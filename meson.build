@@ -99,8 +99,15 @@ has_posix_aio = cpp.has_function('aio_cancel', prefix: '#include <aio.h>', depen
 # Check whether the POSIX plugin is enabled
 has_posix_plugin = has_linux_aio or has_io_uring or has_posix_aio
 
-# Check for CUObject Client library
-cuobj_dep = dependency('cuobjclient-13.1', required: false)
+# Check for CUObject Client library (auto-detect versioned pkg-config name)
+cuobj_pkg_result = run_command('sh', '-c',
+    'pkg-config --list-all 2>/dev/null | grep -oP "^cuobjclient-\\S+"',
+    check: false)
+if cuobj_pkg_result.returncode() == 0
+    cuobj_dep = dependency(cuobj_pkg_result.stdout().strip(), required: false)
+else
+    cuobj_dep = dependency('cuobjclient', required: false)
+endif
 if cuobj_dep.found()
     add_project_arguments('-DHAVE_CUOBJ_CLIENT', language: ['cpp'])
 endif

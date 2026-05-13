@@ -40,6 +40,10 @@ obj_plugin_deps = [nixl_infra, nixl_common_dep, obj_utils_interface, dependency(
 obj_compile_defs = []
 obj_compile_flags = []
 
+ibverbs_dep = dependency('libibverbs', required: false)
+rdmacm_dep = dependency('librdmacm', required: false)
+has_ibverbs_rc = ibverbs_dep.found() and rdmacm_dep.found()
+
 if cuobj_dep.found()
     message('Found CUObjClient Library. Enabling S3 Accelerated engines')
     obj_sources += [
@@ -51,10 +55,34 @@ if cuobj_dep.found()
         's3_accel/dell/client.h',
         's3_accel/dell/engine_impl.cpp',
         's3_accel/dell/engine_impl.h',
+        'rest_accel/scality_ai_connector/cuobj_rdma_token_client.cpp',
+        'rest_accel/scality_ai_connector/cuobj_rdma_token_client.h',
     ]
-    obj_plugin_deps += [ cuobj_dep ]
+    obj_plugin_deps += [cuobj_dep]
+endif
+
+if cuobj_dep.found() or has_ibverbs_rc
+    message('Enabling Scality AI Connector engine')
+    obj_sources += [
+        'rest_accel/scality_ai_connector/client.cpp',
+        'rest_accel/scality_ai_connector/client.h',
+        'rest_accel/scality_ai_connector/engine_impl.cpp',
+        'rest_accel/scality_ai_connector/engine_impl.h',
+        'rest_accel/scality_ai_connector/rdma_token_client.h',
+    ]
+    obj_plugin_deps += [dependency('libcurl', required: true)]
 else
-    message ('Could not find CUObjClient Library. Skipping S3 Accelerated engines')
+    message('Could not find CUObjClient Library or libibverbs. Skipping object Accelerated engines')
+endif
+
+if has_ibverbs_rc
+    message('Found libibverbs + librdmacm. Enabling RC transport for Scality AI Connector')
+    obj_sources += [
+        'rest_accel/scality_ai_connector/ibverbs_rc_rdma_token_client.cpp',
+        'rest_accel/scality_ai_connector/ibverbs_rc_rdma_token_client.h',
+    ]
+    obj_compile_defs += ['-DUSE_IBVERBS_RC_RDMA']
+    obj_plugin_deps += [ibverbs_dep, rdmacm_dep]
 endif
 
 if 'OBJ' in static_plugins
