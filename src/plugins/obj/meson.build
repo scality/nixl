@@ -16,6 +16,8 @@
 obj_sources = [
     'obj_backend.cpp',
     'obj_backend.h',
+    'obj_engine_registry.cpp',
+    'obj_engine_registry.h',
     'obj_plugin.cpp',
     '../../utils/object/engine_utils.h',
     's3/client.cpp',
@@ -83,4 +85,8 @@ else
     endif
 endif
 
-obj_backend_interface = declare_dependency(link_with: obj_backend_lib)
+if 'OBJ' in static_plugins
+    obj_backend_interface = declare_dependency(link_whole: obj_backend_lib)
+else
+    obj_backend_interface = declare_dependency(link_with: obj_backend_lib)
+endif

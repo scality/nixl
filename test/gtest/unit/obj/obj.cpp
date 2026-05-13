@@ -20,16 +20,9 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <chrono>
-#include <functional>
-#include <map>
-#include <thread>
-
-#include "s3/client.h"
+#include "mock_s3_client.h"
+#include "mock_client_registry.h"
 #include "obj_backend.h"
-#include "obj_executor.h"
-#include "object/engine_utils.h"
-#include "s3_accel/dell/rdma_interface.h"
 
 namespace gtest::obj {
 /**
@@ -48,204 +41,6 @@ struct ObjTestConfig {
     nixl_b_params_t customParams;
     std::string agentName;
     bool supportsVram = false;
-};
-
-class mockS3Client : public iS3Client {
-private:
-    bool simulateSuccess_ = true;
-    bool simulateError_ = false;
-    std::shared_ptr<asioThreadPoolExecutor> executor_;
-    std::vector<std::function<void()>> pendingCallbacks_;
-    std::set<std::string> checkedKeys_;
-    std::map<std::string, bool> keyOutcomes_;
-    std::map<std::string, std::chrono::milliseconds> keyDelays_;
-    std::set<std::string> keyErrors_;
-
-public:
-    mockS3Client() = default;
-
-    mockS3Client([[maybe_unused]] nixl_b_params_t *custom_params,
-                 std::shared_ptr<Aws::Utils::Threading::Executor> executor = nullptr) {
-        if (executor) {
-            executor_ = std::dynamic_pointer_cast<asioThreadPoolExecutor>(executor);
-        }
-    }
-
-    void
-    setSimulateSuccess(bool success) {
-        simulateSuccess_ = success;
-    }
-
-    void
-    setSimulateError(bool error) {
-        simulateError_ = error;
-    }
-
-    void
-    setKeyOutcome(const std::string &key, bool success) {
-        keyOutcomes_[key] = success;
-    }
-
-    void
-    setKeyDelay(const std::string &key, std::chrono::milliseconds delay) {
-        keyDelays_[key] = delay;
-    }
-
-    void
-    setKeyError(const std::string &key) {
-        keyErrors_.insert(key);
-    }
-
-    void
-    setExecutor(std::shared_ptr<Aws::Utils::Threading::Executor> executor) override {
-        executor_ = std::dynamic_pointer_cast<asioThreadPoolExecutor>(executor);
-    }
-
-    void
-    putObjectAsync(std::string_view key,
-                   uintptr_t data_ptr,
-                   size_t data_len,
-                   size_t offset,
-                   put_object_callback_t callback) {
-        pendingCallbacks_.push_back([callback, this]() { callback(simulateSuccess_); });
-    }
-
-    void
-    getObjectAsync(std::string_view key,
-                   uintptr_t data_ptr,
-                   size_t data_len,
-                   size_t offset,
-                   get_object_callback_t callback) {
-        pendingCallbacks_.push_back([callback, data_ptr, data_len, offset, this]() {
-            if (simulateSuccess_ && data_ptr && data_len > 0) {
-                char *buffer = reinterpret_cast<char *>(data_ptr);
-                for (size_t i = 0; i < data_len; ++i) {
-                    buffer[i] = static_cast<char>('A' + ((i + offset) % 26));
-                }
-            }
-            callback(simulateSuccess_);
-        });
-    }
-
-    void
-    checkObjectExistsAsync(std::string_view key, check_object_callback_t callback) override {
-        std::string key_str(key);
-        checkedKeys_.insert(key_str);
-
-        // Per-key error overrides global simulateError_
-        bool simulate_error = keyErrors_.count(key_str) > 0 || simulateError_;
-
-        // Per-key outcome overrides global simulateSuccess_
-        auto outcome_it = keyOutcomes_.find(key_str);
-        bool success = (outcome_it != keyOutcomes_.end()) ? outcome_it->second : simulateSuccess_;
-
-        // Per-key delay (defaults to no delay)
-        std::chrono::milliseconds delay{0};
-        auto delay_it = keyDelays_.find(key_str);
-        if (delay_it != keyDelays_.end()) {
-            delay = delay_it->second;
-        }
-
-        if (executor_) {
-            executor_->Submit([callback, success, simulate_error, delay]() {
-                if (delay.count() > 0) {
-                    std::this_thread::sleep_for(delay);
-                }
-                callback(simulate_error ? std::optional<bool>(std::nullopt) :
-                                          std::optional<bool>(success));
-            });
-        } else {
-            if (delay.count() > 0) {
-                std::this_thread::sleep_for(delay);
-            }
-            callback(simulate_error ? std::optional<bool>(std::nullopt) :
-                                      std::optional<bool>(success));
-        }
-    }
-
-    void
-    execAsync() {
-        for (auto &callback : pendingCallbacks_) {
-            executor_->Submit([callback]() { callback(); });
-        }
-        pendingCallbacks_.clear();
-        executor_->waitUntilIdle();
-    }
-
-    size_t
-    getPendingCount() const {
-        return pendingCallbacks_.size();
-    }
-
-    const std::set<std::string> &
-    getCheckedKeys() const {
-        return checkedKeys_;
-    }
-
-    bool
-    hasExecutor() const {
-        return executor_ != nullptr;
-    }
-
-protected:
-    // Make pendingCallbacks_ accessible to derived classes
-    std::vector<std::function<void()>> &
-    getPendingCallbacks() {
-        return pendingCallbacks_;
-    }
-
-    // Make simulateSuccess_ accessible to derived classes
-    bool
-    getSimulateSuccess() const {
-        return simulateSuccess_;
-    }
-};
-
-// Dell-specific mock S3 client with RDMA support
-class mockDellS3Client : public mockS3Client, public iDellS3RdmaClient {
-public:
-    mockDellS3Client() = default;
-
-    mockDellS3Client([[maybe_unused]] nixl_b_params_t *custom_params,
-                     std::shared_ptr<Aws::Utils::Threading::Executor> executor = nullptr)
-        : mockS3Client(custom_params, executor) {}
-
-    // Dell-specific RDMA methods
-    void
-    putObjectRdmaAsync(std::string_view key,
-                       uintptr_t data_ptr,
-                       size_t data_len,
-                       size_t offset,
-                       std::string_view rdma_desc,
-                       put_object_callback_t callback) {
-        if (rdma_desc.empty()) {
-            getPendingCallbacks().push_back([callback]() { callback(false); });
-        } else {
-            getPendingCallbacks().push_back([callback, this]() { callback(getSimulateSuccess()); });
-        }
-    }
-
-    void
-    getObjectRdmaAsync(std::string_view key,
-                       uintptr_t data_ptr,
-                       size_t data_len,
-                       size_t offset,
-                       std::string_view rdma_desc,
-                       get_object_callback_t callback) {
-        if (rdma_desc.empty()) {
-            getPendingCallbacks().push_back([callback]() { callback(false); });
-        } else {
-            getPendingCallbacks().push_back([callback, data_ptr, data_len, offset, this]() {
-                if (getSimulateSuccess() && data_ptr && data_len > 0) {
-                    char *buffer = reinterpret_cast<char *>(data_ptr);
-                    for (size_t i = 0; i < data_len; ++i) {
-                        buffer[i] = static_cast<char>('A' + ((i + offset) % 26));
-                    }
-                }
-                callback(getSimulateSuccess());
-            });
-        }
-    }
 };
 
 // Mock that invokes the checkObjectExistsAsync callback twice to test
@@ -306,12 +101,12 @@ protected:
         initParams_.pthrDelay = 0;
         initParams_.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
 
-        // Use appropriate mock client based on configuration
-        if (isDellOBSRequested(&customParams_)) {
-            mockS3Client_ = std::make_shared<mockDellS3Client>();
-        } else {
-            mockS3Client_ = std::make_shared<mockS3Client>();
-        }
+        auto type_it = customParams_.find("type");
+        std::string type = (type_it != customParams_.end()) ? type_it->second : "";
+        auto mock = mockClientRegistry::instance().create(type);
+        if (!type.empty() && !mock)
+            throw std::runtime_error("No registered mock for engine type '" + type + "'");
+        mockS3Client_ = mock ? mock : std::make_shared<mockS3Client>();
         objEngine_ = std::make_unique<nixlObjEngine>(&initParams_, mockS3Client_);
     }
 
