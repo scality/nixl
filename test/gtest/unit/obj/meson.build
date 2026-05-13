@@ -19,6 +19,12 @@ if cuobj_dep.found()
     obj_unit_test_sources += ['mock_dell_s3_client.cpp']
 endif
 
+# ScalityClient tests only make sense when the Scality AI Connector engine is
+# compiled in, which happens when cuObject client or libibverbs RC RDMA is available.
+if cuobj_dep.found() or has_ibverbs_rc
+    obj_unit_test_sources += ['scality_ai_connector.cpp']
+endif
+
 obj_unit_test_dep = declare_dependency(
     sources: obj_unit_test_sources,
     include_directories: [
