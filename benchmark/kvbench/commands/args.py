@@ -279,6 +279,22 @@ def nixl_bench_args(func):
         type=str,
         help="Path to CA bundle for S3 backend (only used with OBJ backend)",
     )(func)
+    func = click.option(
+        "--obj_accelerated_enable",
+        is_flag=True,
+        default=False,
+        help="Enable S3-accelerated client (only used with OBJ backend)",
+    )(func)
+    func = click.option(
+        "--obj_accelerated_type",
+        type=str,
+        help="Accelerated client type, e.g. 'scality_ai_connector' (only used with OBJ backend)",
+    )(func)
+    func = click.option(
+        "--obj_rdma_transport",
+        type=str,
+        help="RDMA transport [dc, rc, auto] (only used with OBJ/scality_ai_connector backend)",
+    )(func)
     return func
 
 

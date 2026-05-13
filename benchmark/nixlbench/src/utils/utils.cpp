@@ -190,6 +190,15 @@ NB_ARG_STRING(obj_accelerated_type,
               "",
               "S3 Accelerated client vendor type to use. "
               "Only used when obj_accelerated_enable=true");
+NB_ARG_STRING(obj_rdma_transport,
+              "auto",
+              "RDMA transport mode for Scality AI Connector engine [dc, rc, auto]. "
+              "Only used when obj_accelerated_type=scality_ai_connector");
+NB_ARG_STRING(obj_rdma_advertise_ip,
+              "",
+              "IP address to advertise for RDMA connections (e.g. 10.0.1.1). "
+              "If empty, auto-detected from active RDMA devices. "
+              "Only used with RC transport (implies obj_rdma_transport=rc)");
 
 // AZURE BLOB options - only used when backend is AZURE_BLOB
 NB_ARG_STRING(azure_blob_account_url, "", "Account URL for Azure Blob backend");
@@ -285,6 +294,8 @@ std::string xferBenchConfig::obj_ca_bundle = "";
 size_t xferBenchConfig::obj_crt_min_limit = 0;
 bool xferBenchConfig::obj_accelerated_enable = false;
 std::string xferBenchConfig::obj_accelerated_type = "";
+std::string xferBenchConfig::obj_rdma_transport = "";
+std::string xferBenchConfig::obj_rdma_advertise_ip = "";
 std::string xferBenchConfig::azure_blob_account_url = "";
 std::string xferBenchConfig::azure_blob_container_name = "";
 std::string xferBenchConfig::azure_blob_connection_string = "";
@@ -432,6 +443,18 @@ xferBenchConfig::loadParams(void) {
             obj_crt_min_limit = NB_ARG(obj_crt_min_limit);
             obj_accelerated_enable = NB_ARG(obj_accelerated_enable);
             obj_accelerated_type = NB_ARG(obj_accelerated_type);
+            obj_rdma_transport = NB_ARG(obj_rdma_transport);
+            obj_rdma_advertise_ip = NB_ARG(obj_rdma_advertise_ip);
+
+            // If an advertise IP is provided, it implies RC transport
+            if (!obj_rdma_advertise_ip.empty() && obj_rdma_transport == "dc") {
+                std::cerr << "--obj_rdma_advertise_ip is not used with DC transport"
+                          << std::endl;
+                return -1;
+            }
+            if (!obj_rdma_advertise_ip.empty() && obj_rdma_transport == "auto") {
+                obj_rdma_transport = "rc";
+            }
 
             // Validate OBJ S3 scheme
             if (obj_scheme != XFERBENCH_OBJ_SCHEME_HTTP &&
@@ -665,6 +688,13 @@ xferBenchConfig::printConfig() {
                                                  "false (Accelerated disabled)");
             printOption("OBJ S3 Accelerated type (--obj_accelerated_type=type)",
                         obj_accelerated_type.empty() ? "(default)" : obj_accelerated_type);
+            if (obj_accelerated_type == "scality_ai_connector") {
+                printOption("RDMA transport (--obj_rdma_transport=[dc,rc,auto])", obj_rdma_transport);
+                if (obj_rdma_transport != "dc") {
+                    printOption("RDMA advertise IP (--obj_rdma_advertise_ip=IP)",
+                                obj_rdma_advertise_ip.empty() ? "(auto-detect)" : obj_rdma_advertise_ip);
+                }
+            }
         }
 
         if (backend == XFERBENCH_BACKEND_AZURE_BLOB) {
@@ -1225,7 +1255,10 @@ xferBenchUtils::buildAwsCredentials() {
 
 bool
 xferBenchUtils::putObj(size_t buffer_size, const std::string &name) {
-    if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ) {
+    if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ &&
+        xferBenchConfig::obj_accelerated_type == "scality_ai_connector") {
+        return putObjScality(buffer_size, name);
+    } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ) {
         return putObjS3(buffer_size, name);
     } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_AZURE_BLOB) {
         return putObjAzure(buffer_size, name);
@@ -1251,7 +1284,10 @@ xferBenchUtils::getObj(const std::string &name) {
 
 bool
 xferBenchUtils::rmObj(const std::string &name) {
-    if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ) {
+    if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ &&
+        xferBenchConfig::obj_accelerated_type == "scality_ai_connector") {
+        return rmObjScality(name);
+    } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ) {
         return rmObjS3(name);
     } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_AZURE_BLOB) {
         return rmObjAzure(name);
@@ -1344,6 +1380,60 @@ xferBenchUtils::rmObjS3(const std::string &name) {
     if (result != 0) {
         std::cerr << "Warning: Failed to remove S3 object " << name << " from bucket "
                   << bucket_name << " (exit code: " << result << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool
+xferBenchUtils::putObjScality(size_t buffer_size, const std::string &name) {
+    std::string endpoint = xferBenchConfig::obj_endpoint_override;
+    if (endpoint.empty()) {
+        std::cerr << "Error: obj_endpoint_override required for Scality AI Connector put" << std::endl;
+        return false;
+    }
+
+    std::string filename = "/tmp/" + name;
+    int fd = createFile(buffer_size, filename);
+    if (fd < 0) {
+        return false;
+    }
+
+    std::string url = endpoint + "/v1/" + name;
+    std::string cmd = "curl -s -f -o /dev/null -T '" + filename + "' '" + url + "'";
+
+    std::cout << "Putting Scality AI Connector object: " << name
+              << " (size: " << buffer_size << " bytes)" << std::endl;
+
+    int result = system(cmd.c_str());
+    cleanupFile(fd, filename);
+
+    if (result != 0) {
+        std::cerr << "Failed to put Scality AI Connector object " << name
+                  << " (exit code: " << result << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool
+xferBenchUtils::rmObjScality(const std::string &name) {
+    std::string endpoint = xferBenchConfig::obj_endpoint_override;
+    if (endpoint.empty()) {
+        std::cerr << "Error: obj_endpoint_override required for Scality AI Connector cleanup" << std::endl;
+        return false;
+    }
+
+    std::string url = endpoint + "/v1/" + name;
+
+    std::string cmd = "curl -s -f -o /dev/null -X DELETE '" + url + "'";
+
+    std::cout << "Removing Scality AI Connector object: " << name << std::endl;
+
+    int result = system(cmd.c_str());
+    if (result != 0) {
+        std::cerr << "Warning: Failed to delete Scality AI Connector object " << name
+                  << " (exit code: " << result << ")" << std::endl;
         return false;
     }
     return true;

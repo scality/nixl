@@ -187,6 +187,8 @@ public:
     static size_t obj_crt_min_limit;
     static bool obj_accelerated_enable;
     static std::string obj_accelerated_type;
+    static std::string obj_rdma_transport;
+    static std::string obj_rdma_advertise_ip;
     static std::string azure_blob_account_url;
     static std::string azure_blob_container_name;
     static std::string azure_blob_connection_string;
@@ -362,6 +364,10 @@ public:
     getObjS3(const std::string &name);
     static bool
     rmObjS3(const std::string &name);
+    static bool
+    putObjScality(size_t buffer_size, const std::string &name);
+    static bool
+    rmObjScality(const std::string &name);
 
     static bool
     checkConsistency(std::vector<std::vector<xferBenchIOV>> &desc_lists);

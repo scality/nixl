@@ -257,6 +257,13 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
                 backend_params["type"] = xferBenchConfig::obj_accelerated_type;
                 std::cout << " (type: " << xferBenchConfig::obj_accelerated_type << ")";
             }
+            if (!xferBenchConfig::obj_rdma_transport.empty()) {
+                backend_params["rdma_transport"] = xferBenchConfig::obj_rdma_transport;
+            }
+            if (!xferBenchConfig::obj_rdma_advertise_ip.empty()) {
+                backend_params["rdma_advertise_ip"] = xferBenchConfig::obj_rdma_advertise_ip;
+            }
+            backend_params["num_threads"] = std::to_string(xferBenchConfig::num_threads);
             std::cout << std::endl;
         } else {
             std::cout << "OBJ backend with standard S3 enabled" << std::endl;
