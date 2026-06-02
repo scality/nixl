@@ -20,7 +20,10 @@
 #include "ibverbs_rc_rdma_token_client.h"
 #include "common/nixl_log.h"
 
+#include <absl/strings/ascii.h>
 #include <absl/strings/str_format.h>
+#include <absl/strings/str_join.h>
+#include <absl/strings/str_split.h>
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -42,12 +45,15 @@ IbverbsRcRdmaTokenClient::IbverbsRcRdmaTokenClient(CUObjOps_t &ops,
                                                      const std::string &advertiseIp)
     : userOps_(ops) {
     if (!advertiseIp.empty()) {
-        advertiseIp_ = advertiseIp;
+        advertiseIps_ = absl::StrSplit(advertiseIp, ',', absl::SkipWhitespace());
+        for (auto &ip : advertiseIps_) {
+            ip = std::string(absl::StripAsciiWhitespace(ip));
+        }
     } else {
-        advertiseIp_ = detectAdvertiseIp();
+        advertiseIps_ = detectAdvertiseIps();
     }
 
-    if (advertiseIp_.empty()) {
+    if (advertiseIps_.empty()) {
         NIXL_ERROR << "IbverbsRcRdmaTokenClient: could not determine advertise IP";
         return;
     }
@@ -62,8 +68,8 @@ IbverbsRcRdmaTokenClient::IbverbsRcRdmaTokenClient(CUObjOps_t &ops,
     acceptThread_ = std::thread(&IbverbsRcRdmaTokenClient::acceptLoop, this);
     connected_ = true;
 
-    NIXL_INFO << "IbverbsRcRdmaTokenClient initialized (RC transport), advertiseIp="
-              << advertiseIp_;
+    NIXL_INFO << "IbverbsRcRdmaTokenClient initialized (RC transport), advertiseIps="
+              << absl::StrJoin(advertiseIps_, ",");
 }
 
 IbverbsRcRdmaTokenClient::~IbverbsRcRdmaTokenClient() {
@@ -102,18 +108,19 @@ IbverbsRcRdmaTokenClient::~IbverbsRcRdmaTokenClient() {
 // IP auto-detection
 // ---------------------------------------------------------------------------
 
-std::string
-IbverbsRcRdmaTokenClient::detectAdvertiseIp() {
+std::vector<std::string>
+IbverbsRcRdmaTokenClient::detectAdvertiseIps() {
     // Walk /sys/class/infiniband/<dev>/ports/1/gid_attrs/ndevs/0 to find the
-    // parent netdev, then resolve its IPv4 address via getifaddrs().
+    // parent netdev of every ACTIVE device, then resolve their IPv4 addresses
+    // via getifaddrs().
     const char *sysfs_base = "/sys/class/infiniband";
     DIR *dir = opendir(sysfs_base);
     if (!dir) {
         NIXL_WARN << "Cannot open " << sysfs_base;
-        return "";
+        return {};
     }
 
-    std::string netdev;
+    std::vector<std::string> netdevs;
     struct dirent *ent;
     while ((ent = readdir(dir)) != nullptr) {
         if (ent->d_name[0] == '.') continue;
@@ -132,57 +139,66 @@ IbverbsRcRdmaTokenClient::detectAdvertiseIp() {
             }
         }
 
+        std::string netdev;
         // Try the "parent" symlink first (typical for RXE / SIW)
         std::string parentPath =
             std::string(sysfs_base) + "/" + ent->d_name + "/parent";
         std::ifstream parentFile(parentPath);
         if (parentFile.good()) {
             std::getline(parentFile, netdev);
-            if (!netdev.empty()) break;
         }
         // Fallback: gid_attrs ndev
-        std::string ndevPath =
-            std::string(sysfs_base) + "/" + ent->d_name + "/ports/1/gid_attrs/ndevs/0";
-        std::ifstream ndevFile(ndevPath);
-        if (ndevFile.good()) {
-            std::getline(ndevFile, netdev);
-            if (!netdev.empty()) break;
+        if (netdev.empty()) {
+            std::string ndevPath =
+                std::string(sysfs_base) + "/" + ent->d_name + "/ports/1/gid_attrs/ndevs/0";
+            std::ifstream ndevFile(ndevPath);
+            if (ndevFile.good()) {
+                std::getline(ndevFile, netdev);
+            }
+        }
+        if (!netdev.empty() &&
+            std::find(netdevs.begin(), netdevs.end(), netdev) == netdevs.end()) {
+            NIXL_DEBUG << "Detected RDMA parent netdev: " << netdev << " (device "
+                       << ent->d_name << ")";
+            netdevs.push_back(netdev);
         }
     }
     closedir(dir);
 
-    if (netdev.empty()) {
+    if (netdevs.empty()) {
         NIXL_WARN << "Could not find parent netdev for any RDMA device";
-        return "";
+        return {};
     }
 
-    NIXL_DEBUG << "Detected RDMA parent netdev: " << netdev;
-
-    // Resolve netdev → IPv4 address
+    // Resolve each netdev → IPv4 address
     struct ifaddrs *ifas = nullptr;
     if (getifaddrs(&ifas) != 0) {
         NIXL_WARN << "getifaddrs failed: " << strerror(errno);
-        return "";
+        return {};
     }
 
-    std::string ip;
-    for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-        if (netdev != ifa->ifa_name) continue;
-        char buf[INET_ADDRSTRLEN];
-        auto *sin = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
-        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-        ip = buf;
-        break;
+    std::vector<std::string> ips;
+    for (const auto &netdev : netdevs) {
+        std::string ip;
+        for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            if (netdev != ifa->ifa_name) continue;
+            char buf[INET_ADDRSTRLEN];
+            auto *sin = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
+            inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+            ip = buf;
+            break;
+        }
+        if (ip.empty()) {
+            NIXL_WARN << "No IPv4 address found for netdev " << netdev;
+        } else if (std::find(ips.begin(), ips.end(), ip) == ips.end()) {
+            NIXL_DEBUG << "Resolved advertise IP: " << ip << " (netdev " << netdev << ")";
+            ips.push_back(ip);
+        }
     }
     freeifaddrs(ifas);
 
-    if (ip.empty()) {
-        NIXL_WARN << "No IPv4 address found for netdev " << netdev;
-    } else {
-        NIXL_DEBUG << "Resolved advertise IP: " << ip;
-    }
-    return ip;
+    return ips;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,11 +237,14 @@ IbverbsRcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size) {
 
     // 2. Bind to the advertise IP:0 so RDMA CM resolves the correct device.
     //    INADDR_ANY does not work with RXE on veth interfaces.
+    //    Registrations are round-robined across the configured advertise IPs
+    //    so multi-rail setups spread buffers (and thus traffic) over all NICs.
+    reg.advertise_ip = advertiseIps_[nextIpIdx_.fetch_add(1) % advertiseIps_.size()];
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
-    if (inet_pton(AF_INET, advertiseIp_.c_str(), &addr.sin_addr) != 1) {
-        NIXL_ERROR << "Invalid advertise IP: " << advertiseIp_;
+    if (inet_pton(AF_INET, reg.advertise_ip.c_str(), &addr.sin_addr) != 1) {
+        NIXL_ERROR << "Invalid advertise IP: " << reg.advertise_ip;
         rdma_destroy_id(reg.listen_id);
         rdma_destroy_event_channel(reg.cm_channel);
         return CU_OBJ_FAIL;
@@ -281,7 +300,8 @@ IbverbsRcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size) {
     reg.rkey = reg.mr->rkey;
 
     NIXL_DEBUG << "Registered RDMA region: ptr=" << ptr << " size=" << size
-               << " port=" << reg.port << " rkey=0x" << std::hex << reg.rkey;
+               << " ip=" << reg.advertise_ip << " port=" << reg.port << " rkey=0x" << std::hex
+               << reg.rkey;
 
     // 7. Add CM channel fd to epoll
     int fd = reg.cm_channel->fd;
@@ -376,7 +396,7 @@ IbverbsRcRdmaTokenClient::cuObjGet(void *ctx, void *ptr, size_t size, loff_t off
 
         // Per-transfer token: IP:PORT:0xADDR:0xSIZE:0xRKEY
         token = absl::StrFormat("%s:%d:0x%016x:0x%08x:0x%08x",
-                                advertiseIp_, reg->port,
+                                reg->advertise_ip, reg->port,
                                 addr,
                                 static_cast<uint32_t>(size),
                                 reg->rkey);
@@ -408,7 +428,7 @@ IbverbsRcRdmaTokenClient::cuObjPut(void *ctx, void *ptr, size_t size, loff_t off
 
         // Per-transfer token: IP:PORT:0xADDR:0xSIZE:0xRKEY
         token = absl::StrFormat("%s:%d:0x%016x:0x%08x:0x%08x",
-                                advertiseIp_, reg->port,
+                                reg->advertise_ip, reg->port,
                                 addr,
                                 static_cast<uint32_t>(size),
                                 reg->rkey);

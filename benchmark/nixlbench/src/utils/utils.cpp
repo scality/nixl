@@ -196,8 +196,10 @@ NB_ARG_STRING(obj_rdma_transport,
               "Only used when obj_accelerated_type=scality_ai_connector");
 NB_ARG_STRING(obj_rdma_advertise_ip,
               "",
-              "IP address to advertise for RDMA connections (e.g. 10.0.1.1). "
-              "If empty, auto-detected from active RDMA devices. "
+              "IP address(es) to advertise for RDMA connections, comma-separated "
+              "(e.g. 10.0.1.1 or 10.0.1.1,10.0.2.1). Buffer registrations are "
+              "round-robined across the IPs (multi-rail). "
+              "If empty, auto-detected from all active RDMA devices. "
               "Only used with RC transport (implies obj_rdma_transport=rc)");
 
 // AZURE BLOB options - only used when backend is AZURE_BLOB

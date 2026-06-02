@@ -45,6 +45,8 @@ struct RdmaMemRegion {
     uintptr_t base_addr = 0;
     uint32_t rkey = 0;
     uint16_t port = 0;
+    /// IP this region's listener is bound to (used in the advertised token).
+    std::string advertise_ip;
     /// Live QPs accepted on this listener (kept alive for connection reuse).
     std::vector<rdma_cm_id *> active_conns;
 };
@@ -57,6 +59,10 @@ struct RdmaMemRegion {
  * token string "IP:PORT:ADDR:SIZE:RKEY" that the server uses to connect
  * back and perform RDMA READ/WRITE operations.
  *
+ * Multiple advertise IPs (multi-rail) are supported: registrations are
+ * round-robined across the configured IPs, so each region's listener binds
+ * to (and advertises) a different rail.
+ *
  * A single background thread handles all CM events (connect requests,
  * established connections, disconnects) via epoll across all active listeners.
  */
@@ -64,8 +70,11 @@ class IbverbsRcRdmaTokenClient : public iRdmaTokenClient {
 public:
     /**
      * @param ops        User-supplied I/O callbacks (get/put).
-     * @param advertiseIp  Override IP for the RDMA token.  Empty string means
-     *                     auto-detect from the first RDMA device's parent netdev.
+     * @param advertiseIp  Override IP(s) for the RDMA token, comma-separated
+     *                     (e.g. "10.0.1.1" or "10.0.1.1,10.0.2.1").  Empty
+     *                     string means auto-detect from all active RDMA
+     *                     devices' parent netdevs.  Registrations are
+     *                     round-robined across the resulting IPs.
      */
     IbverbsRcRdmaTokenClient(CUObjOps_t &ops, const std::string &advertiseIp = "");
     ~IbverbsRcRdmaTokenClient() override;
@@ -82,8 +91,8 @@ public:
     size_t getActiveConnectionCount() const;
 
 private:
-    /** Resolve the advertise IP from the first RDMA device's parent netdev. */
-    static std::string detectAdvertiseIp();
+    /** Resolve advertise IPs from all active RDMA devices' parent netdevs. */
+    static std::vector<std::string> detectAdvertiseIps();
 
     /** Background thread: epoll_wait on all CM channel fds, handle events. */
     void acceptLoop();
@@ -95,7 +104,8 @@ private:
     const RdmaMemRegion *findRegion(uintptr_t addr) const;
 
     CUObjOps_t userOps_;
-    std::string advertiseIp_;
+    std::vector<std::string> advertiseIps_;
+    std::atomic<size_t> nextIpIdx_{0};
 
     mutable std::mutex mu_;
     std::map<void *, RdmaMemRegion> regions_;
