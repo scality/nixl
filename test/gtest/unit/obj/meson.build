@@ -16,6 +16,7 @@
 obj_unit_test_sources = ['obj.cpp']
 
 if cuobj_dep.found()
+    obj_unit_test_sources += ['obj_cuobj.cpp']
     obj_unit_test_sources += ['mock_dell_s3_client.cpp']
 endif
 
