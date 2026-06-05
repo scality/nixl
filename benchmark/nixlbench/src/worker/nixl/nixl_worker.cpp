@@ -257,7 +257,13 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
                       << xferBenchConfig::obj_crt_min_limit << " bytes" << std::endl;
         } else if (xferBenchConfig::obj_accelerated_enable) {
             backend_params["accelerated"] = "true";
-            std::cout << "OBJ backend with S3 Accelerated client enabled";
+            // Not all accelerated connectors are S3-based (e.g. the Scality AI
+            // Connector is a pure RDMA connector), so only label it "S3" when it
+            // actually is one.
+            const bool is_s3_accelerated =
+                xferBenchConfig::obj_accelerated_type != "scality_ai_connector";
+            std::cout << "OBJ backend with " << (is_s3_accelerated ? "S3 " : "")
+                      << "Accelerated client enabled";
             if (!xferBenchConfig::obj_accelerated_type.empty()) {
                 backend_params["type"] = xferBenchConfig::obj_accelerated_type;
                 std::cout << " (type: " << xferBenchConfig::obj_accelerated_type << ")";
