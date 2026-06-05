@@ -26,6 +26,7 @@ utils_deps = [
   openmp_dep,
   gflags_dep,
   tomlplusplus_dep,
+  dependency('libcurl', required: true),
   dependency('dl', required: true)
 ]
 

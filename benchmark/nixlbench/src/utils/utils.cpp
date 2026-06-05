@@ -26,8 +26,12 @@
 #include <unistd.h>
 #include <utility>
 #include <iomanip>
+#include <memory>
+#include <mutex>
 #include <omp.h>
 #include <set>
+
+#include <curl/curl.h>
 
 #if HAVE_CUDA
 #include <cuda_runtime.h>
@@ -1421,36 +1425,78 @@ xferBenchUtils::rmObjS3(const std::string &name) {
     return true;
 }
 
-// Run a shell command and return its stdout (trimmed of trailing whitespace).
-static std::string
-runCmdCapture(const std::string &cmd) {
-    std::string out;
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-        return out;
-    }
-    char buf[256];
-    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
-        out += buf;
-    }
-    pclose(pipe);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
-        out.pop_back();
-    }
-    return out;
+// --- libcurl helpers for the Scality AI Connector setup/cleanup path ---
+//
+// These replace the previous popen("curl ...") approach. Spawning a curl
+// process per object meant a fork/exec plus a fresh, cold TCP+TLS connection
+// for every object (no keep-alive possible across separate processes). Using
+// libcurl with a reused thread_local handle lets sequential requests from the
+// same thread reuse one keep-alive connection.
+
+namespace {
+
+// Thread-safe line logger. The setup/cleanup loops call into these helpers from
+// multiple OpenMP threads; composing the whole line and writing it under a lock
+// keeps messages from interleaving on the shared stream.
+void
+scalityLogLine(std::ostream &os, const std::string &line) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    os << line << std::endl;
 }
 
-// Read an entire file into a string (best-effort; empty on failure).
-static std::string
-readFileToString(const std::string &path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return std::string();
-    }
-    std::stringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+// curl write callback: append the response body into a std::string.
+size_t
+scalityCurlCaptureBody(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    auto *body = static_cast<std::string *>(userdata);
+    body->append(static_cast<char *>(ptr), size * nmemb);
+    return size * nmemb;
 }
+
+// State for streaming an in-memory upload buffer to libcurl via CURLOPT_READFUNCTION.
+struct scalityUploadCtx {
+    const char *data;
+    size_t remaining;
+};
+
+// curl read callback: feed bytes from the in-memory buffer (no temp file).
+size_t
+scalityCurlReadBody(char *buffer, size_t size, size_t nitems, void *userdata) {
+    auto *ctx = static_cast<scalityUploadCtx *>(userdata);
+    size_t want = size * nitems;
+    size_t n = std::min(want, ctx->remaining);
+    if (n > 0) {
+        std::memcpy(buffer, ctx->data, n);
+        ctx->data += n;
+        ctx->remaining -= n;
+    }
+    return n;
+}
+
+// Initialize libcurl exactly once before any handle is created. curl_global_init
+// is not thread-safe, so serialize it via std::call_once (must run before the
+// OpenMP setup/cleanup regions spawn worker threads).
+void
+scalityCurlGlobalInit() {
+    static std::once_flag flag;
+    std::call_once(flag, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
+}
+
+// Acquire a per-thread CURL handle. curl_easy_reset() clears options while
+// preserving the connection cache, so successive calls on the same thread reuse
+// the keep-alive connection. The handle is cleaned up when the thread exits.
+CURL *
+scalityAcquireHandle() {
+    scalityCurlGlobalInit();
+    thread_local std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(),
+                                                                            &curl_easy_cleanup);
+    if (handle) {
+        curl_easy_reset(handle.get());
+    }
+    return handle.get();
+}
+
+} // namespace
 
 bool
 xferBenchUtils::putObjScality(size_t buffer_size, const std::string &name) {
@@ -1460,35 +1506,47 @@ xferBenchUtils::putObjScality(size_t buffer_size, const std::string &name) {
         return false;
     }
 
-    std::string filename = "/tmp/" + name;
-    int fd = createFile(buffer_size, filename);
-    if (fd < 0) {
+    CURL *curl = scalityAcquireHandle();
+    if (!curl) {
+        scalityLogLine(std::cerr,
+                       "Failed to put Scality AI Connector object " + name +
+                           ": curl handle unavailable");
         return false;
     }
 
+    // Upload straight from an in-memory buffer filled with the consistency
+    // pattern — no /tmp staging file, no disk I/O.
+    std::vector<char> payload(buffer_size, (char)XFERBENCH_TARGET_BUFFER_ELEMENT);
+    scalityUploadCtx upload{payload.data(), payload.size()};
+
     std::string url = endpoint + "/v1/" + name;
-    // -sS: silent but still show errors; capture the HTTP status code and any
-    // response body so failures are diagnosable instead of an opaque exit code.
-    std::string respfile = "/tmp/" + name + ".resp";
-    std::string cmd = "curl -sS -o '" + respfile + "' -w '%{http_code}' -T '" + filename +
-                      "' '" + url + "' 2>&1";
+    std::string response_body;
 
-    std::cout << "Putting Scality AI Connector object: " << name
-              << " (size: " << buffer_size << " bytes)" << std::endl;
+    scalityLogLine(std::cout,
+                   "Putting Scality AI Connector object: " + name + " (size: " +
+                       std::to_string(buffer_size) + " bytes)");
 
-    std::string http_code = runCmdCapture(cmd);
-    cleanupFile(fd, filename);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)buffer_size);
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION, scalityCurlReadBody);
+    curl_easy_setopt(curl, CURLOPT_READDATA, &upload);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, scalityCurlCaptureBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
 
-    bool ok = (http_code.size() == 3 && http_code[0] == '2');
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    bool ok = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
     if (!ok) {
-        std::string body = readFileToString(respfile);
-        std::cerr << "Failed to put Scality AI Connector object " << name
-                  << " (HTTP " << http_code << ") PUT " << url << std::endl;
-        if (!body.empty()) {
-            std::cerr << "  response: " << body << std::endl;
+        std::string msg = "Failed to put Scality AI Connector object " + name + " (curl_code " +
+            std::to_string((int)res) + ", HTTP " + std::to_string(http_code) + ") PUT " + url;
+        if (!response_body.empty()) {
+            msg += "\n  response: " + response_body;
         }
+        scalityLogLine(std::cerr, msg);
     }
-    unlink(respfile.c_str());
     return ok;
 }
 
@@ -1500,24 +1558,39 @@ xferBenchUtils::rmObjScality(const std::string &name) {
         return false;
     }
 
-    std::string url = endpoint + "/v1/" + name;
-    std::string respfile = "/tmp/" + name + ".delresp";
-    std::string cmd =
-        "curl -sS -o '" + respfile + "' -w '%{http_code}' -X DELETE '" + url + "' 2>&1";
-
-    std::cout << "Removing Scality AI Connector object: " << name << std::endl;
-
-    std::string http_code = runCmdCapture(cmd);
-    bool ok = (http_code.size() == 3 && (http_code[0] == '2' || http_code == "404"));
-    if (!ok) {
-        std::string body = readFileToString(respfile);
-        std::cerr << "Warning: Failed to delete Scality AI Connector object " << name
-                  << " (HTTP " << http_code << ") DELETE " << url << std::endl;
-        if (!body.empty()) {
-            std::cerr << "  response: " << body << std::endl;
-        }
+    CURL *curl = scalityAcquireHandle();
+    if (!curl) {
+        scalityLogLine(std::cerr,
+                       "Warning: Failed to delete Scality AI Connector object " + name +
+                           ": curl handle unavailable");
+        return false;
     }
-    unlink(respfile.c_str());
+
+    std::string url = endpoint + "/v1/" + name;
+    std::string response_body;
+
+    scalityLogLine(std::cout, "Removing Scality AI Connector object: " + name);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, scalityCurlCaptureBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    // A missing object (404) is acceptable for best-effort cleanup.
+    bool ok = (res == CURLE_OK) && ((http_code >= 200 && http_code < 300) || http_code == 404);
+    if (!ok) {
+        std::string msg = "Warning: Failed to delete Scality AI Connector object " + name +
+            " (curl_code " + std::to_string((int)res) + ", HTTP " + std::to_string(http_code) +
+            ") DELETE " + url;
+        if (!response_body.empty()) {
+            msg += "\n  response: " + response_body;
+        }
+        scalityLogLine(std::cerr, msg);
+    }
     return ok;
 }
 
