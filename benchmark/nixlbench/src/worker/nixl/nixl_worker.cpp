@@ -966,8 +966,10 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
 
                 if (xferBenchConfig::op_type == XFERBENCH_OP_READ) {
                     if (!xferBenchUtils::putObj(buffer_size, unique_name)) {
-                        std::cerr << "Failed to put object: " << unique_name << std::endl;
-                        continue;
+                        std::cerr << "Failed to put object: " << unique_name
+                                  << " -- cannot pre-populate objects for READ benchmark, aborting."
+                                  << std::endl;
+                        exit(EXIT_FAILURE);
                     }
                 }
 
