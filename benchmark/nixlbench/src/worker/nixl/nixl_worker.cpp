@@ -952,6 +952,11 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
     opt_args.backends.push_back(backend_engine);
 
     if (xferBenchConfig::isObjStorageBackend()) {
+        // The object is sized to a single (max) block and kept independent of
+        // batch_size / pipeline_depth, so sweeping those parameters does not
+        // change the object under test. Batched blocks wrap within this object
+        // (see exchangeIOV()), matching the local-side offset wrapping in
+        // createTransferDescLists().
         buffer_size = xferBenchConfig::max_block_size;
 
         struct timeval tv;
@@ -1311,14 +1316,24 @@ xferBenchNixlWorker::exchangeIOV(const std::vector<std::vector<xferBenchIOV>> &l
             int devidx = 0;
             for (auto &iov : iov_list) {
                 if (xferBenchConfig::isObjStorageBackend()) {
-                    std::optional<xferBenchIOV> basic_desc;
-                    size_t num_devices = iov_list.size();
-                    int obj_dev_id = list_idx * num_devices + devidx;
-                    basic_desc = initBasicDescObj(iov.len, obj_dev_id, iov.metaInfo);
-                    devidx++;
-                    if (basic_desc) {
-                        remote_iov_list.push_back(basic_desc.value());
+                    // Each source buffer was expanded into
+                    // (count * batch_size * pipeline_depth) blocks by
+                    // createTransferDescLists(). Map every expanded block back
+                    // onto the single block-sized object registered for its
+                    // source device, wrapping the offset within the object the
+                    // same way the local side does. The previous code minted a
+                    // fresh obj_dev_id per block, referencing objects that were
+                    // never created/registered, so batch_size or pipeline_depth
+                    // > 1 failed createXferReq() with NIXL_ERR_NOT_FOUND.
+                    const std::vector<xferBenchIOV> &reg_objs = remote_iovs[list_idx];
+                    size_t expand = iov_list.size() / reg_objs.size();
+                    const xferBenchIOV &reg = reg_objs[devidx / expand];
+                    size_t obj_offset = ((devidx % expand) * block_size) % reg.len;
+                    if (obj_offset + block_size > reg.len) {
+                        obj_offset = 0;
                     }
+                    remote_iov_list.emplace_back(obj_offset, block_size, reg.devId, reg.metaInfo);
+                    devidx++;
                 } else if (XFERBENCH_BACKEND_GUSLI == xferBenchConfig::backend) {
                     xferBenchIOV iov_remote(iov);
                     iov_remote.addr = gusli_devices[devidx++].dev_offset + file_offset;
