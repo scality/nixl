@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <sstream>
 #include <sys/time.h>
@@ -1419,6 +1421,37 @@ xferBenchUtils::rmObjS3(const std::string &name) {
     return true;
 }
 
+// Run a shell command and return its stdout (trimmed of trailing whitespace).
+static std::string
+runCmdCapture(const std::string &cmd) {
+    std::string out;
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        return out;
+    }
+    char buf[256];
+    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+        out += buf;
+    }
+    pclose(pipe);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
+        out.pop_back();
+    }
+    return out;
+}
+
+// Read an entire file into a string (best-effort; empty on failure).
+static std::string
+readFileToString(const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return std::string();
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
 bool
 xferBenchUtils::putObjScality(size_t buffer_size, const std::string &name) {
     std::string endpoint = xferBenchConfig::obj_endpoint_override;
@@ -1434,20 +1467,29 @@ xferBenchUtils::putObjScality(size_t buffer_size, const std::string &name) {
     }
 
     std::string url = endpoint + "/v1/" + name;
-    std::string cmd = "curl -s -f -o /dev/null -T '" + filename + "' '" + url + "'";
+    // -sS: silent but still show errors; capture the HTTP status code and any
+    // response body so failures are diagnosable instead of an opaque exit code.
+    std::string respfile = "/tmp/" + name + ".resp";
+    std::string cmd = "curl -sS -o '" + respfile + "' -w '%{http_code}' -T '" + filename +
+                      "' '" + url + "' 2>&1";
 
     std::cout << "Putting Scality AI Connector object: " << name
               << " (size: " << buffer_size << " bytes)" << std::endl;
 
-    int result = system(cmd.c_str());
+    std::string http_code = runCmdCapture(cmd);
     cleanupFile(fd, filename);
 
-    if (result != 0) {
+    bool ok = (http_code.size() == 3 && http_code[0] == '2');
+    if (!ok) {
+        std::string body = readFileToString(respfile);
         std::cerr << "Failed to put Scality AI Connector object " << name
-                  << " (exit code: " << result << ")" << std::endl;
-        return false;
+                  << " (HTTP " << http_code << ") PUT " << url << std::endl;
+        if (!body.empty()) {
+            std::cerr << "  response: " << body << std::endl;
+        }
     }
-    return true;
+    unlink(respfile.c_str());
+    return ok;
 }
 
 bool
@@ -1459,18 +1501,24 @@ xferBenchUtils::rmObjScality(const std::string &name) {
     }
 
     std::string url = endpoint + "/v1/" + name;
-
-    std::string cmd = "curl -s -f -o /dev/null -X DELETE '" + url + "'";
+    std::string respfile = "/tmp/" + name + ".delresp";
+    std::string cmd =
+        "curl -sS -o '" + respfile + "' -w '%{http_code}' -X DELETE '" + url + "' 2>&1";
 
     std::cout << "Removing Scality AI Connector object: " << name << std::endl;
 
-    int result = system(cmd.c_str());
-    if (result != 0) {
+    std::string http_code = runCmdCapture(cmd);
+    bool ok = (http_code.size() == 3 && (http_code[0] == '2' || http_code == "404"));
+    if (!ok) {
+        std::string body = readFileToString(respfile);
         std::cerr << "Warning: Failed to delete Scality AI Connector object " << name
-                  << " (exit code: " << result << ")" << std::endl;
-        return false;
+                  << " (HTTP " << http_code << ") DELETE " << url << std::endl;
+        if (!body.empty()) {
+            std::cerr << "  response: " << body << std::endl;
+        }
     }
-    return true;
+    unlink(respfile.c_str());
+    return ok;
 }
 
 int
