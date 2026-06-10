@@ -263,10 +263,15 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
                       << xferBenchConfig::obj_crt_min_limit << " bytes" << std::endl;
         } else if (xferBenchConfig::obj_accelerated_enable) {
             backend_params["accelerated"] = "true";
-            std::cout << "OBJ backend with S3 Accelerated client enabled";
+            const bool is_s3_accelerated = !xferBenchConfig::isRestBackend();
+            std::cout << "OBJ backend with " << (is_s3_accelerated ? "S3 " : "")
+                      << "Accelerated client enabled";
             if (!xferBenchConfig::obj_accelerated_type.empty()) {
                 backend_params["type"] = xferBenchConfig::obj_accelerated_type;
                 std::cout << " (type: " << xferBenchConfig::obj_accelerated_type << ")";
+            }
+            if (xferBenchConfig::obj_num_threads > 0) {
+                backend_params["num_threads"] = std::to_string(xferBenchConfig::obj_num_threads);
             }
             std::cout << std::endl;
         } else {
@@ -557,6 +562,14 @@ cleanupVramNeuron(xferBenchIOV &iov) {
 static std::optional<xferBenchIOV>
 getVramDescCuda(int devid, size_t buffer_size, uint8_t memset_value) {
     void *addr;
+    int device_count = 0;
+    CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count), "Failed to get CUDA device count");
+    if (devid >= device_count) {
+        std::cerr << "Requested CUDA device " << devid << " but only " << device_count
+                  << " device(s) available (override with CUDA_VISIBLE_DEVICES)" << std::endl;
+        return std::nullopt;
+    }
+    CHECK_CUDA_ERROR(cudaSetDevice(devid), "Failed to set device");
     CHECK_CUDA_ERROR(cudaMalloc(&addr, buffer_size), "Failed to allocate CUDA buffer");
     CHECK_CUDA_ERROR(cudaMemset(addr, memset_value, buffer_size), "Failed to set device memory");
 
@@ -1199,7 +1212,10 @@ xferBenchNixlWorker::deallocateMemory(std::vector<std::vector<xferBenchIOV>> &io
             }
         }
         std::atomic<bool> rm_failed(false);
-#pragma omp parallel for
+        // Cap concurrency so teardown doesn't fire a large burst of cold HTTP
+        // connections at the endpoint's accept backlog all at once.
+        constexpr int kMaxCleanupThreads = 16;
+#pragma omp parallel for num_threads(kMaxCleanupThreads)
         for (size_t idx = 0; idx < obj_names.size(); idx++) {
             if (!xferBenchUtils::rmObj(obj_names[idx])) {
                 std::cerr << "Failed to remove object: " << obj_names[idx] << std::endl;
