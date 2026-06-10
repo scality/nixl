@@ -29,6 +29,7 @@
 #endif
 #include <fcntl.h>
 #include <filesystem>
+#include <atomic>
 #include <iomanip>
 #include <memory>
 #include <numeric>
@@ -262,10 +263,15 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
                       << xferBenchConfig::obj_crt_min_limit << " bytes" << std::endl;
         } else if (xferBenchConfig::obj_accelerated_enable) {
             backend_params["accelerated"] = "true";
-            std::cout << "OBJ backend with S3 Accelerated client enabled";
+            const bool is_s3_accelerated = !xferBenchConfig::isRestBackend();
+            std::cout << "OBJ backend with " << (is_s3_accelerated ? "S3 " : "")
+                      << "Accelerated client enabled";
             if (!xferBenchConfig::obj_accelerated_type.empty()) {
                 backend_params["type"] = xferBenchConfig::obj_accelerated_type;
                 std::cout << " (type: " << xferBenchConfig::obj_accelerated_type << ")";
+            }
+            if (xferBenchConfig::obj_num_threads > 0) {
+                backend_params["num_threads"] = std::to_string(xferBenchConfig::obj_num_threads);
             }
             std::cout << std::endl;
         } else {
@@ -556,6 +562,14 @@ cleanupVramNeuron(xferBenchIOV &iov) {
 static std::optional<xferBenchIOV>
 getVramDescCuda(int devid, size_t buffer_size, uint8_t memset_value) {
     void *addr;
+    int device_count = 0;
+    CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count), "Failed to get CUDA device count");
+    if (devid >= device_count) {
+        std::cerr << "Requested CUDA device " << devid << " but only " << device_count
+                  << " device(s) available (override with CUDA_VISIBLE_DEVICES)" << std::endl;
+        return std::nullopt;
+    }
+    CHECK_CUDA_ERROR(cudaSetDevice(devid), "Failed to set device");
     CHECK_CUDA_ERROR(cudaMalloc(&addr, buffer_size), "Failed to allocate CUDA buffer");
     CHECK_CUDA_ERROR(cudaMemset(addr, memset_value, buffer_size), "Failed to set device memory");
 
@@ -982,19 +996,44 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
         gettimeofday(&tv, nullptr);
         uint64_t timestamp = tv.tv_sec * 1000000ULL + tv.tv_usec;
 
+        // Pre-populate objects for READ benchmarks. Each putObj is one HTTP PUT
+        // (network-bound), so seed all objects concurrently; the descriptor /
+        // registration bookkeeping below stays sequential. Errors are recorded
+        // in a flag rather than exit()-ing inside the OpenMP region.
+        if (xferBenchConfig::op_type == XFERBENCH_OP_READ) {
+            std::vector<std::string> obj_names;
+            obj_names.reserve((size_t)num_threads * num_devices);
+            for (int list_idx = 0; list_idx < num_threads; list_idx++) {
+                for (i = 0; i < num_devices; i++) {
+                    obj_names.push_back("nixlbench_obj" + std::to_string(list_idx) + "_" +
+                                        std::to_string(i) + "_" + std::to_string(timestamp));
+                }
+            }
+
+            std::atomic<bool> put_failed(false);
+#pragma omp parallel for num_threads(num_threads)
+            for (size_t idx = 0; idx < obj_names.size(); idx++) {
+                if (put_failed.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                if (!xferBenchUtils::putObj(buffer_size, obj_names[idx])) {
+                    std::cerr << "Failed to put object: " << obj_names[idx]
+                              << " -- cannot pre-populate objects for READ benchmark, aborting."
+                              << std::endl;
+                    put_failed.store(true, std::memory_order_relaxed);
+                }
+            }
+            if (put_failed.load()) {
+                exit(EXIT_FAILURE);
+            }
+        }
+
         for (int list_idx = 0; list_idx < num_threads; list_idx++) {
             std::vector<xferBenchIOV> iov_list;
             for (i = 0; i < num_devices; i++) {
                 std::optional<xferBenchIOV> basic_desc;
                 std::string unique_name = "nixlbench_obj" + std::to_string(list_idx) + "_" +
                     std::to_string(i) + "_" + std::to_string(timestamp);
-
-                if (xferBenchConfig::op_type == XFERBENCH_OP_READ) {
-                    if (!xferBenchUtils::putObj(buffer_size, unique_name)) {
-                        std::cerr << "Failed to put object: " << unique_name << std::endl;
-                        continue;
-                    }
-                }
 
                 int obj_dev_id = list_idx * num_devices + i;
                 basic_desc = initBasicDescObj(buffer_size, obj_dev_id, unique_name);
@@ -1160,13 +1199,31 @@ xferBenchNixlWorker::deallocateMemory(std::vector<std::vector<xferBenchIOV>> &io
     // 2. Call deregisterMem() before each IOV cleanup
     //    (cleanup destroys resources that backends need).
     if (xferBenchConfig::isObjStorageBackend()) {
+        // Deregister all remote registrations first (ordering invariant), collect
+        // the object keys, then remove the objects concurrently; each rmObj is
+        // one HTTP DELETE (network-bound).
+        std::vector<std::string> obj_names;
         for (auto &iov_list : remote_iovs) {
             nixl_reg_dlist_t desc_list(OBJ_SEG);
             iovListToNixlRegDlist(iov_list, desc_list);
             CHECK_NIXL_ERROR(agent->deregisterMem(desc_list, &opt_args), "deregisterMem failed");
             for (auto &iov : iov_list) {
-                cleanupBasicDescObj(iov);
+                obj_names.push_back(iov.metaInfo);
             }
+        }
+        std::atomic<bool> rm_failed(false);
+        // Cap concurrency so teardown doesn't fire a large burst of cold HTTP
+        // connections at the endpoint's accept backlog all at once.
+        constexpr int kMaxCleanupThreads = 16;
+#pragma omp parallel for num_threads(kMaxCleanupThreads)
+        for (size_t idx = 0; idx < obj_names.size(); idx++) {
+            if (!xferBenchUtils::rmObj(obj_names[idx])) {
+                std::cerr << "Failed to remove object: " << obj_names[idx] << std::endl;
+                rm_failed.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (rm_failed.load()) {
+            exit(EXIT_FAILURE);
         }
     } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_GUSLI) {
         for (auto &iov_list : remote_iovs) {

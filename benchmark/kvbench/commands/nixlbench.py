@@ -74,6 +74,9 @@ class NIXLBench:
         obj_use_virtual_addressing=False,
         obj_endpoint_override="",
         obj_req_checksum="supported",
+        obj_accelerated_enable=False,
+        obj_accelerated_type="",
+        obj_num_threads=0,
         # Additional nixlbench arguments
         large_blk_iter_ftr=16,
         recreate_xfer=False,
@@ -176,6 +179,9 @@ class NIXLBench:
         self.obj_use_virtual_addressing = obj_use_virtual_addressing
         self.obj_endpoint_override = obj_endpoint_override
         self.obj_req_checksum = obj_req_checksum
+        self.obj_accelerated_enable = obj_accelerated_enable
+        self.obj_accelerated_type = obj_accelerated_type
+        self.obj_num_threads = obj_num_threads
         self.large_blk_iter_ftr = large_blk_iter_ftr
         self.recreate_xfer = recreate_xfer
         self._override_defaults()
@@ -354,6 +360,9 @@ class NIXLBench:
             "obj_use_virtual_addressing": self.obj_use_virtual_addressing,
             "obj_endpoint_override": self.obj_endpoint_override,
             "obj_req_checksum": self.obj_req_checksum,
+            "obj_accelerated_enable": self.obj_accelerated_enable,
+            "obj_accelerated_type": self.obj_accelerated_type,
+            "obj_num_threads": self.obj_num_threads,
             # Additional nixlbench parameters
             "large_blk_iter_ftr": self.large_blk_iter_ftr,
             "recreate_xfer": self.recreate_xfer,
@@ -415,6 +424,9 @@ class NIXLBench:
             "obj_use_virtual_addressing": False,
             "obj_endpoint_override": "",
             "obj_req_checksum": "supported",
+            "obj_accelerated_enable": False,
+            "obj_accelerated_type": "",
+            "obj_num_threads": 0,
             # Additional nixlbench defaults
             "large_blk_iter_ftr": 16,
             "recreate_xfer": False,
