@@ -26,7 +26,8 @@ utils_deps = [
   gflags_dep,
   nixl_lib,
   tomlplusplus_dep,
-  dependency('dl', required: true)
+  dependency('dl', required: true),
+  dependency('libcurl', required: true)
 ]
 
 if raw_cli_available
