@@ -155,25 +155,18 @@ class nixlBackendEngine {
         //Backend aborts the transfer if necessary, and destructs the relevant objects
         virtual nixl_status_t releaseReqH(nixlBackendReqH* handle) const = 0;
 
-        // Prepare a memory view for remote buffers
-        virtual nixl_status_t
-        prepMemView(const nixl_remote_meta_dlist_t &,
-                    nixlMemViewH &,
-                    const nixl_opt_b_args_t * = nullptr) const {
-            return NIXL_ERR_NOT_SUPPORTED;
-        }
-
-        // Prepare a memory view for local buffers
-        virtual nixl_status_t
-        prepMemView(const nixl_meta_dlist_t &,
-                    nixlMemViewH &,
-                    const nixl_opt_b_args_t * = nullptr) const {
-            return NIXL_ERR_NOT_SUPPORTED;
-        }
-
-        // Release memory view handle
-        virtual void
-        releaseMemView(nixlMemViewH) const {}
+        // ABI compatibility stubs: align vtable slots with nixl 0.9.0 (libnixl_build.so).
+        // 0.9.0 had 4 virtual functions here (createGpuXferReq, releaseGpuXferReq,
+        // getGpuSignalSize, prepGpuSignal) at slots [15]-[18] before getPublicData,
+        // shifting loadLocalMD to slot [23]. 1.2.0 replaced them with 3 functions
+        // (prepMemView×2, releaseMemView), shifting loadLocalMD to slot [22].
+        // Without this patch, 0.9.0's libnixl_build.so calls slot [23] on the plugin
+        // and hits getNotifs() → NIXL_ERR_BACKEND instead of loadLocalMD.
+        // Remove this block when the full 1.2.0 stack is rebuilt inside the container.
+        virtual nixl_status_t _abi_compat_v090_0() { return NIXL_ERR_NOT_SUPPORTED; }
+        virtual nixl_status_t _abi_compat_v090_1() { return NIXL_ERR_NOT_SUPPORTED; }
+        virtual nixl_status_t _abi_compat_v090_2() { return NIXL_ERR_NOT_SUPPORTED; }
+        virtual nixl_status_t _abi_compat_v090_3() { return NIXL_ERR_NOT_SUPPORTED; }
 
         // *** Needs to be implemented if supportsRemote() is true *** //
 
