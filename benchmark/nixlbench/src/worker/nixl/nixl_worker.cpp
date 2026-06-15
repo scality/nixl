@@ -1401,10 +1401,12 @@ registerIterationMem(nixlAgent *agent,
         return rc;
     }
 
-    nixl_reg_dlist_t remote_reg = iovListToNixlRegDlist(remote_iov, getRemoteSegType());
-    rc = agent->registerMem(remote_reg, &reg_args);
-    if (rc != NIXL_SUCCESS) {
-        return rc;
+    if (xferBenchConfig::isStorageBackend()) {
+        nixl_reg_dlist_t remote_reg = iovListToNixlRegDlist(remote_iov, getRemoteSegType());
+        rc = agent->registerMem(remote_reg, &reg_args);
+        if (rc != NIXL_SUCCESS) {
+            return rc;
+        }
     }
 
     return NIXL_SUCCESS;
@@ -1425,10 +1427,12 @@ deregisterIterationMem(nixlAgent *agent,
         return rc;
     }
 
-    nixl_reg_dlist_t remote_reg = iovListToNixlRegDlist(remote_iov, getRemoteSegType());
-    rc = agent->deregisterMem(remote_reg, &reg_args);
-    if (rc != NIXL_SUCCESS) {
-        return rc;
+    if (xferBenchConfig::isStorageBackend()) {
+        nixl_reg_dlist_t remote_reg = iovListToNixlRegDlist(remote_iov, getRemoteSegType());
+        rc = agent->deregisterMem(remote_reg, &reg_args);
+        if (rc != NIXL_SUCCESS) {
+            return rc;
+        }
     }
 
     return NIXL_SUCCESS;
