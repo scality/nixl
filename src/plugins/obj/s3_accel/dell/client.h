@@ -12,7 +12,7 @@
 #include <aws/s3/S3Client.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include "s3_accel/client.h"
-#include "rdma_interface.h"
+#include "s3_accel/rdma_interface.h"
 #include "nixl_types.h"
 
 /**
@@ -20,7 +20,7 @@
  * This client presents Put and GetObject interfaces to enable RDMA for S3-compatible storage using
  * the cuObject API
  */
-class awsS3DellObsClient : public awsS3AccelClient, public iDellS3RdmaClient {
+class awsS3DellObsClient : public awsS3AccelClient, public iS3RdmaClient {
 public:
     /**
      * Constructor that creates an AWS S3 client for use with Dell ObjectScale from custom
