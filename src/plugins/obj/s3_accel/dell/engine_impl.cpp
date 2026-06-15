@@ -5,7 +5,7 @@
 
 #include "engine_impl.h"
 #include "client.h"
-#include "rdma_interface.h"
+#include "s3_accel/rdma_interface.h"
 #include "common/nixl_log.h"
 #include <absl/strings/str_format.h>
 #include <memory>
@@ -556,9 +556,9 @@ S3DellObsObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
         // S3 client interface signals completion via a callback, but NIXL API polls request handle
         // for the status code. Use future/promise pair to bridge the gap.
         // Cast to RDMA-capable client to access RDMA methods
-        auto rdmaClient = dynamic_cast<iDellS3RdmaClient *>(s3Client_.get());
+        auto rdmaClient = dynamic_cast<iS3RdmaClient *>(s3Client_.get());
         if (!rdmaClient) {
-            NIXL_ERROR << "Dell RDMA operations require iDellS3RdmaClient";
+            NIXL_ERROR << "Dell RDMA operations require iS3RdmaClient";
             status_promise->set_value(NIXL_ERR_BACKEND);
             return NIXL_IN_PROG;
         }
