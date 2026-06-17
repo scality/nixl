@@ -40,3 +40,6 @@ iS3Client *
 S3AccelObjEngineImpl::getClient() const {
     return s3Client_.get();
 }
+
+S3AccelObjEngineImpl::S3AccelObjEngineImpl(const nixlBackendInitParams *init_params, NoClientTag)
+    : DefaultObjEngineImpl(init_params, nullptr, nullptr) {}
