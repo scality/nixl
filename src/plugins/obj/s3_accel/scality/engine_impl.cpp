@@ -12,7 +12,7 @@
 namespace {
 
 objAccelEngineRegistrar reg_scality(
-    "scality_s3",
+    "scality_s3_connector",
     [](const nixlBackendInitParams *p) { return std::make_unique<S3ScalityObjEngineImpl>(p); },
     [](const nixlBackendInitParams *p, std::shared_ptr<iS3Client> s3, std::shared_ptr<iS3Client>) {
         return std::make_unique<S3ScalityObjEngineImpl>(p, std::move(s3));
