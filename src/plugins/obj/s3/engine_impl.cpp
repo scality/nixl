@@ -110,7 +110,7 @@ DefaultObjEngineImpl::DefaultObjEngineImpl(const nixlBackendInitParams *init_par
 DefaultObjEngineImpl::DefaultObjEngineImpl(const nixlBackendInitParams *init_params,
                                            std::shared_ptr<iS3Client> s3_client,
                                            std::shared_ptr<iS3Client> s3_client_crt)
-    : executor_(std::make_shared<asioThreadPoolExecutor>(std::thread::hardware_concurrency())),
+    : executor_(std::make_shared<asioThreadPoolExecutor>(getNumThreads(init_params->customParams))),
       s3Client_(s3_client),
       crtMinLimit_(getCrtMinLimit(init_params->customParams)) {
     // DefaultObjEngineImpl only uses the standard S3 client, not the CRT client.
