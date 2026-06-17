@@ -20,6 +20,11 @@ public:
 protected:
     iS3Client *
     getClient() const override;
+
+    // Tag type for constructing without creating an S3 client.
+    // Used by S3CuObjEngineImpl, which gets its client from a subclass via getClient().
+    struct NoClientTag {};
+    S3AccelObjEngineImpl(const nixlBackendInitParams *init_params, NoClientTag);
 };
 
 #endif // OBJ_PLUGIN_S3_ACCEL_ENGINE_IMPL_H
