@@ -62,18 +62,34 @@ if cuobj_dep.found()
         # link_whole pulls in the static lib's objects but not its dependencies,
         # so add libcurl to plugin_deps to propagate it to the final OBJ target.
         plugin_deps += [ curl_dep ]
+        scality_sources = [
+            'rest_accel/scality_ai_connector/client.cpp',
+            'rest_accel/scality_ai_connector/client.h',
+            'rest_accel/scality_ai_connector/engine_impl.cpp',
+            'rest_accel/scality_ai_connector/engine_impl.h',
+            'rest_accel/scality_ai_connector/rdma_ctx.h',
+            'rest_accel/scality_ai_connector/cufile_nics.h',
+            'rest_accel/scality_ai_connector/rdma_token_client.h',
+            'rest_accel/scality_ai_connector/cuobj_rdma_token_client.cpp',
+            'rest_accel/scality_ai_connector/cuobj_rdma_token_client.h',
+        ]
+        scality_deps = plugin_deps + [ cuda_dep ]
+        # In-process libibverbs DC token client for DRAM multi-NIC spreading.
+        if have_ibverbs_dc
+            message('Enabling ibverbs DC token client for Scality AI Connector')
+            scality_sources += [
+                'rest_accel/scality_ai_connector/dc_descriptor.h',
+                'rest_accel/scality_ai_connector/ibverbs_dc_rdma_token_client.cpp',
+                'rest_accel/scality_ai_connector/ibverbs_dc_rdma_token_client.h',
+            ]
+            scality_deps += [ ibverbs_dep, mlx5_dep ]
+            # Propagate to the final OBJ target (link_whole drops deps).
+            plugin_deps += [ ibverbs_dep, mlx5_dep ]
+        endif
         scality_connector_lib = static_library(
             'scality_ai_connector',
-            [
-                'rest_accel/scality_ai_connector/client.cpp',
-                'rest_accel/scality_ai_connector/client.h',
-                'rest_accel/scality_ai_connector/engine_impl.cpp',
-                'rest_accel/scality_ai_connector/engine_impl.h',
-                'rest_accel/scality_ai_connector/rdma_token_client.h',
-                'rest_accel/scality_ai_connector/cuobj_rdma_token_client.cpp',
-                'rest_accel/scality_ai_connector/cuobj_rdma_token_client.h',
-            ],
-            dependencies: plugin_deps + [ cuda_dep ],
+            scality_sources,
+            dependencies: scality_deps,
             cpp_args: compile_defs + compile_flags,
             include_directories: [nixl_inc_dirs, utils_inc_dirs],
             pic: true,

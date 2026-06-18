@@ -21,7 +21,11 @@
 #include "obj_backend.h"
 #include "rest_accel/scality_ai_connector/client.h"
 #include "rest_accel/scality_ai_connector/rdma_token_client.h"
+#include <cstdint>
+#include <mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 /**
  * Scality AI Connector RDMA Engine Implementation.
@@ -90,10 +94,31 @@ public:
     releaseReqH(nixlBackendReqH *handle) const override;
 
 private:
+    /// Token client for a given segment type: DRAM -> ibverbs DC client
+    /// (multi-NIC); VRAM/OBJ -> cuObject. hostClient_ is built lazily on the
+    /// first DRAM registration, so this must only be called for DRAM after that.
+    const std::shared_ptr<iRdmaTokenClient> &
+    clientFor(const nixl_mem_t &nixl_mem) const {
+        return (nixl_mem == DRAM_SEG && hostClient_) ? hostClient_ : cuClient_;
+    }
+
+    /// Build the ibverbs DC client (once) from the resolved NIC list. Returns
+    /// NIXL_ERR_BACKEND if no NICs were resolved or the client fails to connect.
+    nixl_status_t
+    ensureHostClient();
+
     /// Maps device IDs to object keys
     std::unordered_map<uint64_t, std::string> devIdToObjKey_;
-    /// RDMA token client (DC via cuObjClient)
+    /// RDMA token client (DC via cuObjClient); used for VRAM and OBJ.
     std::shared_ptr<iRdmaTokenClient> cuClient_;
+    /// libibverbs DC token client for DRAM multi-NIC spreading (lazy).
+    std::shared_ptr<iRdmaTokenClient> hostClient_;
+    std::mutex hostClientMu_;
+    /// RDMA NIC specifiers (IPv4 or device names) for DRAM, resolved at
+    /// construction from customParams 'rdma_nics' or cufile.json.
+    std::vector<std::string> rdmaNics_;
+    /// DC access key for the ibverbs DC client.
+    uint64_t dcKey_ = 0xffeeddccULL;
     /// Scality AI Connector HTTP client with RDMA support
     std::shared_ptr<iRestClient> connectorClient_;
 };
