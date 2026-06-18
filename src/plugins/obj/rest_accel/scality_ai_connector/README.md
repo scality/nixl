@@ -89,6 +89,8 @@ The engine is selected and configured through the backend's `customParams`:
 | `type` | yes | n/a | Must be `"scality_ai_connector"` to select this engine |
 | `endpoint_override` | yes | n/a | Base URL of the connector, e.g. `http://10.0.0.1:10000` |
 | `num_threads` | no | `max(2, cpu_threads / 4)` | Size of the callback worker pool (see [Concurrency model](#concurrency-model)). |
+| `rdma_nics` | no | from `cufile.json` | NIC list for DRAM transfers (see [Multi-NIC DRAM](#multi-nic-dram)): comma-separated IPv4 addresses or device names, e.g. `10.10.40.208,10.10.48.208` or `mlx5_1,mlx5_2`. Empty falls back to `cufile.json` `rdma_dev_addr_list`. |
+| `rdma_dc_key` | no | from `cufile.json`, else `0xffeeddcc` | DC access key (hex) the server's DCI side must present, for DRAM transfers. Empty falls back to `cufile.json` `rdma_dc_key`. |
 
 Requests are issued to `{endpoint_override}/{object_id}`.
 
@@ -110,6 +112,32 @@ request's callback runs in a worker pool sized by `num_threads`, so a slow
 callback cannot stall the poller. Size `num_threads` according to the amount of
 work each callback does. The default value is sufficient for lightweight callbacks.
 
+## Multi-NIC DRAM
+
+The RDMA descriptor carries the GID of the NIC the server will RDMA against. NVIDIA cuObject
+picks that NIC from the buffer's GPU: VRAM on distinct GPUs spreads across NICs, but **host
+(DRAM) memory has no GPU affinity and cuObject pins every host registration to a single
+NIC** — so cuObject DRAM transfers cannot use more than one link.
+
+This engine therefore routes **DRAM** through an in-process libibverbs DC client (VRAM and
+OBJ stay on cuObject — a pure per-segment-type split, no flag to choose). It opens one DC
+target context per NIC and round-robins memory regions across them, building the descriptor
+itself with the chosen NIC's GID. The `x-scal-rdma` DC wire format and `dct_access_key`
+match cuObject's, so the server is unchanged. To spread across all NICs, register at least
+one buffer per NIC (e.g. nixlbench `--mode=MG --num_initiator_dev=<n>`, `n` ≥ NIC count).
+
+The NIC list resolves from `rdma_nics` (IPv4 addresses or device names like `mlx5_1`), or,
+when unset, from `cufile.json`'s `rdma_dev_addr_list` (`$CUFILE_ENV_PATH_JSON`, else
+`/etc/cufile.json`) — the same file and key cuObject uses. The DC access key resolves the
+same way: `rdma_dc_key`, else `cufile.json`'s `rdma_dc_key`, else `0xffeeddcc`. If no NICs
+resolve — or any fails to open — a DRAM registration fails with `NIXL_ERR_BACKEND` rather
+than silently falling back to single-NIC cuObject.
+
+Bonded (LAG) NICs are detected from sysfs; one DCT QP is created per physical port and
+regions round-robin across them (the distinct DCT QP numbers feed the hardware bond hash —
+DCT QPs cannot be pinned to a physical port directly). Requires libibverbs + libmlx5 at
+build time; otherwise a DRAM transfer fails at startup with a clear error.
+
 ## How a transfer works
 
 1. **Register memory.** Local **DRAM or VRAM (GPU)** buffers are registered for
@@ -124,8 +152,13 @@ work each callback does. The default value is sufficient for lightweight callbac
 
 ## Limitations
 
-- **DC transport only.** There is no fallback to other RDMA transports.
-- **4 GiB** maximum per memory registration (a cuObject limit).
+- **DC transport only.** Both the cuObject (VRAM/OBJ) and libibverbs (DRAM) paths use RDMA
+  DC; there is no RC fallback.
+- **4 GiB** maximum per memory registration (cuObject limit; the DC descriptor SIZE field
+  is also 32-bit).
+- **DRAM requires libibverbs/libmlx5 and a resolvable NIC list.** VRAM stays on cuObject
+  (GPUDirect peer-memory MR registration is not handled by the ibverbs client); there is no
+  cuObject DRAM path.
 - The **cuObject stack is required** at both build and run time; without it the
   engine does not exist.
 
@@ -147,4 +180,8 @@ Source layout (see the code for details):
 | `engine_impl.{h,cpp}` | `ScalityObjEngineImpl`: the engine (register / prepare / post / check). |
 | `client.{h,cpp}` | `RestClient`: the libcurl HTTP control-plane client, an event-driven `curl_multi` poller with a callback worker pool (behind the `iRestClient` interface, which is also the test-injection seam). See [Concurrency model](#concurrency-model). |
 | `rdma_token_client.h` | `iRdmaTokenClient`: the data-plane interface and the `getCtx()` helper. |
+| `rdma_ctx.h` | `rdma_ctx_t`: the per-transfer context the token client fills with the descriptor. |
 | `cuobj_rdma_token_client.{h,cpp}` | `CuObjRdmaTokenClient`: the DC RDMA implementation, a thin wrapper over NVIDIA `cuObjClient` (`CUOBJ_PROTO_RDMA_DC_V1`). |
+| `ibverbs_dc_rdma_token_client.{h,cpp}` | `IbverbsDcRdmaTokenClient`: in-process libibverbs DC client for DRAM multi-NIC spreading (see [Multi-NIC DRAM](#multi-nic-dram)). |
+| `dc_descriptor.h` | libibverbs-free DC descriptor formatting + bond-slave parsing (unit-tested). |
+| `cufile_nics.h` | libibverbs-free `cufile.json` `rdma_dev_addr_list` extractor (unit-tested). |

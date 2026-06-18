@@ -207,6 +207,15 @@ NB_ARG_UINT64(obj_num_threads,
               0,
               "HTTP worker pool size for the accelerated OBJ connector. "
               "0 means use the engine default. Only used when obj_accelerated_enable=true");
+NB_ARG_STRING(obj_rdma_nics,
+              "",
+              "RDMA NICs for accelerated OBJ DRAM transfers: comma-separated IPv4 addresses or "
+              "device names (e.g. 10.10.40.208,10.10.48.208 or mlx5_1,mlx5_2). DRAM is spread "
+              "round-robin across them. Empty uses cufile.json rdma_dev_addr_list.");
+NB_ARG_STRING(obj_rdma_dc_key,
+              "",
+              "DC access key (hex) for accelerated OBJ DRAM transfers. Empty uses "
+              "cufile.json rdma_dc_key, else 0xffeeddcc.");
 
 // AZURE BLOB options - only used when backend is AZURE_BLOB
 NB_ARG_STRING(azure_blob_account_url, "", "Account URL for Azure Blob backend");
@@ -312,6 +321,8 @@ size_t xferBenchConfig::obj_crt_min_limit = 0;
 bool xferBenchConfig::obj_accelerated_enable = false;
 std::string xferBenchConfig::obj_accelerated_type = "";
 size_t xferBenchConfig::obj_num_threads = 0;
+std::string xferBenchConfig::obj_rdma_nics = "";
+std::string xferBenchConfig::obj_rdma_dc_key = "";
 std::string xferBenchConfig::azure_blob_account_url = "";
 std::string xferBenchConfig::azure_blob_container_name = "";
 std::string xferBenchConfig::azure_blob_connection_string = "";
@@ -464,6 +475,8 @@ xferBenchConfig::loadParams(void) {
             obj_accelerated_enable = NB_ARG(obj_accelerated_enable);
             obj_accelerated_type = NB_ARG(obj_accelerated_type);
             obj_num_threads = NB_ARG(obj_num_threads);
+            obj_rdma_nics = NB_ARG(obj_rdma_nics);
+            obj_rdma_dc_key = NB_ARG(obj_rdma_dc_key);
 
             // Validate OBJ S3 scheme
             if (obj_scheme != XFERBENCH_OBJ_SCHEME_HTTP &&

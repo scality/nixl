@@ -210,6 +210,8 @@ public:
     static bool obj_accelerated_enable;
     static std::string obj_accelerated_type;
     static size_t obj_num_threads;
+    static std::string obj_rdma_nics;
+    static std::string obj_rdma_dc_key;
     static std::string azure_blob_account_url;
     static std::string azure_blob_container_name;
     static std::string azure_blob_connection_string;

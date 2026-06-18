@@ -265,6 +265,13 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
             if (xferBenchConfig::obj_num_threads > 0) {
                 backend_params["num_threads"] = std::to_string(xferBenchConfig::obj_num_threads);
             }
+            if (!xferBenchConfig::obj_rdma_nics.empty()) {
+                backend_params["rdma_nics"] = xferBenchConfig::obj_rdma_nics;
+                std::cout << " (rdma nics: " << xferBenchConfig::obj_rdma_nics << ")";
+            }
+            if (!xferBenchConfig::obj_rdma_dc_key.empty()) {
+                backend_params["rdma_dc_key"] = xferBenchConfig::obj_rdma_dc_key;
+            }
             std::cout << std::endl;
         } else {
             std::cout << "OBJ backend with standard S3 enabled" << std::endl;
