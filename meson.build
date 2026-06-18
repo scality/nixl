@@ -140,6 +140,15 @@ if cuobj_dep.found()
     add_project_arguments('-DHAVE_CUOBJ_CLIENT', language: ['cpp'])
 endif
 
+# libibverbs + libmlx5 enable the in-process DC RDMA token client used by the
+# Scality AI Connector OBJ engine to spread DRAM transfers across NICs.
+ibverbs_dep = dependency('libibverbs', required: false)
+mlx5_dep = dependency('libmlx5', required: false)
+have_ibverbs_dc = ibverbs_dep.found() and mlx5_dep.found()
+if have_ibverbs_dc
+    add_project_arguments('-DHAVE_IBVERBS_DC', language: ['cpp'])
+endif
+
 # Search for Abseil dependencies in the system first
 absl_base_dep = dependency('absl_base', required: false)
 absl_log_dep = dependency('absl_log', required: false)

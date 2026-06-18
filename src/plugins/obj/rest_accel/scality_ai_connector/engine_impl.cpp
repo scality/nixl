@@ -20,7 +20,14 @@
 #include "common/nixl_log.h"
 #include <absl/strings/str_format.h>
 #include "cuobj_rdma_token_client.h"
+#include "rdma_ctx.h"
+#include "cufile_nics.h"
+#ifdef HAVE_IBVERBS_DC
+#include "ibverbs_dc_rdma_token_client.h"
+#endif
 #include <cassert>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <memory>
 #include <future>
@@ -76,17 +83,55 @@ objAccelEngineRegistrar reg_scality(
         return std::make_unique<ScalityObjEngineImpl>(p);
     });
 
-/**
- * RDMA context structure for cuObject operations.
- */
-typedef struct rdma_ctx {
-    /// RDMA descriptor string
-    std::string rdma_desc;
-} rdma_ctx_t;
-
 std::string
 objKeyFor(const std::string &metaInfo, uint64_t devId) {
     return metaInfo.empty() ? std::to_string(devId) : metaInfo;
+}
+
+/// Split a comma-separated list, trimming surrounding whitespace; skips empties.
+std::vector<std::string>
+splitCsv(const std::string &s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        size_t end = (comma == std::string::npos) ? s.size() : comma;
+        size_t a = s.find_first_not_of(" \t", start);
+        if (a != std::string::npos && a < end) {
+            size_t b = s.find_last_not_of(" \t", end - 1);
+            out.push_back(s.substr(a, b - a + 1));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return out;
+}
+
+/// Look up a key in customParams, returning a default when absent/empty.
+std::string
+paramOr(const nixl_b_params_t *params, const std::string &key, const std::string &def) {
+    if (params == nullptr) {
+        return def;
+    }
+    auto it = params->find(key);
+    return (it == params->end() || it->second.empty()) ? def : it->second;
+}
+
+/// Read cufile.json content (CUFILE_ENV_PATH_JSON, else /etc/cufile.json).
+/// Returns "" if unreadable. Used to resolve both the NIC list and the DC key.
+std::string
+readCufileJson() {
+    const char *env = std::getenv("CUFILE_ENV_PATH_JSON");
+    const std::string path = env ? env : "/etc/cufile.json";
+    std::ifstream f(path);
+    if (!f) {
+        return std::string();
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 
 /**
@@ -298,6 +343,61 @@ ScalityObjEngineImpl::ScalityObjEngineImpl(const nixlBackendInitParams *init_par
         NIXL_ERROR << "RDMA token client failed to connect.";
         return;
     }
+
+    // DRAM transfers route through an in-process libibverbs DC client that
+    // spreads host registrations across NICs (cuObject pins host memory to a
+    // single NIC); VRAM/OBJ stay on cuObject. Resolve the NIC list and DC key
+    // now: explicit customParams first, else cufile.json (rdma_dev_addr_list /
+    // rdma_dc_key), else the DC-key default. The client is built lazily on the
+    // first DRAM registration (see ensureHostClient), so VRAM-only runs never
+    // need NICs.
+    const nixl_b_params_t *params = init_params ? init_params->customParams : nullptr;
+    const std::string cufile = readCufileJson();
+
+    const std::string nics_param = paramOr(params, "rdma_nics", "");
+    if (!nics_param.empty()) {
+        rdmaNics_ = splitCsv(nics_param);
+    } else {
+        rdmaNics_ = parseRdmaDevAddrList(cufile);
+        if (!rdmaNics_.empty()) {
+            NIXL_INFO << "Resolved " << rdmaNics_.size()
+                      << " DRAM NIC(s) from cufile.json rdma_dev_addr_list";
+        }
+    }
+
+    std::string dckey = paramOr(params, "rdma_dc_key", "");
+    if (dckey.empty()) {
+        dckey = parseRdmaDcKey(cufile); // "" if absent/commented
+    }
+    dcKey_ = dckey.empty() ? 0xffeeddccULL : std::strtoull(dckey.c_str(), nullptr, 0);
+}
+
+nixl_status_t
+ScalityObjEngineImpl::ensureHostClient() {
+    std::lock_guard<std::mutex> lk(hostClientMu_);
+    if (hostClient_) {
+        return NIXL_SUCCESS;
+    }
+#ifdef HAVE_IBVERBS_DC
+    if (rdmaNics_.empty()) {
+        NIXL_ERROR << "DRAM RDMA requires a NIC list: set the 'rdma_nics' parameter "
+                      "(IPv4 addresses or device names like mlx5_1), or rdma_dev_addr_list "
+                      "in cufile.json";
+        return NIXL_ERR_BACKEND;
+    }
+    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_);
+    if (!client->isConnected()) {
+        NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM transfers";
+        return NIXL_ERR_BACKEND;
+    }
+    hostClient_ = std::move(client);
+    NIXL_INFO << "DRAM transfers using ibverbs DC across " << rdmaNics_.size() << " NIC(s)";
+    return NIXL_SUCCESS;
+#else
+    NIXL_ERROR << "DRAM RDMA requires libibverbs/libmlx5 at build time "
+                  "(HAVE_IBVERBS_DC undefined)";
+    return NIXL_ERR_BACKEND;
+#endif
 }
 
 nixl_status_t
@@ -325,6 +425,14 @@ ScalityObjEngineImpl::registerMem(const nixlBlobDesc &mem,
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
+        // DRAM uses the ibverbs DC client (multi-NIC); build it on first use.
+        if (nixl_mem == DRAM_SEG) {
+            nixl_status_t st = ensureHostClient();
+            if (st != NIXL_SUCCESS) {
+                return st;
+            }
+        }
+
         NIXL_DEBUG << absl::StrFormat("registerMem: addr=0x%016x, len=%zu, nixl_mem=%d, devId=%d",
                                       mem.addr,
                                       mem.len,
@@ -338,11 +446,13 @@ ScalityObjEngineImpl::registerMem(const nixlBlobDesc &mem,
             dev_guard.emplace((int)mem.devId);
         }
 
-        cuObjErr_t cuda_status = cuClient_->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
+        cuObjErr_t cuda_status =
+            clientFor(nixl_mem)->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
         if (cuda_status != CU_OBJ_SUCCESS) {
             NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << cuda_status;
             const char *cfg = std::getenv("CUFILE_ENV_PATH_JSON");
-            NIXL_ERROR << "Hint: check rdma_dev_addr_list in " << (cfg ? cfg : "/etc/cufile.json");
+            NIXL_ERROR << "Hint: check rdma_dev_addr_list in " << (cfg ? cfg : "/etc/cufile.json")
+                       << " (cuObject) or the 'rdma_nics' list (ibverbs_dc)";
             return NIXL_ERR_BACKEND;
         }
         out = mem_md.release();
@@ -367,7 +477,7 @@ ScalityObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
                 dev_guard.emplace((int)mem_md_ptr->devId);
             }
             cuObjErr_t cuda_status =
-                cuClient_->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
+                clientFor(mem_md_ptr->nixlMem)->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
             if (cuda_status != CU_OBJ_SUCCESS) {
                 NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << cuda_status;
                 // mem_md_ptr destructor frees the metadata as deregisterMem consumes it
@@ -398,6 +508,10 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
 
     auto req_h = std::make_unique<nixlScalityObjBackendReqH>();
 
+    // Local buffers of one transfer share a segment type, so the token client is
+    // chosen once: DRAM via the ibverbs DC client when configured, else cuObject.
+    const std::shared_ptr<iRdmaTokenClient> &tokenClient = clientFor(local.getType());
+
     for (int i = 0; i < local.descCount(); ++i) {
         scalityObjTransferRequestH req(local[i].addr, local[i].len, remote[i].addr);
 
@@ -411,14 +525,14 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
 
         if (operation == NIXL_WRITE) {
             ssize_t cuda_status =
-                cuClient_->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
+                tokenClient->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
             if (cuda_status < 0) {
                 NIXL_ERROR << "cuObjPut failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;
             }
         } else if (operation == NIXL_READ) {
             ssize_t cuda_status =
-                cuClient_->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
+                tokenClient->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
             if (cuda_status < 0) {
                 NIXL_ERROR << "cuObjGet failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;
