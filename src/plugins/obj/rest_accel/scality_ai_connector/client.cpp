@@ -310,7 +310,9 @@ RestClient::submitRdmaRequest(const char *op_name,
                               std::string_view key,
                               std::string_view rdma_desc,
                               bool is_upload,
-                              std::function<void(bool)> callback) {
+                              std::function<void(bool)> callback,
+                              size_t data_len,
+                              size_t offset) {
     auto ctx = std::make_unique<RequestCtx>();
     ctx->op_name = op_name;
     ctx->method = is_upload ? restMethod::PUT : restMethod::GET;
@@ -331,6 +333,13 @@ RestClient::submitRdmaRequest(const char *op_name,
     if (is_upload) {
         // Content-Length: 0; data is transferred via RDMA, not the HTTP body.
         ctx->headers = curl_slist_append(ctx->headers, "Content-Length: 0");
+    } else if (offset > 0 && data_len > 0) {
+        // Partial read: convey the object byte-range to sproxyd so biziod RDMA-writes
+        // object[offset : offset+data_len] into the (offset-0) local buffer. The offset==0
+        // path is unchanged (no Range header), preserving the proven whole-object read.
+        std::string range_header =
+            absl::StrFormat("Range: bytes=%zu-%zu", offset, offset + data_len - 1);
+        ctx->headers = curl_slist_append(ctx->headers, range_header.c_str());
     }
 
     buildEasy(ctx.get());
@@ -415,7 +424,8 @@ RestClient::getObjectRdmaAsync(std::string_view key,
     }
 
     submitRdmaRequest(
-        "getObjectRdmaAsync", key, rdma_desc, /*is_upload=*/false, std::move(callback));
+        "getObjectRdmaAsync", key, rdma_desc, /*is_upload=*/false, std::move(callback),
+        data_len, offset);
 }
 
 void
