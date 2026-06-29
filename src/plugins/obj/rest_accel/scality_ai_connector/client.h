@@ -167,7 +167,9 @@ private:
                       std::string_view key,
                       std::string_view rdma_desc,
                       bool is_upload,
-                      std::function<void(bool)> callback);
+                      std::function<void(bool)> callback,
+                      size_t data_len = 0,
+                      size_t offset = 0);
 
     /// Apply URL + method-specific curl options to a request's easy handle.
     static void
