@@ -849,6 +849,12 @@ cleanupBasicDescVram(xferBenchIOV &iov) {
 
 static void
 cleanupBasicDescObj(xferBenchIOV &iov) {
+    // With --obj_unique_keys the base name is never written (each WRITE targets
+    // a unique key); those keys are batch-deleted separately in
+    // deallocateMemory, so there is nothing to remove here.
+    if (xferBenchConfig::obj_unique_keys) {
+        return;
+    }
     if (!xferBenchUtils::rmObj(iov.metaInfo)) {
         std::cerr << "Failed to remove object: " << iov.metaInfo << std::endl;
         exit(EXIT_FAILURE);
@@ -1182,6 +1188,17 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
 
 void
 xferBenchNixlWorker::deallocateMemory(std::vector<std::vector<xferBenchIOV>> &iov_lists) {
+    // --obj_unique_keys: bulk-remove every unique object written during the run.
+    // Done before deregistration; for OBJ, deregister is only a devId->key map
+    // erase, so ordering is not load-bearing here.
+    if (xferBenchConfig::obj_unique_keys && !obj_generated_keys_.empty()) {
+        std::cout << "Batch-deleting " << obj_generated_keys_.size()
+                  << " unique objects created during the run" << std::endl;
+        if (!xferBenchUtils::rmObjBatch(obj_generated_keys_)) {
+            std::cerr << "Warning: some unique objects may not have been removed" << std::endl;
+        }
+        obj_generated_keys_.clear();
+    }
     // Ordering: deregister remote regions before local ones
     // (remote registrations may reference local buffers).
     // NixlMemRegion::release() handles deregisterMem + per-IOV cleanup.
@@ -1441,6 +1458,39 @@ deregisterIterationMem(nixlAgent *agent,
     return NIXL_SUCCESS;
 }
 
+// Shared state for --obj_unique_keys: a monotonic counter (unique suffix
+// source) plus a mutex-guarded sink that collects every emitted key for
+// batch delete at teardown. Lives on the worker; a pointer is threaded into
+// execTransferLoop (nullptr disables the feature).
+struct uniqueObjKeyCtx {
+    std::atomic<uint64_t> &counter;
+    std::mutex &keys_mutex;
+    std::vector<std::string> &keys;
+};
+
+// (De)register only the remote OBJ descriptor list, leaving the local (VRAM)
+// registration untouched. For OBJ this is a devId->key map update in the
+// engine with no network cost, so it stays out of the measured Tx window.
+static nixl_status_t
+deregisterRemoteObj(nixlAgent *agent,
+                    const std::vector<xferBenchIOV> &remote_iov,
+                    nixlBackendH *backend_engine) {
+    nixl_opt_args_t reg_args;
+    reg_args.backends.push_back(backend_engine);
+    nixl_reg_dlist_t remote_reg = iovListToNixlRegDlist(remote_iov, getRemoteSegType());
+    return agent->deregisterMem(remote_reg, &reg_args);
+}
+
+static nixl_status_t
+registerRemoteObj(nixlAgent *agent,
+                  const std::vector<xferBenchIOV> &remote_iov,
+                  nixlBackendH *backend_engine) {
+    nixl_opt_args_t reg_args;
+    reg_args.backends.push_back(backend_engine);
+    nixl_reg_dlist_t remote_reg = iovListToNixlRegDlist(remote_iov, getRemoteSegType());
+    return agent->registerMem(remote_reg, &reg_args);
+}
+
 // Per-slot state for execTransferLoop. A slot owns its slice of the IOV
 // vector for the lifetime of the run; req/registered track the current
 // nixlXferReqH and registration state so the prepare/post/recycle helpers
@@ -1455,7 +1505,68 @@ struct slotState {
     nixlDlistH *prep_local_dlist = nullptr;
     nixlDlistH *prep_remote_dlist = nullptr;
     std::vector<int> indices;
+    // --obj_unique_keys: registration-shaped OBJ descriptors ({addr:0,
+    // len:max_block_size, devId, name}), matching the init registration so
+    // (de)register round-trips exactly. Only the name is mutated per iteration;
+    // the block-shaped remote_iov used for the transfer is left untouched
+    // (postXfer keys the object by devId, not the transfer descriptor). Also
+    // the base names and whether the slot is currently on a unique name.
+    std::vector<xferBenchIOV> obj_reg_iov;
+    std::vector<std::string> base_metaInfo;
+    bool obj_unique_registered = false;
 };
+
+// Re-point a slot's remote OBJ descriptors at fresh unique keys: deregister the
+// current names, assign "<base>_<n>" per descriptor (recording each key), then
+// register the new names so the engine binds devId->new key. Caller recreates
+// the xfer req afterwards.
+static nixl_status_t
+rebindSlotUniqueObjKeys(nixlAgent *agent,
+                        nixlBackendH *backend_engine,
+                        slotState &slot,
+                        uniqueObjKeyCtx &ctx,
+                        std::vector<std::string> &collected) {
+    nixl_status_t rc = deregisterRemoteObj(agent, slot.obj_reg_iov, backend_engine);
+    if (rc != NIXL_SUCCESS) {
+        return rc;
+    }
+    slot.obj_unique_registered = false;
+    for (size_t j = 0; j < slot.obj_reg_iov.size(); j++) {
+        const uint64_t n = ctx.counter.fetch_add(1, std::memory_order_relaxed);
+        std::string key = slot.base_metaInfo[j] + "_" + std::to_string(n);
+        collected.push_back(key);
+        slot.obj_reg_iov[j].metaInfo = key;
+        // Keep the transfer descriptor's name in sync with the registration so
+        // createXferReq resolves it to the same registered region.
+        slot.remote_iov[j].metaInfo = std::move(key);
+    }
+    rc = registerRemoteObj(agent, slot.obj_reg_iov, backend_engine);
+    if (rc != NIXL_SUCCESS) {
+        return rc;
+    }
+    slot.obj_unique_registered = true;
+    return NIXL_SUCCESS;
+}
+
+// Restore a slot's remote OBJ descriptors to their base names so the worker's
+// remote_regs_ teardown (which deregisters the base registration) stays
+// balanced. No-op unless the slot is currently on a unique name.
+static nixl_status_t
+restoreSlotBaseObjKeys(nixlAgent *agent, nixlBackendH *backend_engine, slotState &slot) {
+    if (!slot.obj_unique_registered) {
+        return NIXL_SUCCESS;
+    }
+    nixl_status_t rc = deregisterRemoteObj(agent, slot.obj_reg_iov, backend_engine);
+    if (rc != NIXL_SUCCESS) {
+        return rc;
+    }
+    for (size_t j = 0; j < slot.obj_reg_iov.size(); j++) {
+        slot.obj_reg_iov[j].metaInfo = slot.base_metaInfo[j];
+        slot.remote_iov[j].metaInfo = slot.base_metaInfo[j];
+    }
+    slot.obj_unique_registered = false;
+    return registerRemoteObj(agent, slot.obj_reg_iov, backend_engine);
+}
 
 // Register memory (if --reregister_mem) and create the XferReq for a slot
 // that doesn't already have one. Records the wall-clock time as
@@ -1585,6 +1696,9 @@ cleanupSlots(nixlAgent *agent, nixlBackendH *backend_engine, std::vector<slotSta
             deregisterIterationMem(agent, slot.local_iov, slot.remote_iov, backend_engine);
             slot.registered = false;
         }
+        // --obj_unique_keys: leave the base OBJ registration in place so the
+        // worker's remote_regs_ teardown deregisters a matching descriptor.
+        restoreSlotBaseObjKeys(agent, backend_engine, slot);
     }
 }
 
@@ -1603,13 +1717,18 @@ execTransferLoop(nixlAgent *agent,
                  xferBenchStats &thread_stats,
                  const std::vector<xferBenchIOV> &local_iov,
                  const std::vector<xferBenchIOV> &remote_iov,
-                 const std::atomic<int> *terminate_ptr = nullptr) {
+                 const std::atomic<int> *terminate_ptr = nullptr,
+                 uniqueObjKeyCtx *ukctx = nullptr) {
     const int depth = std::min(xferBenchConfig::pipeline_depth, num_iter);
     if (depth < xferBenchConfig::pipeline_depth) {
         std::cout << "Warning: pipeline_depth (" << xferBenchConfig::pipeline_depth
                   << ") exceeds num_iter (" << num_iter << "), capping to " << depth << std::endl;
     }
-    const bool recreate = xferBenchConfig::recreate_xfer;
+    // --obj_unique_keys: every posted WRITE targets a fresh object key. This
+    // forces a per-iteration req rebuild (like --recreate_xfer) so the new key
+    // takes effect.
+    const bool unique = (ukctx != nullptr) && (op == NIXL_WRITE);
+    const bool recreate = xferBenchConfig::recreate_xfer || unique;
 
     if (local_iov.size() % depth != 0) {
         std::cerr << "Error: descriptor count (" << local_iov.size()
@@ -1618,12 +1737,39 @@ execTransferLoop(nixlAgent *agent,
     }
     const size_t entries_per_slot = local_iov.size() / depth;
 
+    // Keys emitted this call are collected locally (no per-post locking) and
+    // merged into the shared sink on return, on every exit path.
+    std::vector<std::string> collected_keys;
+    struct KeyFlusher {
+        uniqueObjKeyCtx *ctx;
+        std::vector<std::string> *local;
+        ~KeyFlusher() {
+            if (ctx && !local->empty()) {
+                std::lock_guard<std::mutex> lk(ctx->keys_mutex);
+                ctx->keys.insert(ctx->keys.end(),
+                                 std::make_move_iterator(local->begin()),
+                                 std::make_move_iterator(local->end()));
+            }
+        }
+    } key_flusher{unique ? ukctx : nullptr, &collected_keys};
+
     std::vector<slotState> slots(depth);
     for (int s = 0; s < depth; s++) {
         auto lb = local_iov.begin() + s * entries_per_slot;
         auto rb = remote_iov.begin() + s * entries_per_slot;
         slots[s].local_iov.assign(lb, lb + entries_per_slot);
         slots[s].remote_iov.assign(rb, rb + entries_per_slot);
+        if (unique) {
+            // Canonical registration descriptors matching the init-time OBJ
+            // registration ({addr:0, len:max_block_size, devId, base name}).
+            slots[s].base_metaInfo.reserve(slots[s].remote_iov.size());
+            slots[s].obj_reg_iov.reserve(slots[s].remote_iov.size());
+            for (const auto &riov : slots[s].remote_iov) {
+                slots[s].base_metaInfo.push_back(riov.metaInfo);
+                slots[s].obj_reg_iov.emplace_back(
+                    0, xferBenchConfig::max_block_size, riov.devId, riov.metaInfo);
+            }
+        }
     }
 
     int issued = 0;
@@ -1633,6 +1779,16 @@ execTransferLoop(nixlAgent *agent,
         if (terminate_ptr && terminate_ptr->load()) [[unlikely]] {
             cleanupSlots(agent, backend_engine, slots);
             return -1;
+        }
+        if (unique) {
+            nixl_status_t rc =
+                rebindSlotUniqueObjKeys(agent, backend_engine, slots[s], *ukctx, collected_keys);
+            if (rc != NIXL_SUCCESS) [[unlikely]] {
+                std::cerr << "rebindSlotUniqueObjKeys failed for slot " << s << ": "
+                          << nixlEnumStrings::statusStr(rc) << std::endl;
+                cleanupSlots(agent, backend_engine, slots);
+                return -1;
+            }
         }
         nixl_status_t rc =
             prepareSlot(agent, backend_engine, op, target, params, thread_stats, slots[s]);
@@ -1695,6 +1851,16 @@ execTransferLoop(nixlAgent *agent,
                     cleanupSlots(agent, backend_engine, slots);
                     return -1;
                 }
+                if (unique) {
+                    rc = rebindSlotUniqueObjKeys(
+                        agent, backend_engine, slots[s], *ukctx, collected_keys);
+                    if (rc != NIXL_SUCCESS) [[unlikely]] {
+                        std::cerr << "rebindSlotUniqueObjKeys failed on resubmit for slot " << s
+                                  << ": " << nixlEnumStrings::statusStr(rc) << std::endl;
+                        cleanupSlots(agent, backend_engine, slots);
+                        return -1;
+                    }
+                }
                 rc = prepareSlot(agent, backend_engine, op, target, params, thread_stats, slots[s]);
                 if (rc != NIXL_SUCCESS) [[unlikely]] {
                     std::cerr << "prepareSlot failed on resubmit for slot " << s << ": "
@@ -1728,7 +1894,8 @@ execTransfer(nixlAgent *agent,
              const int num_iter,
              const int num_threads,
              xferBenchStats &stats,
-             const std::atomic<int> *terminate_ptr = nullptr) {
+             const std::atomic<int> *terminate_ptr = nullptr,
+             uniqueObjKeyCtx *ukctx = nullptr) {
     int ret = 0;
     stats.clear();
 
@@ -1757,7 +1924,8 @@ execTransfer(nixlAgent *agent,
                                       thread_stats,
                                       local_iov,
                                       remote_iov,
-                                      terminate_ptr);
+                                      terminate_ptr,
+                                      ukctx);
 
         if (result != 0) [[unlikely]] {
             ret = result;
@@ -1782,6 +1950,12 @@ xferBenchNixlWorker::transfer(size_t block_size,
     int ret = 0;
     nixl_xfer_op_t xfer_op = XFERBENCH_OP_READ == xferBenchConfig::op_type ? NIXL_READ : NIXL_WRITE;
 
+    // --obj_unique_keys (validated WRITE + OBJ only): give each posted WRITE a
+    // fresh object key. The context (counter + collected-keys sink) is shared
+    // across warmup, measured, and the whole block-size sweep.
+    uniqueObjKeyCtx ukctx{obj_unique_key_counter_, obj_generated_keys_mutex_, obj_generated_keys_};
+    uniqueObjKeyCtx *ukctx_ptr = xferBenchConfig::obj_unique_keys ? &ukctx : nullptr;
+
     if (!rt->checkKeepAlive()) { // also refreshes the lease internally.
         std::cerr << "nixlbench: keepalive failed before transfer — aborting" << std::endl;
         return std::variant<xferBenchStats, int>(-1);
@@ -1802,7 +1976,8 @@ xferBenchNixlWorker::transfer(size_t block_size,
                            skip,
                            xferBenchConfig::num_threads,
                            stats,
-                           &terminate);
+                           &terminate,
+                           ukctx_ptr);
         if (ret < 0) {
             return std::variant<xferBenchStats, int>(ret);
         }
@@ -1821,7 +1996,8 @@ xferBenchNixlWorker::transfer(size_t block_size,
                        num_iter,
                        xferBenchConfig::num_threads,
                        stats,
-                       &terminate);
+                       &terminate,
+                       ukctx_ptr);
     if (ret < 0) {
         return std::variant<xferBenchStats, int>(ret);
     }

@@ -19,7 +19,9 @@
 #define NIXL_BENCHMARK_NIXLBENCH_SRC_WORKER_NIXL_NIXL_WORKER_H
 
 #include "config.h"
+#include <atomic>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <variant>
@@ -43,6 +45,13 @@ class xferBenchNixlWorker: public xferBenchWorker {
         std::vector<NixlMemRegion> remote_regs_;
         std::vector<NixlMemRegion> local_regs_;
         std::vector<GusliDeviceConfig> gusli_devices;
+
+        // --obj_unique_keys state: a monotonic counter feeds a unique suffix per
+        // posted WRITE, and every emitted key is collected for batch delete at
+        // teardown (deallocateMemory).
+        std::atomic<uint64_t> obj_unique_key_counter_{0};
+        std::mutex obj_generated_keys_mutex_;
+        std::vector<std::string> obj_generated_keys_;
 
     public:
         explicit xferBenchNixlWorker(const std::vector<std::string> &devices);

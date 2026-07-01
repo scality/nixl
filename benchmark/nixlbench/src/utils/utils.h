@@ -212,6 +212,7 @@ public:
     static size_t obj_num_threads;
     static std::string obj_rdma_nics;
     static std::string obj_rdma_dc_key;
+    static bool obj_unique_keys;
     static std::string azure_blob_account_url;
     static std::string azure_blob_container_name;
     static std::string azure_blob_connection_string;
@@ -384,6 +385,10 @@ public:
     getObj(const std::string &name);
     static bool
     rmObj(const std::string &name);
+    // Bulk-delete many objects. REST backend uses the sproxyd .batch_delete
+    // endpoint (chunked); other backends fall back to per-key removal.
+    static bool
+    rmObjBatch(const std::vector<std::string> &names);
     static bool
     putObjS3(size_t buffer_size, const std::string &name);
     static bool
@@ -394,6 +399,8 @@ public:
     putObjRest(size_t buffer_size, const std::string &name);
     static bool
     rmObjRest(const std::string &name);
+    static bool
+    rmObjRestBatch(const std::vector<std::string> &names);
 
     static bool
     checkConsistency(std::vector<std::vector<xferBenchIOV>> &desc_lists);

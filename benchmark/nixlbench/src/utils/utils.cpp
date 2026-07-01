@@ -216,6 +216,11 @@ NB_ARG_STRING(obj_rdma_dc_key,
               "",
               "DC access key (hex) for accelerated OBJ DRAM transfers. Empty uses "
               "cufile.json rdma_dc_key, else 0xffeeddcc.");
+NB_ARG_BOOL(obj_unique_keys,
+            false,
+            "Generate a unique object key for every posted WRITE so no key is overwritten "
+            "(required for stores that reject overwrites). WRITE-only; keys are batch-deleted "
+            "at teardown.");
 
 // AZURE BLOB options - only used when backend is AZURE_BLOB
 NB_ARG_STRING(azure_blob_account_url, "", "Account URL for Azure Blob backend");
@@ -323,6 +328,7 @@ std::string xferBenchConfig::obj_accelerated_type = "";
 size_t xferBenchConfig::obj_num_threads = 0;
 std::string xferBenchConfig::obj_rdma_nics = "";
 std::string xferBenchConfig::obj_rdma_dc_key = "";
+bool xferBenchConfig::obj_unique_keys = false;
 std::string xferBenchConfig::azure_blob_account_url = "";
 std::string xferBenchConfig::azure_blob_container_name = "";
 std::string xferBenchConfig::azure_blob_connection_string = "";
@@ -477,6 +483,7 @@ xferBenchConfig::loadParams(void) {
             obj_num_threads = NB_ARG(obj_num_threads);
             obj_rdma_nics = NB_ARG(obj_rdma_nics);
             obj_rdma_dc_key = NB_ARG(obj_rdma_dc_key);
+            obj_unique_keys = NB_ARG(obj_unique_keys);
 
             // Validate OBJ S3 scheme
             if (obj_scheme != XFERBENCH_OBJ_SCHEME_HTTP &&
@@ -512,6 +519,14 @@ xferBenchConfig::loadParams(void) {
     scheme = NB_ARG(scheme);
     mode = NB_ARG(mode);
     op_type = NB_ARG(op_type);
+    // Unique keys only make sense for WRITE: READ pre-populates unique-per-run
+    // objects and re-reading a key never conflicts. (obj_unique_keys is only
+    // ever set true for the OBJ backend above.)
+    if (obj_unique_keys && op_type != XFERBENCH_OP_WRITE) {
+        std::cerr << "Warning: --obj_unique_keys only applies to WRITE; ignoring for this op type"
+                  << std::endl;
+        obj_unique_keys = false;
+    }
     check_consistency = NB_ARG(check_consistency);
     total_buffer_size = NB_ARG(total_buffer_size);
     num_initiator_dev = NB_ARG(num_initiator_dev);
@@ -766,6 +781,9 @@ xferBenchConfig::printConfig() {
             printOption("OBJ accelerated connector threads (--obj_num_threads=N)",
                         obj_num_threads > 0 ? std::to_string(obj_num_threads) :
                                               "0 (engine default)");
+            printOption("OBJ unique keys (--obj_unique_keys=[true|false])",
+                        obj_unique_keys ? "true (unique key per WRITE)" :
+                                          "false (reuse key across iterations)");
         }
 
         if (backend == XFERBENCH_BACKEND_AZURE_BLOB) {
@@ -1525,6 +1543,113 @@ xferBenchUtils::rmObjRest(const std::string &name) {
 }
 
 bool
+xferBenchUtils::rmObjRestBatch(const std::vector<std::string> &names) {
+    if (names.empty()) {
+        return true;
+    }
+    std::string endpoint = xferBenchConfig::obj_endpoint_override;
+    if (endpoint.empty()) {
+        std::cerr << "Error: obj_endpoint_override required for REST object cleanup" << std::endl;
+        return false;
+    }
+    if (endpoint.back() == '/') {
+        endpoint.pop_back();
+    }
+    // The endpoint already carries the driver alias (e.g. .../bpstrip); the
+    // sproxyd batch-delete op lives at "<alias>/.batch_delete".
+    const std::string url = endpoint + "/.batch_delete";
+
+    // sproxyd .batch_delete accepts at most 1000 keys (and a 1 MiB payload;
+    // the benchmark's short keys stay far under that, so we chunk on count).
+    constexpr size_t kMaxKeysPerBatch = 1000;
+    bool all_ok = true;
+
+    for (size_t start = 0; start < names.size(); start += kMaxKeysPerBatch) {
+        const size_t end = std::min(start + kMaxKeysPerBatch, names.size());
+
+        // Body is {"keys":["<name>",...]}. Keys are the same path segments used
+        // by the single-object PUT/DELETE (endpoint + "/" + name). Benchmark
+        // names are limited to [A-Za-z0-9_], so no JSON escaping is needed.
+        std::string body = "{\"keys\":[";
+        for (size_t i = start; i < end; i++) {
+            if (i != start) {
+                body += ',';
+            }
+            body += '"';
+            body += names[i];
+            body += '"';
+        }
+        body += "]}";
+
+        CURL *curl = restAcquireHandle();
+        if (!curl) {
+            restLogLine(std::cerr, "Warning: batch delete failed: curl handle unavailable");
+            all_ok = false;
+            continue;
+        }
+
+        std::string response_body;
+        restLogLine(std::cout,
+                    "Batch-deleting " + std::to_string(end - start) + " REST objects");
+
+        struct curl_slist *headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        if (!xferBenchConfig::obj_ca_bundle.empty()) {
+            curl_easy_setopt(curl, CURLOPT_CAINFO, xferBenchConfig::obj_ca_bundle.c_str());
+        }
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, restCurlCaptureBody);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+        // The batch response carries no large body, so a hard total timeout is
+        // safe alongside the connection-setup cap.
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 30000L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 30000L);
+
+        // Batch delete is idempotent, so retry connect-class failures (a burst
+        // of cold connections at teardown can overflow the accept backlog).
+        constexpr int kMaxAttempts = 4;
+        CURLcode res = CURLE_OK;
+        long http_code = 0;
+        for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+            response_body.clear();
+            res = curl_easy_perform(curl);
+            http_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+            bool transient = (res == CURLE_COULDNT_CONNECT) || (res == CURLE_OPERATION_TIMEDOUT) ||
+                (res == CURLE_COULDNT_RESOLVE_HOST) || (res == CURLE_SEND_ERROR) ||
+                (res == CURLE_RECV_ERROR);
+            if (!transient || attempt == kMaxAttempts - 1) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 << attempt));
+        }
+
+        curl_slist_free_all(headers);
+
+        // 200 means the keys were accepted (deletion is asynchronous on the RING).
+        bool ok = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
+        if (!ok) {
+            std::string msg = "Warning: batch delete failed (curl_code " +
+                std::to_string((int)res) + ", HTTP " + std::to_string(http_code) + ") POST " + url;
+            if (!response_body.empty()) {
+                msg += "\n  response: " + response_body;
+            }
+            restLogLine(std::cerr, msg);
+            all_ok = false;
+        }
+    }
+
+    return all_ok;
+}
+
+bool
 xferBenchUtils::putObj(size_t buffer_size, const std::string &name) {
     if (xferBenchConfig::backend == XFERBENCH_BACKEND_INFINIA) {
         // INFINIA backends don't need external CLI put
@@ -1578,6 +1703,28 @@ xferBenchUtils::rmObj(const std::string &name) {
                   << xferBenchConfig::backend << std::endl;
         return false;
     }
+}
+
+bool
+xferBenchUtils::rmObjBatch(const std::vector<std::string> &names) {
+    if (names.empty()) {
+        return true;
+    }
+    if (xferBenchConfig::backend == XFERBENCH_BACKEND_INFINIA) {
+        return true;
+    }
+    // Only the REST (sproxyd) backend has a bulk-delete endpoint; other object
+    // stores are removed one key at a time.
+    if (xferBenchConfig::backend == XFERBENCH_BACKEND_OBJ && xferBenchConfig::isRestBackend()) {
+        return rmObjRestBatch(names);
+    }
+    bool all_ok = true;
+    for (const auto &name : names) {
+        if (!rmObj(name)) {
+            all_ok = false;
+        }
+    }
+    return all_ok;
 }
 
 bool
