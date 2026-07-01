@@ -1594,6 +1594,12 @@ xferBenchUtils::rmObjRestBatch(const std::vector<std::string> &names) {
 
         struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
+        // Force a plain Content-Length POST: suppress libcurl's automatic
+        // "Expect: 100-continue" and any chunked transfer encoding. Otherwise
+        // the sproxyd endpoint parses the chunk-size line as a bare JSON number
+        // and rejects the body with "not a JSON object".
+        headers = curl_slist_append(headers, "Expect:");
+        headers = curl_slist_append(headers, "Transfer-Encoding:");
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         if (!xferBenchConfig::obj_ca_bundle.empty()) {
@@ -1602,8 +1608,9 @@ xferBenchUtils::rmObjRestBatch(const std::vector<std::string> &names) {
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        // Set the size before the fields so libcurl sends Content-Length.
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, restCurlCaptureBody);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
         // The batch response carries no large body, so a hard total timeout is
