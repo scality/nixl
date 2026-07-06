@@ -230,6 +230,19 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
     nic.num_lag_ports = numLagPorts(ibv_get_device_name(nic.ctx->device));
     NIXL_INFO << "ibverbs_dc: NIC " << ip << " LAG ports: " << nic.num_lag_ports;
 
+    // Device ceilings that bound RDMA READ concurrency: max_qp_rd_atom caps the
+    // DCT responder resources (max_dest_rd_atomic) this target can grant to a
+    // remote reader (biziod). If the DCT ends up below this ceiling, biziod's
+    // read pipeline is throttled regardless of its own max_rd_atomic.
+    ibv_device_attr dev_attr{};
+    if (ibv_query_device(nic.ctx, &dev_attr) == 0) {
+        NIXL_INFO << "ibverbs_dc: NIC " << ip << " device caps: max_qp_rd_atom="
+                  << dev_attr.max_qp_rd_atom
+                  << " max_qp_init_rd_atom=" << dev_attr.max_qp_init_rd_atom;
+    } else {
+        NIXL_WARN << "ibverbs_dc: ibv_query_device failed for " << ip;
+    }
+
     nic.pd = ibv_alloc_pd(nic.ctx);
     if (!nic.pd) {
         NIXL_ERROR << "ibverbs_dc: ibv_alloc_pd failed for " << ip;
@@ -305,6 +318,19 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 
         nic.dctns[p] = nic.dct_qps[p]->qp_num;
         NIXL_INFO << "ibverbs_dc: NIC " << ip << " DCT QP[" << p << "] dctn=" << nic.dctns[p];
+
+        // Report the negotiated responder capacity: how many concurrent incoming
+        // RDMA READs this DCT will service. The RTR modify above does not set
+        // IBV_QP_MAX_DEST_RD_ATOMIC, so this is the driver default and is the
+        // suspected ceiling on biziod's read pipeline throughput.
+        ibv_qp_attr qa{};
+        ibv_qp_init_attr qia{};
+        if (ibv_query_qp(nic.dct_qps[p], &qa, IBV_QP_MAX_DEST_RD_ATOMIC, &qia) == 0) {
+            NIXL_INFO << "ibverbs_dc: NIC " << ip << " DCT QP[" << p
+                      << "] max_dest_rd_atomic=" << (int)qa.max_dest_rd_atomic;
+        } else {
+            NIXL_WARN << "ibverbs_dc: ibv_query_qp(DCT) failed for " << ip;
+        }
     }
 
     ibv_port_attr port_attr{};
