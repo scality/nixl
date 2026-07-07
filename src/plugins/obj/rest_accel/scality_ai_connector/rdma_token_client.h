@@ -38,10 +38,12 @@ public:
 
     /**
      * Register a memory region and obtain an RDMA descriptor (token).
+     * @param dev_id CUDA device ordinal for VRAM buffers (affinity hint), or -1
+     *               for host memory / no affinity. Implementations may ignore it.
      * @return CU_OBJ_SUCCESS on success.
      */
     virtual cuObjErr_t
-    cuMemObjGetDescriptor(void *ptr, size_t size) = 0;
+    cuMemObjGetDescriptor(void *ptr, size_t size, int dev_id = -1) = 0;
 
     /**
      * Deregister a previously registered memory region.
