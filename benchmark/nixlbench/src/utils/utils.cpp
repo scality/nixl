@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -1251,7 +1252,10 @@ void
 xferBenchUtils::printStats(bool is_target,
                            size_t block_size,
                            size_t batch_size,
-                           xferBenchStats stats) {
+                           xferBenchStats stats,
+                           double cpu_usr_s,
+                           double cpu_sys_s,
+                           double wall_s) {
     size_t total_data_transferred = 0;
     double avg_latency = 0, throughput_gb = 0;
     double totalbw = 0;
@@ -1335,6 +1339,39 @@ xferBenchUtils::printStats(bool is_target,
                   << std::endl;
         // clang-format on
     }
+
+    // Machine-readable result line for downstream parsing, emitted only when
+    // NIXLBENCH_EMIT_RESULT is set in the environment. transfer_duration
+    // samples are per-transfer latencies (== per-object when batch_size == 1).
+    // Latencies in microseconds; CPU as process user/sys seconds over the
+    // measured wall window (divide by wall to get busy-core count).
+    if (getenv("NIXLBENCH_EMIT_RESULT") == nullptr) {
+        return;
+    }
+    double throughput_mibps = (throughput_gb * 1e9) / (1024.0 * 1024.0);
+    double obj_per_s = block_size > 0 ? (throughput_gb * 1e9) / (double)block_size : 0.0;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    std::cout << std::fixed << std::setprecision(3)
+              << "NIXLBENCH_RESULT"
+              << " op=" << (xferBenchConfig::op_type == XFERBENCH_OP_WRITE ? "WRITE" : "READ")
+              << " block_size=" << block_size
+              << " batch_size=" << batch_size
+              << " threads=" << xferBenchConfig::num_threads
+              << " initiator_dev=" << xferBenchConfig::num_initiator_dev
+              << " bw_gbps=" << throughput_gb
+              << " bw_mibps=" << throughput_mibps
+              << " obj_per_s=" << obj_per_s
+              << " lat_avg_us=" << stats.transfer_duration.avg()
+              << " lat_p90_us=" << stats.transfer_duration.p90()
+              << " lat_p99_us=" << stats.transfer_duration.p99()
+              << " lat_min_us=" << stats.transfer_duration.min()
+              << " lat_max_us=" << stats.transfer_duration.max()
+              << " lat_stddev_us=" << stats.transfer_duration.stddev()
+              << " cpu_usr_s=" << cpu_usr_s
+              << " cpu_sys_s=" << cpu_sys_s
+              << " wall_s=" << wall_s
+              << " ncpu=" << ncpu
+              << std::endl;
 }
 
 std::string
@@ -1986,6 +2023,18 @@ xferMetricStats::p99() {
     std::sort(samples.begin(), samples.end());
     size_t index = samples.size() * 0.99;
     return samples[std::min(index, samples.size() - 1)];
+}
+
+double
+xferMetricStats::stddev() const {
+    if (samples.size() < 2) return 0;
+    double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+    double sq_sum = 0;
+    for (double v : samples) {
+        double d = v - mean;
+        sq_sum += d * d;
+    }
+    return std::sqrt(sq_sum / (samples.size() - 1));
 }
 
 void

@@ -19,6 +19,7 @@
 #include <iostream>
 #include <nixl.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include "utils/utils.h"
 #include "utils/scope_guard.h"
 #include "worker/nixl/nixl_worker.h"
@@ -139,17 +140,32 @@ static int processBatchSizes(xferBenchWorker &worker,
             std::vector<std::vector<xferBenchIOV>> remote_trans_lists(
                 worker.exchangeIOV(local_trans_lists, block_size));
 
+            struct rusage ru_start, ru_end;
+            struct timeval wall_start, wall_end;
+            getrusage(RUSAGE_SELF, &ru_start);
+            gettimeofday(&wall_start, nullptr);
+
             auto result = worker.transfer(block_size, local_trans_lists, remote_trans_lists);
             if (std::holds_alternative<int>(result)) {
                 return 1;
             }
+
+            getrusage(RUSAGE_SELF, &ru_end);
+            gettimeofday(&wall_end, nullptr);
+            auto tv_diff = [](const struct timeval &a, const struct timeval &b) {
+                return (a.tv_sec - b.tv_sec) + (a.tv_usec - b.tv_usec) / 1e6;
+            };
+            double cpu_usr_s = tv_diff(ru_end.ru_utime, ru_start.ru_utime);
+            double cpu_sys_s = tv_diff(ru_end.ru_stime, ru_start.ru_stime);
+            double wall_s = tv_diff(wall_end, wall_start);
 
             if (!xferBenchUtils::validateTransfer(true, local_trans_lists, remote_trans_lists)) {
                 return EXIT_FAILURE;
             }
 
             xferBenchUtils::printStats(
-                false, block_size, batch_size, std::get<xferBenchStats>(result));
+                false, block_size, batch_size, std::get<xferBenchStats>(result),
+                cpu_usr_s, cpu_sys_s, wall_s);
         }
     }
 
