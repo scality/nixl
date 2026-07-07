@@ -94,12 +94,14 @@ public:
     releaseReqH(nixlBackendReqH *handle) const override;
 
 private:
-    /// Token client for a given segment type: DRAM -> ibverbs DC client
-    /// (multi-NIC); VRAM/OBJ -> cuObject. hostClient_ is built lazily on the
-    /// first DRAM registration, so this must only be called for DRAM after that.
+    /// Token client for a given segment type: DRAM and VRAM both use the
+    /// ibverbs DC client (multi-NIC, GPU/NIC-affinity aware); OBJ falls back to
+    /// cuClient_. hostClient_ is built lazily on the first DRAM/VRAM
+    /// registration, so this returns the ibverbs client only once it exists.
     const std::shared_ptr<iRdmaTokenClient> &
     clientFor(const nixl_mem_t &nixl_mem) const {
-        return (nixl_mem == DRAM_SEG && hostClient_) ? hostClient_ : cuClient_;
+        return ((nixl_mem == DRAM_SEG || nixl_mem == VRAM_SEG) && hostClient_) ? hostClient_
+                                                                               : cuClient_;
     }
 
     /// Build the ibverbs DC client (once) from the resolved NIC list. Returns
@@ -109,12 +111,13 @@ private:
 
     /// Maps device IDs to object keys
     std::unordered_map<uint64_t, std::string> devIdToObjKey_;
-    /// RDMA token client (DC via cuObjClient); used for VRAM and OBJ.
+    /// RDMA token client (DC via cuObjClient); retained for OBJ only, no longer
+    /// on the DRAM/VRAM data path (kept until a follow-up removal cleanup).
     std::shared_ptr<iRdmaTokenClient> cuClient_;
-    /// libibverbs DC token client for DRAM multi-NIC spreading (lazy).
+    /// libibverbs DC token client for DRAM/VRAM multi-NIC spreading (lazy).
     std::shared_ptr<iRdmaTokenClient> hostClient_;
     std::mutex hostClientMu_;
-    /// RDMA NIC specifiers (IPv4 or device names) for DRAM, resolved at
+    /// RDMA NIC specifiers (IPv4 or device names) for DRAM/VRAM, resolved at
     /// construction from customParams 'rdma_nics' or cufile.json.
     std::vector<std::string> rdmaNics_;
     /// DC access key for the ibverbs DC client.

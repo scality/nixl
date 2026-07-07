@@ -19,10 +19,18 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <limits.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
 
 #include "common/nixl_log.h"
 #include "rdma_ctx.h"
@@ -30,6 +38,60 @@
 namespace {
 
 constexpr int kDcPort = 1;
+
+/// Canonicalize a sysfs symlink to its /sys/devices/... target. Empty on failure.
+std::string
+canonicalPath(const std::string &path) {
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) == nullptr) {
+        return "";
+    }
+    return std::string(resolved);
+}
+
+/// Read a single integer from a sysfs file; returns fallback on any failure.
+int
+readIntFile(const std::string &path, int fallback = -1) {
+    std::ifstream f(path);
+    int v = fallback;
+    if (f && (f >> v)) {
+        return v;
+    }
+    return fallback;
+}
+
+/// Number of shared leading '/'-separated components between two paths. Used as
+/// a PCIe-proximity score: a longer shared prefix means a closer shared bridge.
+size_t
+commonPathPrefix(const std::string &a, const std::string &b) {
+    if (a.empty() || b.empty()) {
+        return 0;
+    }
+    std::stringstream sa(a), sb(b);
+    std::string ca, cb;
+    size_t n = 0;
+    while (std::getline(sa, ca, '/') && std::getline(sb, cb, '/')) {
+        if (ca != cb) {
+            break;
+        }
+        n++;
+    }
+    return n;
+}
+
+/// Canonical /sys PCIe path for a CUDA device, via its PCI bus id. Empty on error.
+std::string
+gpuPciPath(int dev_id) {
+    char busid[32] = {};
+    if (cudaDeviceGetPCIBusId(busid, sizeof(busid), dev_id) != cudaSuccess) {
+        return "";
+    }
+    // cudaDeviceGetPCIBusId yields upper-case "0000:1B:00.0"; sysfs uses lower-case.
+    for (char *p = busid; *p; ++p) {
+        *p = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+    }
+    return canonicalPath(std::string("/sys/bus/pci/devices/") + busid);
+}
 
 /// RoCE GID type via sysfs: 2 (RoCEv2), 1 (RoCEv1), 0 (IB), -1 on error.
 int
@@ -230,6 +292,15 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 
     nic.num_lag_ports = numLagPorts(ibv_get_device_name(nic.ctx->device));
     NIXL_INFO << "ibverbs_dc: NIC " << ip << " LAG ports: " << nic.num_lag_ports;
+
+    // Record PCIe topology for GPU/NIC affinity (used only as an advisory hint;
+    // failures degrade to no-affinity, never block).
+    nic.dev_name = ibv_get_device_name(nic.ctx->device);
+    const std::string ib_dev = "/sys/class/infiniband/" + nic.dev_name + "/device";
+    nic.pci_path = canonicalPath(ib_dev);
+    nic.numa_node = readIntFile(ib_dev + "/numa_node");
+    NIXL_INFO << "ibverbs_dc: NIC " << ip << " (" << nic.dev_name << ") pci_path='" << nic.pci_path
+              << "' numa_node=" << nic.numa_node;
 
     // Device ceilings that bound RDMA READ concurrency: max_qp_rd_atom caps the
     // DCT responder resources (max_dest_rd_atomic) this target can grant to a
@@ -433,8 +504,78 @@ IbverbsDcRdmaTokenClient::isConnected() const {
     return connected_;
 }
 
+const std::vector<int> &
+IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
+    auto it = gpu_affine_nics_.find(dev_id);
+    if (it != gpu_affine_nics_.end()) {
+        return it->second;
+    }
+
+    std::vector<int> affine;
+    const std::string gpu_path = gpuPciPath(dev_id);
+    int gpu_numa = -1;
+    if (!gpu_path.empty()) {
+        gpu_numa = readIntFile(gpu_path + "/numa_node");
+        // (a) NIC(s) sharing the longest PCIe-path prefix with the GPU: the
+        // closest shared bridge/switch, i.e. the best direct-P2P target.
+        size_t best = 0;
+        for (size_t i = 0; i < nics_.size(); ++i) {
+            size_t p = commonPathPrefix(gpu_path, nics_[i].pci_path);
+            if (p > best) {
+                best = p;
+                affine.clear();
+                affine.push_back(static_cast<int>(i));
+            } else if (p == best && best > 0) {
+                affine.push_back(static_cast<int>(i));
+            }
+        }
+        // A tie across every NIC means the shared prefix is just the sysfs root
+        // (no real locality); discard it so the NUMA fallback can discriminate.
+        if (affine.size() == nics_.size()) {
+            affine.clear();
+        }
+    }
+    // (b) fall back to same-NUMA NICs (avoids the cross-socket SYS path).
+    if (affine.empty() && gpu_numa >= 0) {
+        for (size_t i = 0; i < nics_.size(); ++i) {
+            if (nics_[i].numa_node == gpu_numa) {
+                affine.push_back(static_cast<int>(i));
+            }
+        }
+    }
+    // (c) fall back to all NICs; affinity is advisory, never a hard failure.
+    if (affine.empty()) {
+        NIXL_WARN << "ibverbs_dc: no PCIe/NUMA affinity for GPU " << dev_id << " (gpu_path='"
+                  << gpu_path << "'); using all NICs";
+        for (size_t i = 0; i < nics_.size(); ++i) {
+            affine.push_back(static_cast<int>(i));
+        }
+    } else {
+        std::string names;
+        for (int i : affine) {
+            names += (names.empty() ? "" : ",") + nics_[i].dev_name;
+        }
+        NIXL_INFO << "ibverbs_dc: GPU " << dev_id << " -> affine NIC(s): " << names;
+    }
+
+    auto res = gpu_affine_nics_.emplace(dev_id, std::move(affine));
+    return res.first->second;
+}
+
+int
+IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
+    // Host memory (dev_id < 0): global round-robin across all NICs, unchanged.
+    if (dev_id < 0) {
+        return static_cast<int>(reg_counter_++ % nics_.size());
+    }
+    // VRAM: round-robin within the GPU's PCIe-affine NIC set.
+    const std::vector<int> &affine = affineNicsFor(dev_id);
+    uint64_t &cursor = gpu_reg_cursor_[dev_id];
+    return affine[cursor++ % affine.size()];
+}
+
 cuObjErr_t
-IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size) {
+IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_id) {
     if (!connected_) {
         return CU_OBJ_FAIL;
     }
@@ -445,7 +586,9 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size) {
     }
 
     std::lock_guard<std::mutex> lk(mu_);
-    int nic_idx = static_cast<int>(reg_counter_++ % nics_.size());
+    // dev_id >= 0 (VRAM) selects a PCIe-affine NIC for the GPU; dev_id < 0 (host
+    // memory) keeps the global round-robin. See selectNicFor.
+    int nic_idx = selectNicFor(dev_id);
     NicCtx &nic = nics_[nic_idx];
 
     ibv_mr *mr = ibv_reg_mr(nic.pd,
@@ -462,6 +605,7 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size) {
     r.mr = mr;
     r.len = size;
     r.nic_idx = nic_idx;
+    r.dev_id = dev_id;
     r.dctn = nic.dctns[nic.lag_seq++ % nic.num_lag_ports];
     regions_[reinterpret_cast<uintptr_t>(ptr)] = r;
     return CU_OBJ_SUCCESS;
@@ -482,10 +626,55 @@ IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
     return CU_OBJ_SUCCESS;
 }
 
+void
+IbverbsDcRdmaTokenClient::logAssignment() {
+    // mu_ held by caller. Summarize registered regions as GPU -> per-NIC counts.
+    std::map<int, std::vector<size_t>> per_gpu; // dev_id -> count per NIC index
+    std::vector<size_t> per_nic(nics_.size(), 0);
+    for (const auto &kv : regions_) {
+        const Region &r = kv.second;
+        per_nic[r.nic_idx]++;
+        auto &v = per_gpu[r.dev_id];
+        if (v.empty()) {
+            v.assign(nics_.size(), 0);
+        }
+        v[r.nic_idx]++;
+    }
+
+    NIXL_INFO << "ibverbs_dc: GPU->NIC buffer assignment (" << regions_.size()
+              << " registered regions):";
+    for (const auto &g : per_gpu) {
+        std::string line;
+        for (size_t i = 0; i < nics_.size(); ++i) {
+            if (g.second[i] == 0) {
+                continue;
+            }
+            line += (line.empty() ? "" : " ") + nics_[i].dev_name + ":" +
+                    std::to_string(g.second[i]);
+        }
+        if (g.first < 0) {
+            NIXL_INFO << "ibverbs_dc:   host memory -> " << line;
+        } else {
+            NIXL_INFO << "ibverbs_dc:   GPU " << g.first << " -> " << line;
+        }
+    }
+    std::string totals;
+    for (size_t i = 0; i < nics_.size(); ++i) {
+        totals += (totals.empty() ? "" : " ") + nics_[i].dev_name + ":" +
+                  std::to_string(per_nic[i]);
+    }
+    NIXL_INFO << "ibverbs_dc:   per-NIC totals: " << totals;
+}
+
 std::string
 IbverbsDcRdmaTokenClient::descriptorFor(void *ptr, size_t size) {
     uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
     std::lock_guard<std::mutex> lk(mu_);
+    // Registrations are complete by the first transfer; dump the layout once.
+    if (!assignment_logged_) {
+        logAssignment();
+        assignment_logged_ = true;
+    }
     // Find the region [base, base+len) that contains addr.
     auto it = regions_.upper_bound(addr);
     if (it == regions_.begin()) {

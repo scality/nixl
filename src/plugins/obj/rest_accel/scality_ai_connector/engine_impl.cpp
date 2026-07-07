@@ -340,8 +340,10 @@ ScalityObjEngineImpl::ScalityObjEngineImpl(const nixlBackendInitParams *init_par
     cuClient_ = std::make_shared<CuObjRdmaTokenClient>(scality_ops);
 
     if (!cuClient_ || !cuClient_->isConnected()) {
-        NIXL_ERROR << "RDMA token client failed to connect.";
-        return;
+        // cuObject is no longer on the DRAM/VRAM data path (both use the ibverbs
+        // DC client) and OBJ_SEG needs no RDMA client, so a cuObject connect
+        // failure is not fatal here.
+        NIXL_WARN << "cuObject client not connected; DRAM/VRAM use the ibverbs DC client.";
     }
 
     // DRAM transfers route through an in-process libibverbs DC client that
@@ -380,18 +382,18 @@ ScalityObjEngineImpl::ensureHostClient() {
     }
 #ifdef HAVE_IBVERBS_DC
     if (rdmaNics_.empty()) {
-        NIXL_ERROR << "DRAM RDMA requires a NIC list: set the 'rdma_nics' parameter "
+        NIXL_ERROR << "DRAM/VRAM RDMA requires a NIC list: set the 'rdma_nics' parameter "
                       "(IPv4 addresses or device names like mlx5_1), or rdma_dev_addr_list "
                       "in cufile.json";
         return NIXL_ERR_BACKEND;
     }
     auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_);
     if (!client->isConnected()) {
-        NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM transfers";
+        NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM/VRAM transfers";
         return NIXL_ERR_BACKEND;
     }
     hostClient_ = std::move(client);
-    NIXL_INFO << "DRAM transfers using ibverbs DC across " << rdmaNics_.size() << " NIC(s)";
+    NIXL_INFO << "DRAM/VRAM transfers using ibverbs DC across " << rdmaNics_.size() << " NIC(s)";
     return NIXL_SUCCESS;
 #else
     NIXL_ERROR << "DRAM RDMA requires libibverbs/libmlx5 at build time "
@@ -404,11 +406,6 @@ nixl_status_t
 ScalityObjEngineImpl::registerMem(const nixlBlobDesc &mem,
                                   const nixl_mem_t &nixl_mem,
                                   nixlBackendMD *&out) {
-    if (!cuClient_ || !cuClient_->isConnected()) {
-        NIXL_ERROR << "RDMA token client is not connected.";
-        return NIXL_ERR_BACKEND;
-    }
-
     auto supported_mems = {OBJ_SEG, DRAM_SEG, VRAM_SEG};
     if (std::find(supported_mems.begin(), supported_mems.end(), nixl_mem) == supported_mems.end()) {
         return NIXL_ERR_NOT_SUPPORTED;
@@ -425,12 +422,11 @@ ScalityObjEngineImpl::registerMem(const nixlBlobDesc &mem,
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
-        // DRAM uses the ibverbs DC client (multi-NIC); build it on first use.
-        if (nixl_mem == DRAM_SEG) {
-            nixl_status_t st = ensureHostClient();
-            if (st != NIXL_SUCCESS) {
-                return st;
-            }
+        // DRAM and VRAM both use the ibverbs DC client (multi-NIC, GPU/NIC
+        // affinity for VRAM); build it on first use.
+        nixl_status_t st = ensureHostClient();
+        if (st != NIXL_SUCCESS) {
+            return st;
         }
 
         NIXL_DEBUG << absl::StrFormat("registerMem: addr=0x%016x, len=%zu, nixl_mem=%d, devId=%d",
@@ -442,12 +438,15 @@ ScalityObjEngineImpl::registerMem(const nixlBlobDesc &mem,
             std::make_unique<nixlScalityObjMetadata>(nixl_mem, mem.addr, mem.devId);
 
         std::optional<CudaDeviceGuard> dev_guard;
+        // VRAM passes the GPU ordinal as the NIC-affinity hint; DRAM passes -1.
+        int affinity_dev = -1;
         if (nixl_mem == VRAM_SEG) {
             dev_guard.emplace((int)mem.devId);
+            affinity_dev = (int)mem.devId;
         }
 
-        cuObjErr_t cuda_status =
-            clientFor(nixl_mem)->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
+        cuObjErr_t cuda_status = clientFor(nixl_mem)->cuMemObjGetDescriptor(
+            (void *)(mem.addr), mem.len, affinity_dev);
         if (cuda_status != CU_OBJ_SUCCESS) {
             NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << cuda_status;
             const char *cfg = std::getenv("CUFILE_ENV_PATH_JSON");
@@ -497,11 +496,6 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
                                const std::string &local_agent,
                                nixlBackendReqH *&handle,
                                const nixl_opt_b_args_t *opt_args) const {
-    if (!cuClient_ || !cuClient_->isConnected()) {
-        NIXL_ERROR << "RDMA token client is not connected.";
-        return NIXL_ERR_BACKEND;
-    }
-
     if (!isValidPrepXferParams(operation, local, remote, remote_agent, local_agent)) {
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -509,8 +503,12 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
     auto req_h = std::make_unique<nixlScalityObjBackendReqH>();
 
     // Local buffers of one transfer share a segment type, so the token client is
-    // chosen once: DRAM via the ibverbs DC client when configured, else cuObject.
+    // chosen once: DRAM/VRAM via the ibverbs DC client, OBJ via cuObject.
     const std::shared_ptr<iRdmaTokenClient> &tokenClient = clientFor(local.getType());
+    if (!tokenClient || !tokenClient->isConnected()) {
+        NIXL_ERROR << "RDMA token client is not connected.";
+        return NIXL_ERR_BACKEND;
+    }
 
     for (int i = 0; i < local.descCount(); ++i) {
         scalityObjTransferRequestH req(local[i].addr, local[i].len, remote[i].addr);

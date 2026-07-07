@@ -60,7 +60,7 @@ public:
     bool
     isConnected() const override;
     cuObjErr_t
-    cuMemObjGetDescriptor(void *ptr, size_t size) override;
+    cuMemObjGetDescriptor(void *ptr, size_t size, int dev_id = -1) override;
     cuObjErr_t
     cuMemObjPutDescriptor(void *ptr) override;
     ssize_t
@@ -82,6 +82,9 @@ private:
         uint8_t gid[16] = {};
         int gid_index = 0;
         uint64_t lag_seq = 0; ///< round-robin cursor over this NIC's LAG ports
+        std::string dev_name;  ///< ib device name (e.g. mlx5_1), for logging.
+        std::string pci_path;  ///< canonical /sys/devices/... PCIe path of the NIC.
+        int numa_node = -1;    ///< NUMA node of the NIC, or -1 if unknown.
     };
 
     /// One registered memory region: its MR plus the NIC/DCTN it was bound to.
@@ -90,6 +93,7 @@ private:
         size_t len = 0;
         int nic_idx = 0;
         uint32_t dctn = 0;
+        int dev_id = -1; ///< GPU ordinal (VRAM) or -1 (host), for the assignment dump.
     };
 
     /// Build (and INIT->RTR) a NIC's DC context for the given IP. Returns false on error.
@@ -101,10 +105,30 @@ private:
     /// Build the descriptor for the region covering ptr; empty string if not found.
     std::string
     descriptorFor(void *ptr, size_t size);
+    /// One-shot NIXL_INFO dump of the GPU->NIC buffer assignment. Caller holds mu_.
+    void
+    logAssignment();
+
+    /// Pick the NIC index to register a buffer on. dev_id < 0 (host memory) uses
+    /// the global round-robin; dev_id >= 0 (VRAM) round-robins within the GPU's
+    /// PCIe-affine NIC set (see affineNicsFor). Caller must hold mu_.
+    int
+    selectNicFor(int dev_id);
+    /// Resolve (and cache) the set of NIC indices PCIe-closest to a GPU:
+    /// longest common PCIe-path prefix, else same NUMA node, else all NICs.
+    /// Caller must hold mu_.
+    const std::vector<int> &
+    affineNicsFor(int dev_id);
 
     std::vector<NicCtx> nics_;
     bool connected_ = false;
-    uint64_t reg_counter_ = 0; ///< round-robin cursor over NICs
+    uint64_t reg_counter_ = 0; ///< round-robin cursor over NICs (host memory)
+    /// dev_id -> PCIe-affine NIC indices, resolved once per GPU.
+    std::map<int, std::vector<int>> gpu_affine_nics_;
+    /// dev_id -> round-robin cursor within that GPU's affine NIC set.
+    std::map<int, uint64_t> gpu_reg_cursor_;
+    /// Guard so the GPU->NIC assignment is dumped once, at the first transfer.
+    bool assignment_logged_ = false;
     /// RoCE service level for the DCT AV. Under `trust pcp` this selects the
     /// egress priority (SL -> PCP), so 3 targets the lossless PFC lane by
     /// default. Overridable via UCX_IB_SL (0-15), shared with the UCX backend.
