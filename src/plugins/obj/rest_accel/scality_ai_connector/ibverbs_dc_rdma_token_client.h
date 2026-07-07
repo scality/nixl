@@ -105,6 +105,14 @@ private:
     std::vector<NicCtx> nics_;
     bool connected_ = false;
     uint64_t reg_counter_ = 0; ///< round-robin cursor over NICs
+    /// RoCE service level for the DCT AV. Under `trust pcp` this selects the
+    /// egress priority (SL -> PCP), so 3 targets the lossless PFC lane by
+    /// default. Overridable via UCX_IB_SL (0-15), shared with the UCX backend.
+    uint8_t sl_ = 3;
+    /// RoCE traffic class (ToS byte; RoCEv2 DSCP = tc >> 2) for the DCT AV.
+    /// Only relevant under `trust dscp`. 0 = default lane; overridable via
+    /// UCX_IB_TRAFFIC_CLASS, shared with the UCX backend.
+    uint8_t traffic_class_ = 0;
 
     mutable std::mutex mu_;
     /// base address -> region, ordered so a sub-address can be found by range.
