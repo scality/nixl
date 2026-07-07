@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 
 #include "common/nixl_log.h"
@@ -304,10 +305,12 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
         memset(&mod, 0, sizeof(mod));
         mod.qp_state = IBV_QPS_RTR;
         mod.path_mtu = IBV_MTU_4096;
+        mod.ah_attr.sl = sl_;
         mod.ah_attr.port_num = kDcPort;
         mod.ah_attr.is_global = 1;
         mod.ah_attr.grh.sgid_index = nic.gid_index;
         mod.ah_attr.grh.hop_limit = 64;
+        mod.ah_attr.grh.traffic_class = traffic_class_;
         mod.min_rnr_timer = 12;
         if (ibv_modify_qp(nic.dct_qps[p],
                           &mod,
@@ -355,6 +358,32 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
         NIXL_ERROR << "ibverbs_dc: no NIC addresses provided (rdma_nics is empty)";
         return;
     }
+    // Reuse UCX's well-known knobs so a single setting steers RoCE priority for
+    // both the UCX backend and this (raw-ibverbs) connector on a NIXL host.
+    // Reuse UCX's well-known knobs so a single setting steers RoCE priority for
+    // both the UCX backend and this (raw-ibverbs) connector on a NIXL host.
+    // Non-numeric values (e.g. UCX_IB_SL=auto) are left to the default.
+    if (const char *sl = std::getenv("UCX_IB_SL")) {
+        char *end = nullptr;
+        long parsed = std::strtol(sl, &end, 0);
+        if (end != sl && *end == '\0' && parsed >= 0 && parsed <= 15) {
+            sl_ = static_cast<uint8_t>(parsed);
+        } else {
+            NIXL_WARN << "ibverbs_dc: ignoring non-numeric/out-of-range UCX_IB_SL: " << sl;
+        }
+    }
+    if (const char *tos = std::getenv("UCX_IB_TRAFFIC_CLASS")) {
+        char *end = nullptr;
+        long parsed = std::strtol(tos, &end, 0);
+        if (end != tos && *end == '\0' && parsed >= 0 && parsed <= 255) {
+            traffic_class_ = static_cast<uint8_t>(parsed);
+        } else {
+            NIXL_WARN << "ibverbs_dc: ignoring non-numeric/out-of-range UCX_IB_TRAFFIC_CLASS: "
+                      << tos;
+        }
+    }
+    NIXL_INFO << "ibverbs_dc: RoCE sl=" << (int)sl_ << " traffic_class=" << (int)traffic_class_
+              << " (DSCP " << (traffic_class_ >> 2) << ")";
     nics_.resize(nic_ips.size());
     for (size_t i = 0; i < nic_ips.size(); i++) {
         if (!setupNic(nic_ips[i], dc_key, nics_[i])) {
