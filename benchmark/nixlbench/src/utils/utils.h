@@ -291,6 +291,8 @@ public:
     p95();
     double
     p99();
+    double
+    stddev() const;
 
     void
     add(double value);
@@ -411,7 +413,13 @@ public:
     static void
     printStatsHeader();
     static void
-    printStats(bool is_target, size_t block_size, size_t batch_size, xferBenchStats stats);
+    printStats(bool is_target,
+               size_t block_size,
+               size_t batch_size,
+               xferBenchStats stats,
+               double cpu_usr_s = 0.0,
+               double cpu_sys_s = 0.0,
+               double wall_s = 0.0);
 };
 
 #endif
