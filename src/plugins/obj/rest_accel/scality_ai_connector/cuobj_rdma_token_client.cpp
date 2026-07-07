@@ -29,7 +29,8 @@ CuObjRdmaTokenClient::isConnected() const {
 }
 
 cuObjErr_t
-CuObjRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size) {
+CuObjRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int /*dev_id*/) {
+    // cuObject selects the NIC internally; the affinity hint does not apply here.
     return inner_->cuMemObjGetDescriptor(ptr, size);
 }
 

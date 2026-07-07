@@ -31,7 +31,7 @@ public:
     bool
     isConnected() const override;
     cuObjErr_t
-    cuMemObjGetDescriptor(void *ptr, size_t size) override;
+    cuMemObjGetDescriptor(void *ptr, size_t size, int dev_id = -1) override;
     cuObjErr_t
     cuMemObjPutDescriptor(void *ptr) override;
     ssize_t
