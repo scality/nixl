@@ -959,6 +959,31 @@ xferBenchNixlWorker::ensureFileHasConsistencyData(const GusliDeviceConfig &devic
     return true;
 }
 
+/**
+ * Cap a requested VRAM device count to the number of GPUs actually visible.
+ * Without this, a request for more devices than exist would silently skip the
+ * missing ones while the reported bandwidth (block * iters * num_*_dev / time)
+ * still counted them, inflating the result. Returning the real count keeps
+ * buffer sizing and the reported bandwidth consistent with what transfers.
+ */
+static int
+usableVramDevices(int requested) {
+    int count = 0;
+#if HAVE_CUDA
+    if (cudaGetDeviceCount(&count) != cudaSuccess) count = 0;
+#elif HAVE_ROCM
+    if (hipGetDeviceCount(&count) != hipSuccess) count = 0;
+#endif
+    if (count > 0 && requested > count) {
+        std::cerr << "Warning: requested " << requested << " VRAM device(s) but only " << count
+                  << " visible; using " << count
+                  << " so the reported bandwidth reflects the devices that actually transfer"
+                  << std::endl;
+        return count;
+    }
+    return requested;
+}
+
 /** Allocate and register memory descriptors for each thread. */
 std::vector<std::vector<xferBenchIOV>>
 xferBenchNixlWorker::allocateMemory(int num_threads) {
@@ -967,8 +992,15 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
     nixl_opt_args_t opt_args;
 
     if (isInitiator()) {
+        if (xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_VRAM) {
+            xferBenchConfig::num_initiator_dev =
+                usableVramDevices(xferBenchConfig::num_initiator_dev);
+        }
         num_devices = xferBenchConfig::num_initiator_dev;
     } else if (isTarget()) {
+        if (xferBenchConfig::target_seg_type == XFERBENCH_SEG_TYPE_VRAM) {
+            xferBenchConfig::num_target_dev = usableVramDevices(xferBenchConfig::num_target_dev);
+        }
         num_devices = xferBenchConfig::num_target_dev;
     }
     buffer_size = xferBenchConfig::total_buffer_size / (num_devices * num_threads);
