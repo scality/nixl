@@ -80,9 +80,11 @@ commonPathPrefix(const std::string &a, const std::string &b) {
     return n;
 }
 
-/// Canonical /sys PCIe path for a CUDA device, via its PCI bus id. Empty on error.
+/// PCI bus id ("0000:1b:00.0", lower-case) for a CUDA device. Empty on error.
+/// Stable identity for the physical GPU under CUDA_VISIBLE_DEVICES, which
+/// renumbers the runtime-visible ordinals; maps directly to `nvidia-smi topo`.
 std::string
-gpuPciPath(int dev_id) {
+gpuBusId(int dev_id) {
     char busid[32] = {};
     if (cudaDeviceGetPCIBusId(busid, sizeof(busid), dev_id) != cudaSuccess) {
         return "";
@@ -90,6 +92,16 @@ gpuPciPath(int dev_id) {
     // cudaDeviceGetPCIBusId yields upper-case "0000:1B:00.0"; sysfs uses lower-case.
     for (char *p = busid; *p; ++p) {
         *p = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+    }
+    return busid;
+}
+
+/// Canonical /sys PCIe path for a CUDA device, via its PCI bus id. Empty on error.
+std::string
+gpuPciPath(int dev_id) {
+    const std::string busid = gpuBusId(dev_id);
+    if (busid.empty()) {
+        return "";
     }
     return canonicalPath(std::string("/sys/bus/pci/devices/") + busid);
 }
@@ -585,8 +597,9 @@ IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
         for (int i : affine) {
             names += (names.empty() ? "" : ",") + nics_[i].dev_name;
         }
-        NIXL_INFO << "ibverbs_dc: GPU " << dev_id << " (numa " << gpu_numa
-                  << ") -> affine NIC(s): " << names;
+        const std::string busid = gpuBusId(dev_id);
+        NIXL_INFO << "ibverbs_dc: GPU " << dev_id << " (" << (busid.empty() ? "?" : busid)
+                  << ", numa " << gpu_numa << ") -> affine NIC(s): " << names;
     }
 
     auto res = gpu_affine_nics_.emplace(dev_id, std::move(affine));
@@ -697,7 +710,11 @@ IbverbsDcRdmaTokenClient::logAssignment() {
         if (g.first < 0) {
             NIXL_INFO << "ibverbs_dc:   host memory -> " << line;
         } else {
-            NIXL_INFO << "ibverbs_dc:   GPU " << g.first << " -> " << line;
+            // g.first is the runtime-visible ordinal (renumbered under
+            // CUDA_VISIBLE_DEVICES); the bus id names the physical GPU.
+            const std::string busid = gpuBusId(g.first);
+            NIXL_INFO << "ibverbs_dc:   GPU " << g.first << " ("
+                      << (busid.empty() ? "?" : busid) << ") -> " << line;
         }
     }
     std::string totals;
