@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -462,6 +463,11 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
             return;
         }
     }
+    nic_load_.assign(nics_.size(), 0);
+    all_nics_.resize(nics_.size());
+    for (size_t i = 0; i < nics_.size(); i++) {
+        all_nics_[i] = static_cast<int>(i);
+    }
     connected_ = true;
     NIXL_INFO << "ibverbs_dc: DC transport ready across " << nics_.size() << " NIC(s), key=0x"
               << std::hex << dc_key << std::dec;
@@ -511,51 +517,76 @@ IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
         return it->second;
     }
 
-    std::vector<int> affine;
     const std::string gpu_path = gpuPciPath(dev_id);
-    int gpu_numa = -1;
-    if (!gpu_path.empty()) {
-        gpu_numa = readIntFile(gpu_path + "/numa_node");
-        // (a) NIC(s) sharing the longest PCIe-path prefix with the GPU: the
-        // closest shared bridge/switch, i.e. the best direct-P2P target.
-        size_t best = 0;
-        for (size_t i = 0; i < nics_.size(); ++i) {
-            size_t p = commonPathPrefix(gpu_path, nics_[i].pci_path);
-            if (p > best) {
-                best = p;
-                affine.clear();
-                affine.push_back(static_cast<int>(i));
-            } else if (p == best && best > 0) {
-                affine.push_back(static_cast<int>(i));
-            }
-        }
-        // A tie across every NIC means the shared prefix is just the sysfs root
-        // (no real locality); discard it so the NUMA fallback can discriminate.
-        if (affine.size() == nics_.size()) {
-            affine.clear();
-        }
-    }
-    // (b) fall back to same-NUMA NICs (avoids the cross-socket SYS path).
-    if (affine.empty() && gpu_numa >= 0) {
+    const int gpu_numa = gpu_path.empty() ? -1 : readIntFile(gpu_path + "/numa_node");
+
+    // Candidate rails: same-NUMA NICs (avoids the cross-socket SYS path). If NUMA
+    // is unknown, every NIC is a candidate.
+    std::vector<int> cand;
+    if (gpu_numa >= 0) {
         for (size_t i = 0; i < nics_.size(); ++i) {
             if (nics_[i].numa_node == gpu_numa) {
-                affine.push_back(static_cast<int>(i));
+                cand.push_back(static_cast<int>(i));
             }
         }
     }
-    // (c) fall back to all NICs; affinity is advisory, never a hard failure.
-    if (affine.empty()) {
-        NIXL_WARN << "ibverbs_dc: no PCIe/NUMA affinity for GPU " << dev_id << " (gpu_path='"
-                  << gpu_path << "'); using all NICs";
-        for (size_t i = 0; i < nics_.size(); ++i) {
-            affine.push_back(static_cast<int>(i));
+    if (cand.empty()) {
+        cand = all_nics_;
+    }
+
+    // Narrow to PCIe switch-local NICs, but ONLY when the locality is real. A NIC
+    // is switch-local to the GPU when the GPU's PCIe path reaches into the NIC's
+    // switch, i.e. the GPU shares MORE of the path with that NIC than the NIC's
+    // same-switch siblings share with each other. On hardware where the RDMA NICs
+    // sit on a shared bridge equidistant (NODE) from every GPU in the node, no NIC
+    // is switch-local, so all same-NUMA rails stay in the set and registrations
+    // spread across both. On hardware where each GPU has a dedicated (PXB/PIX)
+    // NIC, that one rail wins and pinning is preserved.
+    std::vector<int> affine;
+    if (!gpu_path.empty() && cand.size() > 1) {
+        int best = cand.front();
+        size_t best_prefix = commonPathPrefix(gpu_path, nics_[best].pci_path);
+        for (int idx : cand) {
+            size_t p = commonPathPrefix(gpu_path, nics_[idx].pci_path);
+            if (p > best_prefix) {
+                best_prefix = p;
+                best = idx;
+            }
         }
+        // How deep the best NIC's switch neighborhood extends among the candidates.
+        size_t sibling_prefix = 0;
+        for (int idx : cand) {
+            if (idx == best) {
+                continue;
+            }
+            sibling_prefix = std::max(
+                sibling_prefix, commonPathPrefix(nics_[best].pci_path, nics_[idx].pci_path));
+        }
+        // GPU reaches past where the siblings diverge -> genuinely switch-local;
+        // keep every candidate at that deepest tier and drop the rest.
+        if (best_prefix > sibling_prefix) {
+            for (int idx : cand) {
+                if (commonPathPrefix(gpu_path, nics_[idx].pci_path) == best_prefix) {
+                    affine.push_back(idx);
+                }
+            }
+        }
+    }
+
+    // Not switch-local (equidistant NODE-level rails) or NUMA-only: use them all.
+    if (affine.empty()) {
+        affine = cand;
+    }
+
+    if (gpu_path.empty()) {
+        NIXL_WARN << "ibverbs_dc: no PCIe path for GPU " << dev_id << "; using all NICs";
     } else {
         std::string names;
         for (int i : affine) {
             names += (names.empty() ? "" : ",") + nics_[i].dev_name;
         }
-        NIXL_INFO << "ibverbs_dc: GPU " << dev_id << " -> affine NIC(s): " << names;
+        NIXL_INFO << "ibverbs_dc: GPU " << dev_id << " (numa " << gpu_numa
+                  << ") -> affine NIC(s): " << names;
     }
 
     auto res = gpu_affine_nics_.emplace(dev_id, std::move(affine));
@@ -563,15 +594,23 @@ IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
 }
 
 int
-IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
-    // Host memory (dev_id < 0): global round-robin across all NICs, unchanged.
-    if (dev_id < 0) {
-        return static_cast<int>(reg_counter_++ % nics_.size());
+IbverbsDcRdmaTokenClient::leastLoadedNic(const std::vector<int> &candidates) {
+    int best = candidates.front();
+    for (int idx : candidates) {
+        if (nic_load_[idx] < nic_load_[best]) {
+            best = idx;
+        }
     }
-    // VRAM: round-robin within the GPU's PCIe-affine NIC set.
-    const std::vector<int> &affine = affineNicsFor(dev_id);
-    uint64_t &cursor = gpu_reg_cursor_[dev_id];
-    return affine[cursor++ % affine.size()];
+    nic_load_[best]++;
+    return best;
+}
+
+int
+IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
+    // Host memory (dev_id < 0): balance across all NICs. VRAM: balance within the
+    // GPU's affine NIC set. Least-loaded (not a per-GPU cursor) so multiple GPUs
+    // sharing an affine set spread across it even when each registers one buffer.
+    return leastLoadedNic(dev_id < 0 ? all_nics_ : affineNicsFor(dev_id));
 }
 
 cuObjErr_t
@@ -621,6 +660,9 @@ IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
     }
     if (it->second.mr) {
         ibv_dereg_mr(it->second.mr);
+    }
+    if (nic_load_[it->second.nic_idx] > 0) {
+        nic_load_[it->second.nic_idx]--;
     }
     regions_.erase(it);
     return CU_OBJ_SUCCESS;
