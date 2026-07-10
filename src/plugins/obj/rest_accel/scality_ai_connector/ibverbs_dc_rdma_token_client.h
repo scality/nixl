@@ -109,24 +109,33 @@ private:
     void
     logAssignment();
 
-    /// Pick the NIC index to register a buffer on. dev_id < 0 (host memory) uses
-    /// the global round-robin; dev_id >= 0 (VRAM) round-robins within the GPU's
-    /// PCIe-affine NIC set (see affineNicsFor). Caller must hold mu_.
+    /// Pick the NIC index to register a buffer on. dev_id < 0 (host memory)
+    /// balances across all NICs; dev_id >= 0 (VRAM) balances within the GPU's
+    /// affine NIC set (see affineNicsFor). Caller must hold mu_.
     int
     selectNicFor(int dev_id);
-    /// Resolve (and cache) the set of NIC indices PCIe-closest to a GPU:
-    /// longest common PCIe-path prefix, else same NUMA node, else all NICs.
+    /// Least-loaded NIC among candidates (fewest live registrations; ties break
+    /// to the lowest index). Bumps the chosen NIC's load. Caller must hold mu_.
+    int
+    leastLoadedNic(const std::vector<int> &candidates);
+    /// Resolve (and cache) the set of NIC indices affine to a GPU. Prefers NICs
+    /// that share a PCIe switch with the GPU (PXB/PIX-local); when no NIC is
+    /// switch-local (the RDMA NICs sit on a shared bridge equidistant from every
+    /// GPU in the node), keeps all same-NUMA NICs so registrations spread across
+    /// both rails. Falls back to all NICs when no topology info is available.
     /// Caller must hold mu_.
     const std::vector<int> &
     affineNicsFor(int dev_id);
 
     std::vector<NicCtx> nics_;
     bool connected_ = false;
-    uint64_t reg_counter_ = 0; ///< round-robin cursor over NICs (host memory)
-    /// dev_id -> PCIe-affine NIC indices, resolved once per GPU.
+    /// All NIC indices [0, nics_.size()); candidate set for host-memory balancing.
+    std::vector<int> all_nics_;
+    /// Live registration count per NIC, used to balance new registrations across
+    /// the affine set (a per-GPU cursor can't spread when each GPU registers once).
+    std::vector<uint64_t> nic_load_;
+    /// dev_id -> affine NIC indices, resolved once per GPU.
     std::map<int, std::vector<int>> gpu_affine_nics_;
-    /// dev_id -> round-robin cursor within that GPU's affine NIC set.
-    std::map<int, uint64_t> gpu_reg_cursor_;
     /// Guard so the GPU->NIC assignment is dumped once, at the first transfer.
     bool assignment_logged_ = false;
     /// RoCE service level for the DCT AV. Under `trust pcp` this selects the
