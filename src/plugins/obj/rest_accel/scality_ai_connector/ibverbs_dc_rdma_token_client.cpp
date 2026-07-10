@@ -106,6 +106,32 @@ gpuPciPath(int dev_id) {
     return canonicalPath(std::string("/sys/bus/pci/devices/") + busid);
 }
 
+/// Map a runtime-visible GPU ordinal back to the id the user set: the entry at
+/// position dev_id in CUDA_VISIBLE_DEVICES (which renumbers visible devices to
+/// 0..N). Falls back to dev_id when the variable is unset or the entry is not a
+/// plain integer (e.g. a UUID or MIG handle).
+int
+visibleToUserGpu(int dev_id) {
+    const char *cvd = std::getenv("CUDA_VISIBLE_DEVICES");
+    if (!cvd || dev_id < 0) {
+        return dev_id;
+    }
+    std::stringstream ss(cvd);
+    std::string tok;
+    for (int i = 0; std::getline(ss, tok, ','); ++i) {
+        if (i != dev_id) {
+            continue;
+        }
+        char *end = nullptr;
+        long v = std::strtol(tok.c_str(), &end, 10);
+        if (end != tok.c_str() && *end == '\0' && v >= 0) {
+            return static_cast<int>(v);
+        }
+        break; // non-integer entry; can't map to a number
+    }
+    return dev_id;
+}
+
 /// RoCE GID type via sysfs: 2 (RoCEv2), 1 (RoCEv1), 0 (IB), -1 on error.
 int
 gidTypeSysfs(const char *dev_name, int gid_index) {
@@ -597,9 +623,8 @@ IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
         for (int i : affine) {
             names += (names.empty() ? "" : ",") + nics_[i].dev_name;
         }
-        const std::string busid = gpuBusId(dev_id);
-        NIXL_INFO << "ibverbs_dc: GPU " << dev_id << " (" << (busid.empty() ? "?" : busid)
-                  << ", numa " << gpu_numa << ") -> affine NIC(s): " << names;
+        NIXL_INFO << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id) << " (numa " << gpu_numa
+                  << ") -> affine NIC(s): " << names;
     }
 
     auto res = gpu_affine_nics_.emplace(dev_id, std::move(affine));
@@ -710,11 +735,7 @@ IbverbsDcRdmaTokenClient::logAssignment() {
         if (g.first < 0) {
             NIXL_INFO << "ibverbs_dc:   host memory -> " << line;
         } else {
-            // g.first is the runtime-visible ordinal (renumbered under
-            // CUDA_VISIBLE_DEVICES); the bus id names the physical GPU.
-            const std::string busid = gpuBusId(g.first);
-            NIXL_INFO << "ibverbs_dc:   GPU " << g.first << " ("
-                      << (busid.empty() ? "?" : busid) << ") -> " << line;
+            NIXL_INFO << "ibverbs_dc:   GPU " << visibleToUserGpu(g.first) << " -> " << line;
         }
     }
     std::string totals;
