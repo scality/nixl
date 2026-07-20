@@ -1215,6 +1215,29 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
         iov_lists.push_back(std::move(iov_list));
     }
 
+    // Reconcile the requested device count with what actually registered. In a
+    // single-process SG run only the rank's own device gets a buffer (see the
+    // SG gate in initBasicDescVram/initBasicDescDram), so num_initiator_dev can
+    // overstate the devices that transfer. Left uncorrected, the bandwidth math
+    // in printStats() multiplies by num_initiator_dev and inflates the reported
+    // throughput by that factor. Fold the real count back into the config so
+    // both the printed configuration and the throughput reflect reality.
+    // getSize() > 1 SG runs spread devices across ranks and are summed in the
+    // reduction, so they must keep the aggregate count untouched.
+    if (rt->getSize() == 1 && !iov_lists.empty()) {
+        int registered_dev = (int)iov_lists.front().size();
+        int &requested_dev =
+            isInitiator() ? xferBenchConfig::num_initiator_dev : xferBenchConfig::num_target_dev;
+        if (registered_dev > 0 && registered_dev != requested_dev) {
+            std::cout << "Warning: requested " << requested_dev << " device(s) but only "
+                      << registered_dev
+                      << " registered a buffer (SG single-process registers one device per rank); "
+                      << "reporting bandwidth against " << registered_dev << " device(s)"
+                      << std::endl;
+            requested_dev = registered_dev;
+        }
+    }
+
     return iov_lists;
 }
 
