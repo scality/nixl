@@ -668,11 +668,16 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     int nic_idx = selectNicFor(dev_id);
     NicCtx &nic = nics_[nic_idx];
 
-    ibv_mr *mr = ibv_reg_mr(nic.pd,
-                            ptr,
-                            size,
-                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                IBV_ACCESS_REMOTE_READ);
+    /* Relaxed ordering lets the NIC pipeline the PCIe writes into GPU BAR instead
+     * of serializing them.  Without it, GET writes into VRAM collapse under
+     * multi-GPU concentration on a single dual-port card: the card cannot drain
+     * the strict-ordered writes fast enough, asserts PFC pause, and throughput
+     * falls below even a single GPU.  ib_write_bw (perftest) sets this by
+     * default, which is why it scales on the same hardware.  It is an optional
+     * access flag: drivers that don't support it silently ignore it. */
+    unsigned int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                          IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING;
+    ibv_mr *mr = ibv_reg_mr(nic.pd, ptr, size, access);
     if (!mr) {
         NIXL_ERROR << "ibverbs_dc: ibv_reg_mr failed (ptr=" << ptr << ", size=" << size << ")";
         return CU_OBJ_FAIL;
