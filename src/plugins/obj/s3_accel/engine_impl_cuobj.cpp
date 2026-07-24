@@ -5,6 +5,8 @@
 
 #include "engine_impl_cuobj.h"
 #include "s3_accel/rdma_interface.h"
+#include "s3_accel/rdma_ctx.h"
+#include "s3_accel/cuobj_token_client.h"
 #include "common/nixl_log.h"
 #include <absl/strings/str_format.h>
 #include <algorithm>
@@ -14,10 +16,6 @@
 #include <vector>
 
 namespace {
-
-typedef struct rdma_ctx {
-    std::string rdma_desc;
-} rdma_ctx_t;
 
 bool
 isValidPrepXferParams(const nixl_xfer_op_t &operation,
@@ -133,61 +131,13 @@ public:
     uintptr_t localAddr;
 };
 
-static ssize_t
-objectGet(const void *handle,
-          char *buf,
-          size_t size,
-          loff_t offset,
-          const cufileRDMAInfo_t *infop) {
-    if (infop == nullptr || infop->desc_str == nullptr) {
-        NIXL_ERROR << "objectGet: infop or infop->desc_str is null";
-        return -EINVAL;
-    }
-
-    void *ctx = cuObjClient::getCtx(handle);
-    if (ctx == nullptr) {
-        NIXL_ERROR << "objectGet: context is null";
-        return -EINVAL;
-    }
-    NIXL_DEBUG << "objectGet: handle=" << handle << ", buf=" << static_cast<const void *>(buf)
-               << ", size=" << size << ", offset=" << offset << ", infop=" << infop;
-    rdma_ctx_t *rctx = static_cast<rdma_ctx_t *>(ctx);
-    rctx->rdma_desc = infop->desc_str;
-    return 0;
-}
-
-static ssize_t
-objectPut(const void *handle,
-          const char *buf,
-          size_t size,
-          loff_t offset,
-          const cufileRDMAInfo_t *infop) {
-    if (infop == nullptr || infop->desc_str == nullptr) {
-        NIXL_ERROR << "objectPut: infop or infop->desc_str is null";
-        return -EINVAL;
-    }
-
-    void *ctx = cuObjClient::getCtx(handle);
-    if (ctx == nullptr) {
-        NIXL_ERROR << "objectPut: context is null";
-        return -EINVAL;
-    }
-    NIXL_DEBUG << "objectPut: handle=" << handle << ", buf=" << static_cast<const void *>(buf)
-               << ", size=" << size << ", offset=" << offset << ", infop=" << infop;
-    rdma_ctx_t *rctx = static_cast<rdma_ctx_t *>(ctx);
-    rctx->rdma_desc = infop->desc_str;
-    return 0;
-}
-
-CUObjIOOps obs_ops = {.get = objectGet, .put = objectPut};
-
 } // namespace
 
 S3CuObjEngineImpl::S3CuObjEngineImpl(const nixlBackendInitParams *init_params)
     : S3AccelObjEngineImpl(init_params, NoClientTag{}) {
-    cuClient_ = std::make_shared<cuObjClient>(obs_ops, CUOBJ_PROTO_RDMA_DC_V1);
-    if (!cuClient_->isConnected()) {
-        NIXL_ERROR << "CUObjClient failed to connect.";
+    tokenClient_ = std::make_shared<S3CuObjTokenClient>();
+    if (!tokenClient_->isConnected()) {
+        NIXL_ERROR << "S3 RDMA token client failed to connect.";
         return;
     }
 }
@@ -196,8 +146,8 @@ nixl_status_t
 S3CuObjEngineImpl::registerMem(const nixlBlobDesc &mem,
                                const nixl_mem_t &nixl_mem,
                                nixlBackendMD *&out) {
-    if (!cuClient_->isConnected()) {
-        NIXL_ERROR << "CUObjClient is not connected.";
+    if (!tokenClient_->isConnected()) {
+        NIXL_ERROR << "S3 RDMA token client is not connected.";
         return NIXL_ERR_BACKEND;
     }
 
@@ -222,7 +172,7 @@ S3CuObjEngineImpl::registerMem(const nixlBlobDesc &mem,
         std::unique_ptr<nixlObsObjMetadata> mem_md =
             std::make_unique<nixlObsObjMetadata>(nixl_mem, mem.addr);
 
-        cuObjErr_t cuda_status = cuClient_->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
+        cuObjErr_t cuda_status = tokenClient_->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
         if (cuda_status != CU_OBJ_SUCCESS) {
             NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << cuda_status;
             return NIXL_ERR_BACKEND;
@@ -243,7 +193,7 @@ S3CuObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
         } else if ((md->nixlMem == DRAM_SEG) || (md->nixlMem == VRAM_SEG)) {
             std::unique_ptr<nixlObsObjMetadata> mem_md_ptr(md);
             cuObjErr_t cuda_status =
-                cuClient_->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
+                tokenClient_->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
             if (cuda_status != CU_OBJ_SUCCESS) {
                 NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << cuda_status;
                 mem_md_ptr.release();
@@ -262,8 +212,8 @@ S3CuObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
                             const std::string &local_agent,
                             nixlBackendReqH *&handle,
                             const nixl_opt_b_args_t *opt_args) const {
-    if (!cuClient_->isConnected()) {
-        NIXL_ERROR << "CUObjClient is not connected.";
+    if (!tokenClient_->isConnected()) {
+        NIXL_ERROR << "S3 RDMA token client is not connected.";
         return NIXL_ERR_BACKEND;
     }
 
@@ -286,14 +236,14 @@ S3CuObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
 
         if (operation == NIXL_WRITE) {
             ssize_t cuda_status =
-                cuClient_->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
+                tokenClient_->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
             if (cuda_status < 0) {
                 NIXL_ERROR << "cuObjPut failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;
             }
         } else if (operation == NIXL_READ) {
             ssize_t cuda_status =
-                cuClient_->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
+                tokenClient_->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
             if (cuda_status < 0) {
                 NIXL_ERROR << "cuObjGet failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;

@@ -7,7 +7,7 @@
 #define NIXL_OBJ_PLUGIN_S3_ACCEL_ENGINE_IMPL_CUOBJ_H
 
 #include "s3_accel/engine_impl.h"
-#include <cuobjclient.h>
+#include "s3_accel/rdma_token_client.h"
 
 /**
  * Abstract base class for cuObject-accelerated S3 engines.
@@ -60,7 +60,7 @@ protected:
     iS3Client *
     getClient() const override = 0;
 
-    std::shared_ptr<cuObjClient> cuClient_;
+    std::shared_ptr<iS3RdmaTokenClient> tokenClient_;
 };
 
 #endif // NIXL_OBJ_PLUGIN_S3_ACCEL_ENGINE_IMPL_CUOBJ_H
