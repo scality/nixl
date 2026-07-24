@@ -67,6 +67,21 @@ if cuobj_dep.found()
     ]
     plugin_deps += [ cuobj_dep ]
 
+    # In-process libibverbs DC token client: opt-in multi-NIC (multi-rail)
+    # spreading for DRAM/VRAM, an alternative to the single-NIC cuObject path.
+    # Needs libibverbs + libmlx5 (DCT) and the CUDA runtime (GPU/NIC affinity).
+    if have_ibverbs_dc and cuda_dep.found()
+        message('Enabling ibverbs DC token client for S3 accelerated engines')
+        obj_sources += [
+            's3_accel/dc_descriptor.h',
+            's3_accel/cufile_nics.h',
+            's3_accel/ibverbs_dc_token_client.cpp',
+            's3_accel/ibverbs_dc_token_client.h',
+        ]
+        plugin_deps += [ ibverbs_dep, mlx5_dep, cuda_dep ]
+        compile_defs += [ '-DS3_ACCEL_HAVE_IBVERBS_DC' ]
+    endif
+
     curl_dep = dependency('libcurl', required: false)
     if curl_dep.found()
         message('Enabling Scality AI Connector engine')
