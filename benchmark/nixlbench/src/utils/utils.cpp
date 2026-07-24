@@ -520,6 +520,11 @@ xferBenchConfig::loadParams(void) {
     scheme = NB_ARG(scheme);
     mode = NB_ARG(mode);
     op_type = NB_ARG(op_type);
+    if (op_type != XFERBENCH_OP_READ && op_type != XFERBENCH_OP_WRITE) {
+        std::cerr << "Invalid --op_type: " << op_type << ". Must be one of [READ, WRITE]"
+                  << std::endl;
+        return -1;
+    }
     // Unique keys only make sense for WRITE: READ pre-populates unique-per-run
     // objects and re-reading a key never conflicts. (obj_unique_keys is only
     // ever set true for the OBJ backend above.)
