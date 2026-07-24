@@ -9,6 +9,11 @@
 #include "s3_accel/engine_impl.h"
 #include "s3_accel/rdma_token_client.h"
 
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <vector>
+
 /**
  * Abstract base class for cuObject-accelerated S3 engines.
  *
@@ -60,7 +65,34 @@ protected:
     iS3Client *
     getClient() const override = 0;
 
+    // Default token producer (cuObject DC): the OBJ path and, unless multi-rail
+    // is opted in, the DRAM/VRAM path too.
     std::shared_ptr<iS3RdmaTokenClient> tokenClient_;
+
+private:
+    /// Token client for a segment type: DRAM/VRAM use the ibverbs DC client once
+    /// it has been built (opt-in via the rdma_nics param); everything else, and
+    /// the non-opted-in default, uses cuObject.
+    const std::shared_ptr<iS3RdmaTokenClient> &
+    clientFor(const nixl_mem_t &nixl_mem) const {
+        return ((nixl_mem == DRAM_SEG || nixl_mem == VRAM_SEG) && hostClient_) ? hostClient_
+                                                                               : tokenClient_;
+    }
+
+    /// Build the ibverbs DC client once from the resolved NIC list. Returns
+    /// NIXL_ERR_BACKEND if no NICs were resolved or the client fails to connect.
+    nixl_status_t
+    ensureHostClient();
+
+    /// libibverbs DC token client for DRAM/VRAM multi-NIC spreading (lazy,
+    /// opt-in). Null unless rdma_nics was set and the client was built.
+    std::shared_ptr<iS3RdmaTokenClient> hostClient_;
+    std::mutex hostClientMu_;
+    /// RDMA NIC specifiers (IPv4 or device names like mlx5_1) for the DC client,
+    /// resolved from the rdma_nics param. Empty means multi-rail is not opted in.
+    std::vector<std::string> rdmaNics_;
+    /// DC access key for the ibverbs DC client (rdma_dc_key / cufile.json).
+    uint64_t dcKey_ = 0xffeeddccULL;
 };
 
 #endif // NIXL_OBJ_PLUGIN_S3_ACCEL_ENGINE_IMPL_CUOBJ_H

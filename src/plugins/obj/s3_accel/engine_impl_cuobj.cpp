@@ -11,11 +11,97 @@
 #include <absl/strings/str_format.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <memory>
+#include <optional>
 #include <vector>
 
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+#include "s3_accel/cufile_nics.h"
+#include "s3_accel/ibverbs_dc_token_client.h"
+#include <cuda_runtime.h>
+#include <fstream>
+#include <sstream>
+#endif
+
 namespace {
+
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+/**
+ * Scoped CUDA device switch. Registering a VRAM buffer requires the buffer's
+ * GPU to be the current device; restore the previous device on scope exit.
+ */
+class CudaDeviceGuard {
+public:
+    explicit CudaDeviceGuard(int dev) {
+        if (cudaGetDevice(&prevDev_) != cudaSuccess) {
+            return;
+        }
+        if (dev >= 0 && dev != prevDev_ && cudaSetDevice(dev) == cudaSuccess) {
+            restore_ = true;
+        }
+    }
+    ~CudaDeviceGuard() {
+        if (restore_) {
+            cudaSetDevice(prevDev_);
+        }
+    }
+    CudaDeviceGuard(const CudaDeviceGuard &) = delete;
+    CudaDeviceGuard &
+    operator=(const CudaDeviceGuard &) = delete;
+
+private:
+    int prevDev_ = 0;
+    bool restore_ = false;
+};
+
+/// Look up a key in customParams, returning a default when absent/empty.
+std::string
+paramOr(const nixl_b_params_t *params, const std::string &key, const std::string &def) {
+    if (params == nullptr) {
+        return def;
+    }
+    auto it = params->find(key);
+    return (it == params->end() || it->second.empty()) ? def : it->second;
+}
+
+/// Split a comma-separated list, trimming surrounding whitespace; skips empties.
+std::vector<std::string>
+splitCsv(const std::string &s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        size_t end = (comma == std::string::npos) ? s.size() : comma;
+        size_t a = s.find_first_not_of(" \t", start);
+        if (a != std::string::npos && a < end) {
+            size_t b = s.find_last_not_of(" \t", end - 1);
+            out.push_back(s.substr(a, b - a + 1));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return out;
+}
+
+/// Read cufile.json content (CUFILE_ENV_PATH_JSON, else /etc/cufile.json).
+/// Returns "" if unreadable. Used only to resolve the DC key.
+std::string
+readCufileJson() {
+    const char *env = std::getenv("CUFILE_ENV_PATH_JSON");
+    const std::string path = env ? env : "/etc/cufile.json";
+    std::ifstream f(path);
+    if (!f) {
+        return std::string();
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+#endif // S3_ACCEL_HAVE_IBVERBS_DC
 
 bool
 isValidPrepXferParams(const nixl_xfer_op_t &operation,
@@ -123,6 +209,15 @@ public:
           objKey(""),
           localAddr(addr) {}
 
+    // DRAM/VRAM: keep the GPU ordinal for VRAM NIC affinity and the CUDA device
+    // guard used when (de)registering the buffer with the ibverbs DC client.
+    nixlObsObjMetadata(nixl_mem_t nixl_mem, uintptr_t addr, uint64_t dev_id)
+        : nixlBackendMD(true),
+          nixlMem(nixl_mem),
+          devId(dev_id),
+          objKey(""),
+          localAddr(addr) {}
+
     ~nixlObsObjMetadata() = default;
 
     nixl_mem_t nixlMem;
@@ -140,6 +235,52 @@ S3CuObjEngineImpl::S3CuObjEngineImpl(const nixlBackendInitParams *init_params)
         NIXL_ERROR << "S3 RDMA token client failed to connect.";
         return;
     }
+
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+    // Opt-in multi-rail: when rdma_nics is set, DRAM/VRAM route to the ibverbs
+    // DC client (built lazily in ensureHostClient) instead of cuObject, which
+    // pins host memory to a single NIC. Unset keeps cuObject as the default.
+    const nixl_b_params_t *params = init_params ? init_params->customParams : nullptr;
+    const std::string nics_param = paramOr(params, "rdma_nics", "");
+    if (!nics_param.empty()) {
+        rdmaNics_ = splitCsv(nics_param);
+        std::string dckey = paramOr(params, "rdma_dc_key", "");
+        if (dckey.empty()) {
+            dckey = parseRdmaDcKey(readCufileJson()); // "" if absent/commented
+        }
+        if (!dckey.empty()) {
+            dcKey_ = std::strtoull(dckey.c_str(), nullptr, 0);
+        }
+        NIXL_INFO << "s3_accel: ibverbs DC multi-rail opted in via rdma_nics ("
+                  << rdmaNics_.size() << " NIC(s))";
+    }
+#endif
+}
+
+nixl_status_t
+S3CuObjEngineImpl::ensureHostClient() {
+    std::lock_guard<std::mutex> lk(hostClientMu_);
+    if (hostClient_) {
+        return NIXL_SUCCESS;
+    }
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+    if (rdmaNics_.empty()) {
+        NIXL_ERROR << "ibverbs DC transport requires a NIC list: set the 'rdma_nics' "
+                      "parameter (IPv4 addresses or device names like mlx5_1)";
+        return NIXL_ERR_BACKEND;
+    }
+    auto client = std::make_shared<S3IbverbsDcTokenClient>(rdmaNics_, dcKey_);
+    if (!client->isConnected()) {
+        NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM/VRAM transfers";
+        return NIXL_ERR_BACKEND;
+    }
+    hostClient_ = std::move(client);
+    NIXL_INFO << "s3_accel: DRAM/VRAM transfers using ibverbs DC across " << rdmaNics_.size()
+              << " NIC(s)";
+    return NIXL_SUCCESS;
+#else
+    return NIXL_ERR_BACKEND;
+#endif
 }
 
 nixl_status_t
@@ -167,12 +308,34 @@ S3CuObjEngineImpl::registerMem(const nixlBlobDesc &mem,
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+        // Opted-in multi-rail routes DRAM/VRAM to the ibverbs DC client; build it
+        // on first use. Not opted in -> clientFor() stays on cuObject.
+        if (!rdmaNics_.empty()) {
+            nixl_status_t st = ensureHostClient();
+            if (st != NIXL_SUCCESS) {
+                return st;
+            }
+        }
+#endif
+
         NIXL_DEBUG << "registerMem: addr=" << mem.addr << ", len=" << mem.len
                    << ", nixl_mem=" << nixl_mem;
         std::unique_ptr<nixlObsObjMetadata> mem_md =
-            std::make_unique<nixlObsObjMetadata>(nixl_mem, mem.addr);
+            std::make_unique<nixlObsObjMetadata>(nixl_mem, mem.addr, mem.devId);
 
-        cuObjErr_t cuda_status = tokenClient_->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
+        // VRAM passes the GPU ordinal as the DC NIC-affinity hint (ignored by
+        // cuObject); DRAM passes -1. cuObject picks the NIC internally either way.
+        int affinity_dev = -1;
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+        std::optional<CudaDeviceGuard> dev_guard;
+        if (nixl_mem == VRAM_SEG && hostClient_) {
+            dev_guard.emplace((int)mem.devId);
+            affinity_dev = (int)mem.devId;
+        }
+#endif
+        cuObjErr_t cuda_status =
+            clientFor(nixl_mem)->cuMemObjGetDescriptor((void *)(mem.addr), mem.len, affinity_dev);
         if (cuda_status != CU_OBJ_SUCCESS) {
             NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << cuda_status;
             return NIXL_ERR_BACKEND;
@@ -192,8 +355,14 @@ S3CuObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
             devIdToObjKey_.erase(obj_md_ptr->devId);
         } else if ((md->nixlMem == DRAM_SEG) || (md->nixlMem == VRAM_SEG)) {
             std::unique_ptr<nixlObsObjMetadata> mem_md_ptr(md);
+#ifdef S3_ACCEL_HAVE_IBVERBS_DC
+            std::optional<CudaDeviceGuard> dev_guard;
+            if (mem_md_ptr->nixlMem == VRAM_SEG && hostClient_) {
+                dev_guard.emplace((int)mem_md_ptr->devId);
+            }
+#endif
             cuObjErr_t cuda_status =
-                tokenClient_->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
+                clientFor(mem_md_ptr->nixlMem)->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
             if (cuda_status != CU_OBJ_SUCCESS) {
                 NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << cuda_status;
                 mem_md_ptr.release();
@@ -212,13 +381,17 @@ S3CuObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
                             const std::string &local_agent,
                             nixlBackendReqH *&handle,
                             const nixl_opt_b_args_t *opt_args) const {
-    if (!tokenClient_->isConnected()) {
-        NIXL_ERROR << "S3 RDMA token client is not connected.";
-        return NIXL_ERR_BACKEND;
-    }
-
     if (!isValidPrepXferParams(operation, local, remote, remote_agent, local_agent)) {
         return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // DRAM/VRAM route to the ibverbs DC client when multi-rail is opted in,
+    // otherwise (and for the default) to cuObject. The buffers were registered
+    // with this same client in registerMem.
+    const std::shared_ptr<iS3RdmaTokenClient> &tokenClient = clientFor(local.getType());
+    if (!tokenClient->isConnected()) {
+        NIXL_ERROR << "S3 RDMA token client is not connected.";
+        return NIXL_ERR_BACKEND;
     }
 
     auto req_h = std::make_unique<nixlObsObjBackendReqH>();
@@ -236,14 +409,14 @@ S3CuObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
 
         if (operation == NIXL_WRITE) {
             ssize_t cuda_status =
-                tokenClient_->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
+                tokenClient->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
             if (cuda_status < 0) {
                 NIXL_ERROR << "cuObjPut failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;
             }
         } else if (operation == NIXL_READ) {
             ssize_t cuda_status =
-                tokenClient_->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
+                tokenClient->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
             if (cuda_status < 0) {
                 NIXL_ERROR << "cuObjGet failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;
