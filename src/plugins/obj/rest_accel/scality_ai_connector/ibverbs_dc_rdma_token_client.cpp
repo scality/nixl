@@ -40,6 +40,14 @@ namespace {
 
 constexpr int kDcPort = 1;
 
+/// Handicap (in live registrations) applied to a NIC that is NOT in a GPU's
+/// affine set when picking a rail for a VRAM registration. Affine rails are
+/// preferred while loads are close, but once they run this many registrations
+/// ahead the overflow spills onto the remaining NICs, so no NIC stays idle
+/// under load. 0 would make selection pure global least-loaded (affinity
+/// ignored); larger values prefer the affine rails more strongly.
+constexpr uint64_t kNonAffineHandicap = 2;
+
 /// Canonicalize a sysfs symlink to its /sys/devices/... target. Empty on failure.
 std::string
 canonicalPath(const std::string &path) {
@@ -645,10 +653,34 @@ IbverbsDcRdmaTokenClient::leastLoadedNic(const std::vector<int> &candidates) {
 
 int
 IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
-    // Host memory (dev_id < 0): balance across all NICs. VRAM: balance within the
-    // GPU's affine NIC set. Least-loaded (not a per-GPU cursor) so multiple GPUs
-    // sharing an affine set spread across it even when each registers one buffer.
-    return leastLoadedNic(dev_id < 0 ? all_nics_ : affineNicsFor(dev_id));
+    // Host memory (dev_id < 0): balance across all NICs.
+    if (dev_id < 0) {
+        return leastLoadedNic(all_nics_);
+    }
+    // VRAM: prefer the GPU's affine ("best") rails, but never restrict to them.
+    // Rank every NIC by live load, handing the non-affine rails a fixed handicap
+    // (kNonAffineHandicap) so affine rails win while loads are close yet the rest
+    // still absorb the overflow once the affine rails run ahead. A GPU whose
+    // affine set is a 2-NIC NUMA node therefore still reaches the other NUMA's
+    // NICs under load instead of leaving them idle. Least-loaded (not a per-GPU
+    // cursor) so multiple GPUs spread even when each registers one buffer.
+    const std::vector<int> &affine = affineNicsFor(dev_id);
+    auto cost = [&](int idx) -> uint64_t {
+        const bool is_affine =
+            std::find(affine.begin(), affine.end(), idx) != affine.end();
+        return nic_load_[idx] + (is_affine ? 0 : kNonAffineHandicap);
+    };
+    int best = all_nics_.front();
+    uint64_t best_cost = cost(best);
+    for (int idx : all_nics_) {
+        const uint64_t c = cost(idx);
+        if (c < best_cost) {
+            best_cost = c;
+            best = idx;
+        }
+    }
+    nic_load_[best]++;
+    return best;
 }
 
 cuObjErr_t
