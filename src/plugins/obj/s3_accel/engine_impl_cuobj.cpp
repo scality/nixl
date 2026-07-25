@@ -242,31 +242,41 @@ S3CuObjEngineImpl::S3CuObjEngineImpl(const nixlBackendInitParams *init_params)
     // across the NICs, instead of cuObject, which pins host memory to a single
     // NIC. The list comes from the rdma_nics param, else cufile.json's
     // rdma_dev_addr_list (mirroring the Scality AI Connector). No list at all
-    // (param unset and cufile absent/empty) keeps cuObject as the default.
+    // (param unset and cufile absent/empty) keeps cuObject as the default, as
+    // does the rdma_transport=cuobj escape hatch below.
     const nixl_b_params_t *params = init_params ? init_params->customParams : nullptr;
-    const std::string cufile = readCufileJson();
 
-    const std::string nics_param = paramOr(params, "rdma_nics", "");
-    if (!nics_param.empty()) {
-        rdmaNics_ = splitCsv(nics_param);
+    // Escape hatch: rdma_transport=cuobj forces the cuObject path for DRAM/VRAM
+    // even when a NIC list is resolvable, leaving rdmaNics_ empty so clientFor()
+    // never selects the DC client.
+    const std::string transport = paramOr(params, "rdma_transport", "");
+    if (transport == "cuobj") {
+        NIXL_INFO << "s3_accel: rdma_transport=cuobj; DRAM/VRAM stay on cuObject";
     } else {
-        rdmaNics_ = parseRdmaDevAddrList(cufile);
-        if (!rdmaNics_.empty()) {
-            NIXL_INFO << "s3_accel: resolved " << rdmaNics_.size()
-                      << " DRAM/VRAM NIC(s) from cufile.json rdma_dev_addr_list";
-        }
-    }
+        const std::string cufile = readCufileJson();
 
-    if (!rdmaNics_.empty()) {
-        std::string dckey = paramOr(params, "rdma_dc_key", "");
-        if (dckey.empty()) {
-            dckey = parseRdmaDcKey(cufile); // "" if absent/commented
+        const std::string nics_param = paramOr(params, "rdma_nics", "");
+        if (!nics_param.empty()) {
+            rdmaNics_ = splitCsv(nics_param);
+        } else {
+            rdmaNics_ = parseRdmaDevAddrList(cufile);
+            if (!rdmaNics_.empty()) {
+                NIXL_INFO << "s3_accel: resolved " << rdmaNics_.size()
+                          << " DRAM/VRAM NIC(s) from cufile.json rdma_dev_addr_list";
+            }
         }
-        if (!dckey.empty()) {
-            dcKey_ = std::strtoull(dckey.c_str(), nullptr, 0);
+
+        if (!rdmaNics_.empty()) {
+            std::string dckey = paramOr(params, "rdma_dc_key", "");
+            if (dckey.empty()) {
+                dckey = parseRdmaDcKey(cufile); // "" if absent/commented
+            }
+            if (!dckey.empty()) {
+                dcKey_ = std::strtoull(dckey.c_str(), nullptr, 0);
+            }
+            NIXL_INFO << "s3_accel: ibverbs DC multi-rail enabled (" << rdmaNics_.size()
+                      << " NIC(s))";
         }
-        NIXL_INFO << "s3_accel: ibverbs DC multi-rail enabled (" << rdmaNics_.size()
-                  << " NIC(s))";
     }
 #endif
 }
