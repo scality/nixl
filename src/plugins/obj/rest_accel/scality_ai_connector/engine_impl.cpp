@@ -400,7 +400,7 @@ ScalityObjEngineImpl::ensureHostClient() {
                       "in cufile.json";
         return NIXL_ERR_BACKEND;
     }
-    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_, splitSize_);
+    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_);
     if (!client->isConnected()) {
         NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM/VRAM transfers";
         return NIXL_ERR_BACKEND;
@@ -533,15 +533,13 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
 
         // One descriptor becomes as many ranged requests as split_size dictates,
         // so callers can hand down a whole tensor and let the backend pick the
-        // wire granularity. Sub-ranges resolve through the registration that
-        // contains them, which is what lets a fanned-out buffer reach several
-        // NICs; for a single-MR buffer they all share its NIC and QP.
+        // wire granularity. The token client resolves each sub-range against the
+        // registration containing it and picks a NIC per request, so splitting is
+        // also what spreads one buffer's traffic across the rails.
         const size_t total = local[i].len;
         // WRITE is never split: the endpoint accepts whole-object writes only and
         // answers a second write of the same key with 409 "cannot overwrite", so a
-        // split descriptor would send N colliding PUTs. The token client registers
-        // a spanning MR alongside the interleaved chunks so the one big request can
-        // still be described.
+        // split descriptor would send N colliding PUTs.
         const bool splittable = (operation != NIXL_WRITE) && (splitSize_ != 0);
         const size_t step = splittable ? splitSize_ : total;
         const size_t nreq = splittable ? objRequestCount(total, splitSize_) : 1;
