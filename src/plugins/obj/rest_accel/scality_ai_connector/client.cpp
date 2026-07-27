@@ -115,15 +115,14 @@ osErrnoText(CURL *easy) {
     return absl::StrFormat("%ld (%s)", err, std::strerror(static_cast<int>(err)));
 }
 
-/// True if the errno means the process ran out of file descriptors, either its
-/// own limit (EMFILE) or the system's (ENFILE).
-bool
-isFdExhaustion(CURL *easy) {
-    long err = 0;
-    if (easy) {
-        curl_easy_getinfo(easy, CURLINFO_OS_ERRNO, &err);
+/// libcurl's description of the failure, or the generic CURLcode text when the
+/// error buffer was left empty.
+std::string
+curlErrorText(CURLcode res, const char *error_buf) {
+    if (error_buf && error_buf[0] != '\0') {
+        return error_buf;
     }
-    return err == EMFILE || err == ENFILE;
+    return curl_easy_strerror(res);
 }
 
 /// File descriptors the process currently holds, or 0 if /proc is unavailable.
@@ -161,6 +160,12 @@ struct RestClient::RequestCtx {
     int attempts = 0; // retries already spent on a connection-level failure
     std::function<void(bool)> bool_cb; // Put/Get
     std::function<void(std::optional<bool>)> check_cb; // Head
+    /// libcurl's own description of the failure. Needed because CURLINFO_OS_ERRNO
+    /// is only populated on some paths -- a connect that failed on socket() with
+    /// EMFILE and one the peer refused can both arrive with errno unset -- whereas
+    /// this buffer carries the reason as text either way. Lives here rather than on
+    /// the handle so it survives the handle being recycled.
+    char error_buf[CURL_ERROR_SIZE] = {};
 
     ~RequestCtx() {
         if (headers) {
@@ -180,6 +185,11 @@ struct RestClient::RequestCtx {
 void
 RestClient::buildEasy(RequestCtx *ctx) {
     CURL *curl = ctx->easy;
+    // Re-set every time: a recycled handle had its options cleared by
+    // curl_easy_reset, and a retried request must not report the previous
+    // attempt's message.
+    ctx->error_buf[0] = '\0';
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, ctx->error_buf);
     curl_easy_setopt(curl, CURLOPT_URL, ctx->url.c_str());
     switch (ctx->method) {
     case restMethod::PUT:
@@ -254,8 +264,9 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
         std::optional<bool> result;
         if (res != CURLE_OK) {
             NIXL_ERROR << absl::StrFormat(
-                "checkObjectExistsAsync: curl_code=%d os_errno=%s for HEAD %s",
+                "checkObjectExistsAsync: curl_code=%d (%s) os_errno=%s for HEAD %s",
                 static_cast<int>(res),
+                curlErrorText(res, ctx->error_buf),
                 osErrnoText(ctx->easy),
                 ctx->url);
             result = std::nullopt;
@@ -282,10 +293,11 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
         bool success = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
         if (!success) {
             NIXL_ERROR << absl::StrFormat(
-                "%s: failed url=%s curl_code=%d os_errno=%s http_code=%ld body=%s",
+                "%s: failed url=%s curl_code=%d (%s) os_errno=%s http_code=%ld body=%s",
                 ctx->op_name,
                 ctx->url,
                 static_cast<int>(res),
+                curlErrorText(res, ctx->error_buf),
                 osErrnoText(ctx->easy),
                 http_code,
                 ctx->response_body.empty() ? "<empty>" : ctx->response_body);
@@ -450,27 +462,33 @@ RestClient::reapCompletions() {
         curl_multi_remove_handle(multi_, easy);
         inflight_.erase(ctx);
 
-        // Running out of descriptors is the one connect failure whose cause is
-        // entirely local, and the only moment the descriptor count means anything
-        // is now: at construction the caller has not yet registered memory or
-        // opened its fabric contexts, and by teardown every connection is closed.
-        // Sample it once, on the first occurrence, so a retry storm cannot turn
-        // this into a log flood.
-        if (res != CURLE_OK && !fdExhaustionLogged_ && isFdExhaustion(easy)) {
+        // Report the descriptor budget on the first connect failure of any kind.
+        // Not gated on the errno being EMFILE: libcurl leaves CURLINFO_OS_ERRNO
+        // unset on several paths, so a genuine descriptor exhaustion can arrive
+        // with errno 0 and would never be recognised. The count itself is the
+        // evidence -- close to the limit means local, far from it means the
+        // endpoint -- and now is the only moment it means anything: at
+        // construction the caller has not yet registered memory or opened its
+        // fabric contexts, and by teardown every connection is closed. Sampled
+        // once so a retry storm cannot turn it into a log flood.
+        if (res == CURLE_COULDNT_CONNECT && !fdExhaustionLogged_) {
             fdExhaustionLogged_ = true;
             rlimit lim{};
             const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
+            const std::size_t open_now = openFdCount();
             NIXL_ERROR << absl::StrFormat(
-                "RestClient: out of file descriptors (open=%zu, soft_limit=%s, "
-                "max_inflight=%zu). Every running request holds a connection, so "
-                "the cap cannot exceed the descriptors left after the caller's own "
-                "use. Lower max_inflight or raise 'ulimit -n'. Further occurrences "
-                "are not logged.",
-                openFdCount(),
+                "RestClient: first connect failure. fds open=%zu, soft_limit=%s, "
+                "max_inflight=%zu, curl says '%s'. Every running request holds a "
+                "connection, so open close to the limit means the cap does not fit "
+                "in the descriptors left after the caller's own use -- lower "
+                "max_inflight or raise 'ulimit -n'. Open well below the limit points "
+                "at the endpoint instead. Further connect failures are not logged.",
+                open_now,
                 (have_limit && lim.rlim_cur != RLIM_INFINITY) ?
                     std::to_string(lim.rlim_cur) :
                     std::string("unlimited"),
-                maxInflight_);
+                maxInflight_,
+                curlErrorText(res, ctx->error_buf));
         }
 
         // Retry a lost request rather than failing the caller's whole transfer for
@@ -486,9 +504,13 @@ RestClient::reapCompletions() {
             ctx->attempts++;
             ctx->response_body.clear();
             totalRetries_++;
-            NIXL_WARN << absl::StrFormat("%s: curl_code=%d os_errno=%s url=%s, retry %d/%d",
+            // buildEasy is not called again, so clear this here or the next attempt
+            // reports whatever the last one failed with.
+            ctx->error_buf[0] = '\0';
+            NIXL_WARN << absl::StrFormat("%s: curl_code=%d (%s) os_errno=%s url=%s, retry %d/%d",
                                          ctx->op_name,
                                          static_cast<int>(res),
+                                         curlErrorText(res, ctx->error_buf),
                                          osErrnoText(ctx->easy),
                                          ctx->url,
                                          ctx->attempts,
