@@ -1771,17 +1771,18 @@ cleanupSlots(nixlAgent *agent, nixlBackendH *backend_engine, std::vector<slotSta
 // tears down and rebuilds the request between iterations, --reregister_mem
 // adds the matching registerMem/deregisterMem cycle.
 static int
-execTransferLoop(nixlAgent *agent,
-                 nixlBackendH *backend_engine,
-                 const nixl_xfer_op_t op,
-                 const std::string &target,
-                 nixl_opt_args_t &params,
-                 const int num_iter,
-                 xferBenchStats &thread_stats,
-                 const std::vector<xferBenchIOV> &local_iov,
-                 const std::vector<xferBenchIOV> &remote_iov,
-                 const std::atomic<int> *terminate_ptr = nullptr,
-                 uniqueObjKeyCtx *ukctx = nullptr) {
+execTransferLoopInner(nixlAgent *agent,
+                      nixlBackendH *backend_engine,
+                      const nixl_xfer_op_t op,
+                      const std::string &target,
+                      nixl_opt_args_t &params,
+                      const int num_iter,
+                      xferBenchStats &thread_stats,
+                      const std::vector<xferBenchIOV> &local_iov,
+                      const std::vector<xferBenchIOV> &remote_iov,
+                      const std::atomic<int> *terminate_ptr,
+                      uniqueObjKeyCtx *ukctx,
+                      const std::atomic<bool> *abort_ptr) {
     const int depth = std::min(xferBenchConfig::pipeline_depth, num_iter);
     if (depth < xferBenchConfig::pipeline_depth) {
         std::cout << "Warning: pipeline_depth (" << xferBenchConfig::pipeline_depth
@@ -1839,7 +1840,8 @@ execTransferLoop(nixlAgent *agent,
     int completed = 0;
 
     for (int s = 0; s < depth; s++) {
-        if (terminate_ptr && terminate_ptr->load()) [[unlikely]] {
+        if ((terminate_ptr && terminate_ptr->load()) ||
+            (abort_ptr && abort_ptr->load())) [[unlikely]] {
             cleanupSlots(agent, backend_engine, slots);
             return -1;
         }
@@ -1872,7 +1874,8 @@ execTransferLoop(nixlAgent *agent,
     }
 
     while (completed < num_iter) {
-        if (terminate_ptr && terminate_ptr->load()) [[unlikely]] {
+        if ((terminate_ptr && terminate_ptr->load()) ||
+            (abort_ptr && abort_ptr->load())) [[unlikely]] {
             cleanupSlots(agent, backend_engine, slots);
             return -1;
         }
@@ -1901,7 +1904,8 @@ execTransferLoop(nixlAgent *agent,
                 continue;
             }
 
-            if (terminate_ptr && terminate_ptr->load()) [[unlikely]] {
+            if ((terminate_ptr && terminate_ptr->load()) ||
+            (abort_ptr && abort_ptr->load())) [[unlikely]] {
                 cleanupSlots(agent, backend_engine, slots);
                 return -1;
             }
@@ -1948,6 +1952,49 @@ execTransferLoop(nixlAgent *agent,
     return 0;
 }
 
+// Run one thread's transfer loop and, on any failure, raise the shared abort flag
+// so the sibling threads stop at their next check instead of each grinding
+// through its own iterations first.
+//
+// Without this a single fault -- descriptor exhaustion, a refused connection --
+// is reported once per thread, so a 128-thread run buries the first and most
+// informative error under a hundred more and keeps hammering an endpoint that is
+// already failing. The failure still propagates the same way (execTransfer -> the
+// variant -> EXIT_FAILURE); this only makes it prompt.
+//
+// Wrapping rather than setting the flag at each return keeps it correct for the
+// dozen existing failure paths and any added later.
+static int
+execTransferLoop(nixlAgent *agent,
+                 nixlBackendH *backend_engine,
+                 const nixl_xfer_op_t op,
+                 const std::string &target,
+                 nixl_opt_args_t &params,
+                 const int num_iter,
+                 xferBenchStats &thread_stats,
+                 const std::vector<xferBenchIOV> &local_iov,
+                 const std::vector<xferBenchIOV> &remote_iov,
+                 const std::atomic<int> *terminate_ptr = nullptr,
+                 uniqueObjKeyCtx *ukctx = nullptr,
+                 std::atomic<bool> *abort_ptr = nullptr) {
+    const int result = execTransferLoopInner(agent,
+                                             backend_engine,
+                                             op,
+                                             target,
+                                             params,
+                                             num_iter,
+                                             thread_stats,
+                                             local_iov,
+                                             remote_iov,
+                                             terminate_ptr,
+                                             ukctx,
+                                             abort_ptr);
+    if (result != 0 && abort_ptr) {
+        abort_ptr->store(true);
+    }
+    return result;
+}
+
 static int
 execTransfer(nixlAgent *agent,
              nixlBackendH *backend_engine,
@@ -1961,6 +2008,10 @@ execTransfer(nixlAgent *agent,
              uniqueObjKeyCtx *ukctx = nullptr) {
     int ret = 0;
     stats.clear();
+
+    // Raised by whichever thread fails first, so the rest stop promptly rather
+    // than reporting the same fault num_threads times over.
+    std::atomic<bool> aborted{false};
 
     xferBenchTimer total_timer;
 #pragma omp parallel num_threads(num_threads)
@@ -1988,7 +2039,8 @@ execTransfer(nixlAgent *agent,
                                       local_iov,
                                       remote_iov,
                                       terminate_ptr,
-                                      ukctx);
+                                      ukctx,
+                                      &aborted);
 
         if (result != 0) [[unlikely]] {
             ret = result;
