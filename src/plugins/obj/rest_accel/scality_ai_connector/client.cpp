@@ -55,6 +55,22 @@ parseNumThreads(nixl_b_params_t *params) {
     return parsed;
 }
 
+std::size_t
+parseMaxInflight(nixl_b_params_t *params) {
+    if (!params || params->count("max_inflight") == 0) {
+        return kDefaultMaxInflight;
+    }
+    // 0 is meaningful here (uncapped), so unlike num_threads only malformed
+    // values are rejected.
+    const std::string &value = params->at("max_inflight");
+    std::size_t consumed = 0;
+    const std::size_t parsed = std::stoul(value, &consumed);
+    if (consumed != value.size()) {
+        throw std::invalid_argument("RestClient: max_inflight must be a non-negative integer");
+    }
+    return parsed;
+}
+
 } // namespace
 
 enum class restMethod { PUT, GET, HEAD };
@@ -176,7 +192,8 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
 
 RestClient::RestClient(nixl_b_params_t *custom_params)
     : numThreads_(parseNumThreads(custom_params)),
-      pool_(numThreads_) {
+      pool_(numThreads_),
+      maxInflight_(parseMaxInflight(custom_params)) {
     std::call_once(curl_init_flag, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
     if (!custom_params) {
         throw std::invalid_argument("RestClient: custom_params is null");
@@ -197,9 +214,11 @@ RestClient::RestClient(nixl_b_params_t *custom_params)
     poller_ = std::thread(&RestClient::pollerLoop, this);
 
     NIXL_INFO << absl::StrFormat(
-        "RestClient initialized: endpoint=%s, callback_threads=%zu (curl_multi poller)",
+        "RestClient initialized: endpoint=%s, callback_threads=%zu, max_inflight=%s "
+        "(curl_multi poller)",
         endpoint_,
-        numThreads_);
+        numThreads_,
+        maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
 }
 
 RestClient::~RestClient() {
@@ -214,6 +233,11 @@ RestClient::~RestClient() {
     if (multi_) {
         curl_multi_cleanup(multi_);
     }
+    // peakPending_ > 0 means requests waited on the cap, so max_inflight was the
+    // limit; peakInflight_ below the cap means the producer never kept up.
+    NIXL_DEBUG << "RestClient teardown: peak_inflight=" << peakInflight_
+               << ", peak_pending=" << peakPending_ << ", max_inflight="
+               << (maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
 }
 
 std::string
@@ -252,12 +276,32 @@ RestClient::reapCompletions() {
 }
 
 void
+RestClient::startPending() {
+    peakPending_ = std::max(peakPending_, pending_.size());
+    while (!pending_.empty() && (maxInflight_ == 0 || inflight_.size() < maxInflight_)) {
+        std::unique_ptr<RequestCtx> ctx = std::move(pending_.front());
+        pending_.pop_front();
+        RequestCtx *raw = ctx.get();
+        CURLMcode mc = curl_multi_add_handle(multi_, raw->easy);
+        if (mc != CURLM_OK) {
+            NIXL_ERROR << absl::StrFormat(
+                "%s: curl_multi_add_handle failed: %s", raw->op_name, curl_multi_strerror(mc));
+            finishRequest(ctx.release(), CURLE_FAILED_INIT, 0);
+            continue;
+        }
+        ctx.release(); // ownership tracked via CURLOPT_PRIVATE until completion
+        inflight_.insert(raw);
+        peakInflight_ = std::max(peakInflight_, inflight_.size());
+    }
+}
+
+void
 RestClient::pollerLoop() {
     for (;;) {
         const bool stopping = stop_.load();
 
-        // 1. Drain the producer queue. On shutdown, fail queued requests instead
-        //    of starting them.
+        // 1. Drain the producer queue into pending_. On shutdown, fail queued
+        //    requests instead of starting them.
         std::queue<std::unique_ptr<RequestCtx>> batch;
         {
             const std::lock_guard<std::mutex> lk(queueMtx_);
@@ -270,36 +314,44 @@ RestClient::pollerLoop() {
                 finishRequest(ctx.release(), CURLE_ABORTED_BY_CALLBACK, 0);
                 continue;
             }
-            RequestCtx *raw = ctx.get();
-            CURLMcode mc = curl_multi_add_handle(multi_, raw->easy);
-            if (mc != CURLM_OK) {
-                NIXL_ERROR << absl::StrFormat(
-                    "%s: curl_multi_add_handle failed: %s", raw->op_name, curl_multi_strerror(mc));
-                finishRequest(ctx.release(), CURLE_FAILED_INIT, 0);
-                continue;
-            }
-            ctx.release(); // ownership tracked via CURLOPT_PRIVATE until completion
-            inflight_.insert(raw);
+            pending_.push_back(std::move(ctx));
         }
 
-        // 2. Advance all in-flight transfers (non-blocking).
+        // 2. Fill the in-flight slots from pending_.
+        startPending();
+
+        // 3. Advance all in-flight transfers (non-blocking).
         int running = 0;
         curl_multi_perform(multi_, &running);
 
-        // 3. Hand finished transfers' callbacks to the worker pool.
+        // 4. Hand finished transfers' callbacks to the worker pool.
         reapCompletions();
 
-        // 4. On shutdown, abort anything still in flight so every callback fires.
+        // 5. Completions above freed slots; refill before sleeping so a capped
+        //    queue does not stall waiting for the next socket event.
+        if (!stopping) {
+            startPending();
+        }
+
+        // 6. On shutdown, abort everything queued or in flight so every callback
+        //    fires exactly once.
         if (stopping) {
             for (RequestCtx *ctx : inflight_) {
                 curl_multi_remove_handle(multi_, ctx->easy);
                 finishRequest(ctx, CURLE_ABORTED_BY_CALLBACK, 0);
             }
             inflight_.clear();
+            while (!pending_.empty()) {
+                std::unique_ptr<RequestCtx> ctx = std::move(pending_.front());
+                pending_.pop_front();
+                finishRequest(ctx.release(), CURLE_ABORTED_BY_CALLBACK, 0);
+            }
             break;
         }
 
-        // 5. Block until socket activity, the 1s backstop, or curl_multi_wakeup().
+        // 7. Block until socket activity, the 1s backstop, or curl_multi_wakeup().
+        //    Requests still in pending_ imply the in-flight set is full, so a
+        //    completion (socket event) is what frees the next slot.
         int numfds = 0;
         curl_multi_poll(multi_, nullptr, 0, 1000, &numfds);
     }
