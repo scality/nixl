@@ -80,13 +80,46 @@ parseNumThreads(nixl_b_params_t *params) {
     return parsed;
 }
 
+/// True if the caller set max_inflight rather than leaving it to us.
+bool
+hasMaxInflight(nixl_b_params_t *params) {
+    return params && params->count("max_inflight") != 0;
+}
+
+/// Share of RLIMIT_NOFILE the default cap may claim. Every running request holds
+/// a connection, so the cap is a descriptor requirement, and the caller needs the
+/// rest for its own threads, registrations and fabric contexts -- which it opens
+/// after this client is built, so they cannot be counted here. A quarter leaves
+/// room for a caller several times heavier than this client.
+constexpr std::size_t kFdShareDivisor = 4;
+
+/// The cap to use when the caller did not choose one.
+///
+/// kDefaultMaxInflight alone is not safe: it was picked to sit under a 1024
+/// descriptor limit, which only holds if everything else in the process stays
+/// under the remaining half. A benchmark with 128 threads was measured using 639
+/// on its own, and a 700 limit leaves less still, so the fixed default would
+/// exhaust descriptors and every request would fail at connect. Scale it to the
+/// limit actually in force instead.
 std::size_t
-parseMaxInflight(nixl_b_params_t *params) {
-    if (!params || params->count("max_inflight") == 0) {
+defaultMaxInflight() {
+    rlimit lim{};
+    if (getrlimit(RLIMIT_NOFILE, &lim) != 0 || lim.rlim_cur == RLIM_INFINITY) {
         return kDefaultMaxInflight;
     }
+    const std::size_t share = static_cast<std::size_t>(lim.rlim_cur) / kFdShareDivisor;
+    return std::max<std::size_t>(1, std::min(kDefaultMaxInflight, share));
+}
+
+std::size_t
+parseMaxInflight(nixl_b_params_t *params) {
+    if (!hasMaxInflight(params)) {
+        return defaultMaxInflight();
+    }
     // 0 is meaningful here (uncapped), so unlike num_threads only malformed
-    // values are rejected.
+    // values are rejected. An explicit value is honoured as given: the operator
+    // may know the descriptor budget better than we can infer it. The constructor
+    // warns when it will not fit.
     const std::string &value = params->at("max_inflight");
     std::size_t consumed = 0;
     const std::size_t parsed = std::stoul(value, &consumed);
@@ -382,12 +415,28 @@ RestClient::RestClient(nixl_b_params_t *custom_params)
     curl_multi_setopt(multi_, CURLMOPT_MAXCONNECTS, static_cast<long>(easyCacheCap_));
     poller_ = std::thread(&RestClient::pollerLoop, this);
 
+    const bool cap_from_params = hasMaxInflight(custom_params);
     NIXL_INFO << absl::StrFormat(
         "RestClient initialized: endpoint=%s, callback_threads=%zu, max_inflight=%s "
-        "(curl_multi poller)",
+        "(%s, curl_multi poller)",
         endpoint_,
         numThreads_,
-        maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
+        maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_),
+        cap_from_params ? "configured" : "default");
+
+    // A default lower than kDefaultMaxInflight means the descriptor limit, not
+    // this client, chose it. Say so, or the number looks arbitrary to anyone
+    // comparing runs across machines with different ulimits.
+    if (!cap_from_params && maxInflight_ < kDefaultMaxInflight) {
+        NIXL_INFO << absl::StrFormat(
+            "RestClient: max_inflight defaulted to %zu, a 1/%zu share of "
+            "RLIMIT_NOFILE, rather than the built-in %zu which would not leave the "
+            "caller enough descriptors. Set max_inflight explicitly to override, or "
+            "raise 'ulimit -n' for a larger default.",
+            maxInflight_,
+            kFdShareDivisor,
+            kDefaultMaxInflight);
+    }
 
     // Every running request holds a connection, so max_inflight is a file
     // descriptor requirement as much as a concurrency setting. Report the budget:
