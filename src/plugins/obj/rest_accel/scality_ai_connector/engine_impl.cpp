@@ -400,7 +400,7 @@ ScalityObjEngineImpl::ensureHostClient() {
                       "in cufile.json";
         return NIXL_ERR_BACKEND;
     }
-    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_, splitSize_);
+    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_);
     if (!client->isConnected()) {
         NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM/VRAM transfers";
         return NIXL_ERR_BACKEND;
