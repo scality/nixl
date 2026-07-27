@@ -439,19 +439,6 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 
         nic.dctns[p] = nic.dct_qps[p]->qp_num;
         NIXL_INFO << "ibverbs_dc: NIC " << ip << " DCT QP[" << p << "] dctn=" << nic.dctns[p];
-
-        // Report the negotiated responder capacity: how many concurrent incoming
-        // RDMA READs this DCT will service. The RTR modify above does not set
-        // IBV_QP_MAX_DEST_RD_ATOMIC, so this is the driver default and is the
-        // suspected ceiling on biziod's read pipeline throughput.
-        ibv_qp_attr qa{};
-        ibv_qp_init_attr qia{};
-        if (ibv_query_qp(nic.dct_qps[p], &qa, IBV_QP_MAX_DEST_RD_ATOMIC, &qia) == 0) {
-            NIXL_INFO << "ibverbs_dc: NIC " << ip << " DCT QP[" << p
-                      << "] max_dest_rd_atomic=" << (int)qa.max_dest_rd_atomic;
-        } else {
-            NIXL_WARN << "ibverbs_dc: ibv_query_qp(DCT) failed for " << ip;
-        }
     }
 
     ibv_port_attr port_attr{};
