@@ -186,6 +186,15 @@ private:
     /// Set once the descriptor-exhaustion diagnostic has been emitted, so a retry
     /// storm reports it once rather than per request. Poller-thread only.
     bool fdExhaustionLogged_ = false;
+    /// Set when a connect failure was traced to the process being out of file
+    /// descriptors. Unlike a refused connection that may clear on its own, this
+    /// cannot resolve while the caller keeps its descriptors, so retrying is
+    /// pointless and the queued requests cannot succeed either. Latching it
+    /// suppresses retries and fails the backlog at once. Poller-thread only.
+    bool fdExhausted_ = false;
+    /// Requests failed by the backlog drain, reported once at teardown rather
+    /// than one log line each. Poller-thread only.
+    std::size_t fdAbandoned_ = 0;
 
     /**
      * Build the full URL for a given key.
