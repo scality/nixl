@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <sys/resource.h>
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -125,14 +126,14 @@ curlErrorText(CURLcode res, const char *error_buf) {
     return curl_easy_strerror(res);
 }
 
-/// File descriptors the process currently holds, or 0 if /proc is unavailable.
-/// Reading /proc/self/fd holds one descriptor of its own, which is discounted
-/// along with "." and "..".
-std::size_t
+/// File descriptors the process currently holds, or nullopt with errno set if the
+/// count could not be taken. "." and ".." and our own directory handle are
+/// discounted.
+std::optional<std::size_t>
 openFdCount() {
     DIR *dir = opendir("/proc/self/fd");
     if (!dir) {
-        return 0;
+        return std::nullopt;
     }
     std::size_t count = 0;
     while (readdir(dir) != nullptr) {
@@ -140,6 +141,30 @@ openFdCount() {
     }
     closedir(dir);
     return count > 3 ? count - 3 : 0;
+}
+
+/// The descriptor count rendered for a log line.
+///
+/// Counting needs a descriptor of its own, so the count is unavailable in exactly
+/// the situation it would settle. Say which rather than printing a number:
+/// opendir failing with EMFILE is itself proof of exhaustion, whereas a bare 0
+/// reads as "no data" and sends the reader looking at the endpoint instead.
+std::string
+openFdCountText() {
+    const int saved = errno;
+    errno = 0;
+    const std::optional<std::size_t> count = openFdCount();
+    const int err = errno;
+    errno = saved;
+    if (count) {
+        return std::to_string(*count);
+    }
+    if (err == EMFILE || err == ENFILE) {
+        return absl::StrFormat("unreadable: %s -- taking the count hit the limit too, "
+                               "which is itself the answer",
+                               std::strerror(err));
+    }
+    return absl::StrFormat("unreadable (%s)", std::strerror(err));
 }
 
 } // namespace
@@ -369,7 +394,7 @@ RestClient::RestClient(nixl_b_params_t *custom_params)
     // baseline is higher -- on one 128-thread benchmark it reached 639.
     rlimit lim{};
     const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
-    const std::size_t open_now = openFdCount();
+    const std::size_t open_now = openFdCount().value_or(0);
     if (have_limit && lim.rlim_cur != RLIM_INFINITY) {
         NIXL_INFO << absl::StrFormat(
             "RestClient fd budget: open=%zu (so far), soft_limit=%llu, "
@@ -475,15 +500,14 @@ RestClient::reapCompletions() {
             fdExhaustionLogged_ = true;
             rlimit lim{};
             const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
-            const std::size_t open_now = openFdCount();
             NIXL_ERROR << absl::StrFormat(
-                "RestClient: first connect failure. fds open=%zu, soft_limit=%s, "
+                "RestClient: first connect failure. fds open=%s, soft_limit=%s, "
                 "max_inflight=%zu, curl says '%s'. Every running request holds a "
                 "connection, so open close to the limit means the cap does not fit "
                 "in the descriptors left after the caller's own use -- lower "
                 "max_inflight or raise 'ulimit -n'. Open well below the limit points "
                 "at the endpoint instead. Further connect failures are not logged.",
-                open_now,
+                openFdCountText(),
                 (have_limit && lim.rlim_cur != RLIM_INFINITY) ?
                     std::to_string(lim.rlim_cur) :
                     std::string("unlimited"),
