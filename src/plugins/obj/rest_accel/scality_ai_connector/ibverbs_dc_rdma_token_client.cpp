@@ -256,9 +256,9 @@ openDeviceForNic(const std::string &nic, int *out_gid_index) {
         result = ibv_open_device(dev_list[best_dev]);
         if (result) {
             *out_gid_index = best_gidx;
-            NIXL_INFO << "ibverbs_dc: NIC " << nic << " -> "
-                      << ibv_get_device_name(dev_list[best_dev]) << " gid_index=" << best_gidx
-                      << " (score " << best_score << ")";
+            NIXL_DEBUG << "ibverbs_dc: NIC " << nic << " -> "
+                       << ibv_get_device_name(dev_list[best_dev]) << " gid_index=" << best_gidx
+                       << " (score " << best_score << ")";
         }
     } else {
         NIXL_ERROR << "ibverbs_dc: no RDMA device found for NIC '" << nic
@@ -325,8 +325,8 @@ IbverbsDcRdmaTokenClient::numLagPorts(const char *dev_name) {
                   << " slave(s), out of range [1," << kDcMaxLagPorts << "], using 1";
         return 1;
     }
-    NIXL_INFO << "ibverbs_dc: bond '" << bond << "' has " << n << " slave(s) (iface " << iface
-              << ")";
+    NIXL_DEBUG << "ibverbs_dc: bond '" << bond << "' has " << n << " slave(s) (iface " << iface
+               << ")";
     return n;
 }
 
@@ -338,7 +338,7 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
     }
 
     nic.num_lag_ports = numLagPorts(ibv_get_device_name(nic.ctx->device));
-    NIXL_INFO << "ibverbs_dc: NIC " << ip << " LAG ports: " << nic.num_lag_ports;
+    NIXL_DEBUG << "ibverbs_dc: NIC " << ip << " LAG ports: " << nic.num_lag_ports;
 
     // Record PCIe topology for GPU/NIC affinity (used only as an advisory hint;
     // failures degrade to no-affinity, never block).
@@ -346,8 +346,8 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
     const std::string ib_dev = "/sys/class/infiniband/" + nic.dev_name + "/device";
     nic.pci_path = canonicalPath(ib_dev);
     nic.numa_node = readIntFile(ib_dev + "/numa_node");
-    NIXL_INFO << "ibverbs_dc: NIC " << ip << " (" << nic.dev_name << ") pci_path='" << nic.pci_path
-              << "' numa_node=" << nic.numa_node;
+    NIXL_DEBUG << "ibverbs_dc: NIC " << ip << " (" << nic.dev_name << ") pci_path='" << nic.pci_path
+               << "' numa_node=" << nic.numa_node;
 
     // Device ceilings that bound RDMA READ concurrency: max_qp_rd_atom caps the
     // DCT responder resources (max_dest_rd_atomic) this target can grant to a
@@ -355,9 +355,9 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
     // read pipeline is throttled regardless of its own max_rd_atomic.
     ibv_device_attr dev_attr{};
     if (ibv_query_device(nic.ctx, &dev_attr) == 0) {
-        NIXL_INFO << "ibverbs_dc: NIC " << ip << " device caps: max_qp_rd_atom="
-                  << dev_attr.max_qp_rd_atom
-                  << " max_qp_init_rd_atom=" << dev_attr.max_qp_init_rd_atom;
+        NIXL_DEBUG << "ibverbs_dc: NIC " << ip << " device caps: max_qp_rd_atom="
+                   << dev_attr.max_qp_rd_atom
+                   << " max_qp_init_rd_atom=" << dev_attr.max_qp_init_rd_atom;
     } else {
         NIXL_WARN << "ibverbs_dc: ibv_query_device failed for " << ip;
     }
@@ -438,7 +438,7 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
         }
 
         nic.dctns[p] = nic.dct_qps[p]->qp_num;
-        NIXL_INFO << "ibverbs_dc: NIC " << ip << " DCT QP[" << p << "] dctn=" << nic.dctns[p];
+        NIXL_DEBUG << "ibverbs_dc: NIC " << ip << " DCT QP[" << p << "] dctn=" << nic.dctns[p];
     }
 
     ibv_port_attr port_attr{};
@@ -489,8 +489,8 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
                       << tos;
         }
     }
-    NIXL_INFO << "ibverbs_dc: RoCE sl=" << (int)sl_ << " traffic_class=" << (int)traffic_class_
-              << " (DSCP " << (traffic_class_ >> 2) << ")";
+    NIXL_DEBUG << "ibverbs_dc: RoCE sl=" << (int)sl_ << " traffic_class=" << (int)traffic_class_
+               << " (DSCP " << (traffic_class_ >> 2) << ")";
     nics_.resize(nic_ips.size());
     for (size_t i = 0; i < nic_ips.size(); i++) {
         if (!setupNic(nic_ips[i], dc_key, nics_[i])) {
@@ -505,7 +505,9 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
     }
     connected_ = true;
     NIXL_INFO << "ibverbs_dc: DC transport ready across " << nics_.size() << " NIC(s), key=0x"
-              << std::hex << dc_key << std::dec;
+              << std::hex << dc_key << std::dec << ", RoCE sl=" << (int)sl_
+              << " traffic_class=" << (int)traffic_class_ << " (DSCP " << (traffic_class_ >> 2)
+              << ")";
 }
 
 IbverbsDcRdmaTokenClient::~IbverbsDcRdmaTokenClient() {
