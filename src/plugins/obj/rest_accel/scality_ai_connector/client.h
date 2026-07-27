@@ -23,6 +23,7 @@
 #include <curl/curl.h>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -84,6 +85,10 @@ public:
     checkObjectExistsAsync(std::string_view key, check_object_callback_t callback) = 0;
 };
 
+/// Default cap on concurrently-running requests. Sized to stay clear of a
+/// typical 1024 RLIMIT_NOFILE while leaving fds for sockets, plugins and files.
+constexpr std::size_t kDefaultMaxInflight = 512;
+
 /**
  * Scality AI Connector HTTP client with RDMA support.
  * Uses libcurl to perform HTTP PUT/GET requests, passing the RDMA
@@ -98,6 +103,8 @@ public:
      * @param custom_params Backend init params; must contain "endpoint_override".
      *                      Optional "num_threads" sizes the callback worker pool
      *                      (default: max(2, hardware_concurrency / 4)).
+     *                      Optional "max_inflight" caps concurrently-running
+     *                      requests (default: kDefaultMaxInflight, "0" = unlimited).
      */
     explicit RestClient(nixl_b_params_t *custom_params);
 
@@ -137,6 +144,14 @@ private:
     std::size_t numThreads_;
     asio::thread_pool pool_; // callback worker pool
 
+    // Cap on requests running at once. A caller submitting one descriptor per
+    // tensor can queue thousands in a single batch, and every running request
+    // holds its own connection (and fd), so an uncapped multi handle can exhaust
+    // RLIMIT_NOFILE or the endpoint's connection budget. Excess requests wait in
+    // pending_ and start as slots free, which keeps the fabric saturated without
+    // the fd blow-up. 0 disables the cap.
+    std::size_t maxInflight_;
+
     CURLM *multi_ = nullptr;
     std::thread poller_;
     std::mutex queueMtx_;
@@ -144,6 +159,13 @@ private:
     std::atomic<bool> stop_{false};
     /// Handles currently added to multi_. Poller-thread access only (no lock).
     std::unordered_set<RequestCtx *> inflight_;
+    /// Built requests waiting for a free in-flight slot. Poller-thread only.
+    std::deque<std::unique_ptr<RequestCtx>> pending_;
+    // High-water marks, logged at teardown. Without them a throughput sweep
+    // cannot tell whether max_inflight was the binding constraint or the producer
+    // simply never supplied enough work. Poller-thread only, so no locking.
+    std::size_t peakInflight_ = 0;
+    std::size_t peakPending_ = 0;
 
     /**
      * Build the full URL for a given key.
@@ -178,6 +200,11 @@ private:
     /// Push a fully-built request onto the queue and wake the poller.
     void
     enqueue(std::unique_ptr<RequestCtx> ctx);
+
+    /// Move pending requests into multi_ while in-flight slots are available.
+    /// Poller-thread only.
+    void
+    startPending();
 
     /// Body of the poller thread: drain queue, perform, reap, poll.
     void
