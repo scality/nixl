@@ -127,8 +127,7 @@ private:
     /// requests of at most this, so callers hand down whole tensors and the
     /// backend decides the wire granularity. 0 disables splitting (one request
     /// per descriptor, whatever its size). Resolved from customParams
-    /// 'split_size' at construction and shared with the DC token client, which
-    /// interleaves registration chunks of this size across the NICs.
+    /// 'split_size' at construction.
     size_t splitSize_ = kDefaultSplitSize;
     /// Scality AI Connector HTTP client with RDMA support
     std::shared_ptr<iRestClient> connectorClient_;

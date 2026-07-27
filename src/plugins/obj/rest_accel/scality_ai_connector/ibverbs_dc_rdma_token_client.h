@@ -35,9 +35,15 @@
  *
  * Bypasses cuObject to spread host-memory (DRAM) transfers across multiple NICs:
  * cuObject pins every host registration to a single NIC, whereas this client
- * opens one DC target context per NIC and round-robins memory regions across
- * them, building the DC descriptor itself with the chosen NIC's GID. The Scality
+ * opens one DC target context per NIC and registers every buffer on all of them,
+ * building the DC descriptor itself with the chosen NIC's GID. The Scality
  * server accepts the same wire format produced by the bench rdma-helper.
+ *
+ * A descriptor carries the request's own address and length, and an rkey covers
+ * any sub-range of its MR, so the NIC a request travels on is decided when its
+ * descriptor is built rather than fixed at registration. That keeps one MR per
+ * (buffer, NIC) instead of one per request-sized offset, and lets rail selection
+ * follow the live load: see pickRail and kNonAffineHandicap.
  *
  * The DC target is passive: the server (DCI side) initiates and performs all
  * one-sided RDMA, so this client runs no background threads, CM listener, or
@@ -47,18 +53,10 @@ class IbverbsDcRdmaTokenClient : public iRdmaTokenClient {
 public:
     /**
      * @param nic_ips     IPv4 addresses selecting the RDMA devices (one DC context
-     *                    per IP); memory regions are round-robined across them.
+     *                    per IP); every buffer is registered on all of them.
      * @param dc_key      DC access key the server's DCI side must present.
-     * @param split_size  Bytes per object request, as used by the engine. A
-     *                    registration is cut into chunks of this size and the
-     *                    chunks are spread over the NICs, so every request lands
-     *                    inside exactly one chunk (descriptorFor requires
-     *                    containment). 0 means the engine does not split, so a
-     *                    registration stays on one NIC.
      */
-    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
-                             uint64_t dc_key,
-                             size_t split_size);
+    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips, uint64_t dc_key);
     ~IbverbsDcRdmaTokenClient() override;
 
     IbverbsDcRdmaTokenClient(const IbverbsDcRdmaTokenClient &) = delete;
@@ -95,18 +93,21 @@ private:
         int numa_node = -1;    ///< NUMA node of the NIC, or -1 if unknown.
     };
 
-    /// One registered memory region: its MR plus the NIC/DCTN it was bound to.
-    /// A caller registration may fan out into several adjacent Regions on
-    /// different NICs; every piece carries the caller's base address in
-    /// parent_base so release can find its siblings.
-    struct Region {
+    /// One rail of a registered buffer: an MR covering the WHOLE buffer on that
+    /// NIC. An rkey is valid for any sub-range of its MR, so a request at any
+    /// offset can be described from any rail the buffer is registered on.
+    struct RailMr {
         ibv_mr *mr = nullptr;
-        size_t len = 0;
         int nic_idx = 0;
-        uint32_t dctn = 0;
-        int dev_id = -1; ///< GPU ordinal (VRAM) or -1 (host), for the assignment dump.
-        uintptr_t parent_base = 0; ///< Address the caller registered; equals the
-                                   ///< piece base for a single-piece registration.
+    };
+
+    /// A caller registration, held on every NIC that accepted it. The rail a
+    /// request travels on is chosen when its descriptor is built, not here, so
+    /// the choice can follow live load instead of being fixed at registration.
+    struct Buffer {
+        size_t len = 0;
+        int dev_id = -1; ///< GPU ordinal (VRAM) or -1 (host memory).
+        std::vector<RailMr> rails;
     };
 
     /// Build (and INIT->RTR) a NIC's DC context for the given IP. Returns false on error.
@@ -115,43 +116,25 @@ private:
     /// Detect bond width for an IB device via sysfs; clamps to [1, kDcMaxLagPorts].
     static int
     numLagPorts(const char *dev_name);
-    /// Build the descriptor for the region covering ptr; empty string if not found.
+    /// Build the descriptor for the buffer covering ptr; empty string if none does.
     std::string
     descriptorFor(void *ptr, size_t size);
-    /// One-shot NIXL_INFO dump of the GPU->NIC buffer assignment. Caller holds mu_.
+    /// One-shot NIXL_INFO dump of the registered MR layout. Caller holds mu_.
     void
-    logAssignment();
+    logLayout();
+    /// NIXL_INFO dump of how many requests each GPU sent down each rail.
+    void
+    logRequestSpread();
 
-    /// Pick the NIC index to register a buffer on. dev_id < 0 (host memory)
-    /// balances across all NICs; dev_id >= 0 (VRAM) prefers the GPU's affine
-    /// rails but can overflow onto the others (see affineNicsFor). Pure: the
-    /// load is bumped by registerPiece. Caller must hold mu_.
-    int
-    selectNicFor(int dev_id);
-    /// Least-loaded NIC among candidates (fewest live registrations; ties break
-    /// to the lowest index). Pure. Caller must hold mu_.
-    int
-    leastLoadedNic(const std::vector<int> &candidates);
-    /// NIC indices to spread a registration's chunks over, affine rails first so a
-    /// buffer with fewer chunks than rails still favours the GPU's own, while a
-    /// bigger one reaches every rail. Caller must hold mu_.
-    std::vector<int>
-    fanRailsFor(int dev_id);
-    /// Register [ptr, ptr+size) as a single MR on the selected NIC, recording it in
-    /// `dest` under parent_base. Returns false and registers nothing on failure.
-    /// Caller must hold mu_.
-    bool
-    registerPiece(void *ptr,
-                  size_t size,
-                  int dev_id,
-                  int nic_idx,
-                  uintptr_t parent_base,
-                  std::map<uintptr_t, Region> &dest);
-    /// Deregister every piece belonging to the registration at parent_base and
-    /// drop its NIC load. Returns the number of pieces released (0 if unknown).
+    /// Index into buf.rails for the next request against buf. Prefers the GPU's
+    /// affine rails, handing the rest kNonAffineHandicap so they stay unused
+    /// while the affine rails keep up and absorb the excess once they do not.
     /// Caller must hold mu_.
     size_t
-    releaseRegistration(uintptr_t parent_base);
+    pickRail(const Buffer &buf);
+    /// Register [ptr, ptr+size) on one NIC. Returns nullptr on failure.
+    ibv_mr *
+    registerRail(void *ptr, size_t size, int nic_idx);
     /// Resolve (and cache) the set of NIC indices affine to a GPU. Prefers NICs
     /// that share a PCIe switch with the GPU (PXB/PIX-local); when no NIC is
     /// switch-local (the RDMA NICs sit on a shared bridge equidistant from every
@@ -165,20 +148,16 @@ private:
     bool connected_ = false;
     /// All NIC indices [0, nics_.size()); candidate set for host-memory balancing.
     std::vector<int> all_nics_;
-    /// Live registration count per NIC, used to balance new registrations across
-    /// the affine set (a per-GPU cursor can't spread when each GPU registers once).
-    std::vector<uint64_t> nic_load_;
+    /// Requests handed out per NIC. Drives rail selection: a NIC that has taken
+    /// fewer requests is the cheaper next hop, so an idle rail is picked up
+    /// automatically and a busy one sheds to its neighbours.
+    std::vector<uint64_t> nic_issued_;
+    /// dev_id -> requests sent down each NIC, for the teardown dump.
+    std::map<int, std::vector<uint64_t>> gpu_nic_requests_;
     /// dev_id -> affine NIC indices, resolved once per GPU.
     std::map<int, std::vector<int>> gpu_affine_nics_;
-    /// Guard so the GPU->NIC assignment is dumped once, at the first transfer.
-    bool assignment_logged_ = false;
-    /// Engine request granularity. A registration is split into chunks of this and
-    /// the chunks are spread over the rails, so a request never straddles two.
-    /// 0 means the engine does not split, so a registration stays on one NIC.
-    size_t split_size_ = 0;
-    /// Rail the next registration starts its interleave on, so buffers with fewer
-    /// chunks than there are rails still spread instead of all starting on rail 0.
-    size_t fan_rotor_ = 0;
+    /// Guard so the MR layout is dumped once, at the first transfer.
+    bool layout_logged_ = false;
     /// RoCE service level for the DCT AV. Under `trust pcp` this selects the
     /// egress priority (SL -> PCP), so 3 targets the lossless PFC lane by
     /// default. Overridable via UCX_IB_SL (0-15), shared with the UCX backend.
@@ -188,14 +167,8 @@ private:
     /// UCX_IB_TRAFFIC_CLASS, shared with the UCX backend.
     uint8_t traffic_class_ = 0;
     mutable std::mutex mu_;
-    /// base address -> region, ordered so a sub-address can be found by range.
-    std::map<uintptr_t, Region> regions_;
-    /// base address -> one MR spanning a whole registration, for requests too large
-    /// to fit any chunk of it. The endpoint only accepts whole-object writes, so a
-    /// WRITE covers the entire buffer, and a descriptor carries a single rkey and
-    /// DCTN: such a request needs one region spanning the lot. Consulted only after
-    /// regions_ misses, so reads keep their interleaved rails.
-    std::map<uintptr_t, Region> spans_;
+    /// base address -> buffer, ordered so a sub-address can be found by range.
+    std::map<uintptr_t, Buffer> buffers_;
 };
 
 #endif // NIXL_SRC_PLUGINS_OBJ_REST_ACCEL_SCALITY_AI_CONNECTOR_IBVERBS_DC_RDMA_TOKEN_CLIENT_H
