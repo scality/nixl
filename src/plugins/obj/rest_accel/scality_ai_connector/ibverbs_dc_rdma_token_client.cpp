@@ -40,13 +40,15 @@ namespace {
 
 constexpr int kDcPort = 1;
 
-/// Handicap (in live registrations) applied to a NIC that is NOT in a GPU's
-/// affine set when picking a rail for a VRAM registration. Affine rails are
-/// preferred while loads are close, but once they run this many registrations
-/// ahead the overflow spills onto the remaining NICs, so no NIC stays idle
-/// under load. 0 would make selection pure global least-loaded (affinity
-/// ignored); larger values prefer the affine rails more strongly.
-constexpr uint64_t kNonAffineHandicap = 2;
+/// Handicap (in issued requests) applied to a NIC that is NOT in a GPU's affine
+/// set when picking the rail for a request. It makes affinity self-correcting
+/// without knowing how many GPUs are in play: when every GPU is active the rails
+/// on both NUMA nodes fill at the same rate, the counters stay within the
+/// handicap of each other, and no GPU ever leaves its own node. When only one
+/// node's GPUs are busy their rails run away, cross the handicap, and the idle
+/// far rails start taking work, so a lone GPU still reaches the whole node.
+/// Large enough that the normal jitter between symmetric rails cannot trip it.
+constexpr uint64_t kNonAffineHandicap = 64;
 
 /// Canonicalize a sysfs symlink to its /sys/devices/... target. Empty on failure.
 std::string
@@ -458,9 +460,7 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 }
 
 IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
-                                                   uint64_t dc_key,
-                                                   size_t split_size)
-    : split_size_(split_size) {
+                                                   uint64_t dc_key) {
     if (nic_ips.empty()) {
         NIXL_ERROR << "ibverbs_dc: no NIC addresses provided (rdma_nics is empty)";
         return;
@@ -498,7 +498,7 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
             return;
         }
     }
-    nic_load_.assign(nics_.size(), 0);
+    nic_issued_.assign(nics_.size(), 0);
     all_nics_.resize(nics_.size());
     for (size_t i = 0; i < nics_.size(); i++) {
         all_nics_[i] = static_cast<int>(i);
@@ -513,12 +513,15 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
 IbverbsDcRdmaTokenClient::~IbverbsDcRdmaTokenClient() {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        for (auto &kv : regions_) {
-            if (kv.second.mr) {
-                ibv_dereg_mr(kv.second.mr);
+        logRequestSpread();
+        for (auto &kv : buffers_) {
+            for (auto &rail : kv.second.rails) {
+                if (rail.mr) {
+                    ibv_dereg_mr(rail.mr);
+                }
             }
         }
-        regions_.clear();
+        buffers_.clear();
     }
     for (auto &nic : nics_) {
         for (int p = 0; p < kDcMaxLagPorts; p++) {
@@ -630,73 +633,33 @@ IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
     return res.first->second;
 }
 
-int
-IbverbsDcRdmaTokenClient::leastLoadedNic(const std::vector<int> &candidates) {
-    int best = candidates.front();
-    for (int idx : candidates) {
-        if (nic_load_[idx] < nic_load_[best]) {
-            best = idx;
-        }
+size_t
+IbverbsDcRdmaTokenClient::pickRail(const Buffer &buf) {
+    // Host memory has no affinity, so every rail is equally good.
+    const std::vector<int> *affine = nullptr;
+    if (buf.dev_id >= 0) {
+        affine = &affineNicsFor(buf.dev_id);
     }
-    return best;
-}
-
-int
-IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
-    // Host memory (dev_id < 0): balance across all NICs.
-    if (dev_id < 0) {
-        return leastLoadedNic(all_nics_);
-    }
-    // VRAM: prefer the GPU's affine ("best") rails, but never restrict to them.
-    // Rank every NIC by live load, handing the non-affine rails a fixed handicap
-    // (kNonAffineHandicap) so affine rails win while loads are close yet the rest
-    // still absorb the overflow once the affine rails run ahead. A GPU whose
-    // affine set is a 2-NIC NUMA node therefore still reaches the other NUMA's
-    // NICs under load instead of leaving them idle. Least-loaded (not a per-GPU
-    // cursor) so multiple GPUs spread even when each registers one buffer.
-    const std::vector<int> &affine = affineNicsFor(dev_id);
-    auto cost = [&](int idx) -> uint64_t {
+    auto cost = [&](int nic_idx) -> uint64_t {
         const bool is_affine =
-            std::find(affine.begin(), affine.end(), idx) != affine.end();
-        return nic_load_[idx] + (is_affine ? 0 : kNonAffineHandicap);
+            !affine || std::find(affine->begin(), affine->end(), nic_idx) != affine->end();
+        return nic_issued_[nic_idx] + (is_affine ? 0 : kNonAffineHandicap);
     };
-    int best = all_nics_.front();
-    uint64_t best_cost = cost(best);
-    for (int idx : all_nics_) {
-        const uint64_t c = cost(idx);
+
+    size_t best = 0;
+    uint64_t best_cost = cost(buf.rails[0].nic_idx);
+    for (size_t i = 1; i < buf.rails.size(); ++i) {
+        const uint64_t c = cost(buf.rails[i].nic_idx);
         if (c < best_cost) {
             best_cost = c;
-            best = idx;
+            best = i;
         }
     }
     return best;
 }
 
-std::vector<int>
-IbverbsDcRdmaTokenClient::fanRailsFor(int dev_id) {
-    // mu_ held by caller. Affine rails first, then the rest, so a buffer with fewer
-    // chunks than rails favours the GPU's own while a bigger one still reaches every
-    // rail. Host memory (dev_id < 0) is affine to all NICs already.
-    const std::vector<int> &affine = affineNicsFor(dev_id);
-    std::vector<int> rails = affine;
-    for (int idx : all_nics_) {
-        if (std::find(affine.begin(), affine.end(), idx) == affine.end()) {
-            rails.push_back(idx);
-        }
-    }
-    return rails;
-}
-
-bool
-IbverbsDcRdmaTokenClient::registerPiece(void *ptr,
-                                        size_t size,
-                                        int dev_id,
-                                        int nic_idx,
-                                        uintptr_t parent_base,
-                                        std::map<uintptr_t, Region> &dest) {
-    // mu_ held by caller.
-    NicCtx &nic = nics_[nic_idx];
-
+ibv_mr *
+IbverbsDcRdmaTokenClient::registerRail(void *ptr, size_t size, int nic_idx) {
     /* Relaxed ordering lets the NIC pipeline the PCIe writes into GPU BAR instead
      * of serializing them.  Without it, GET writes into VRAM collapse under
      * multi-GPU concentration on a single dual-port card: the card cannot drain
@@ -706,24 +669,12 @@ IbverbsDcRdmaTokenClient::registerPiece(void *ptr,
      * access flag: drivers that don't support it silently ignore it. */
     unsigned int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                           IBV_ACCESS_REMOTE_READ | IBV_ACCESS_RELAXED_ORDERING;
-    ibv_mr *mr = ibv_reg_mr(nic.pd, ptr, size, access);
+    ibv_mr *mr = ibv_reg_mr(nics_[nic_idx].pd, ptr, size, access);
     if (!mr) {
-        NIXL_ERROR << "ibverbs_dc: ibv_reg_mr failed (ptr=" << ptr << ", size=" << size << ")";
-        return false;
+        NIXL_ERROR << "ibverbs_dc: ibv_reg_mr failed on " << nics_[nic_idx].dev_name
+                   << " (ptr=" << ptr << ", size=" << size << ")";
     }
-
-    Region r;
-    r.mr = mr;
-    r.len = size;
-    r.nic_idx = nic_idx;
-    r.dev_id = dev_id;
-    r.dctn = nic.dctns[nic.lag_seq++ % nic.num_lag_ports];
-    r.parent_base = parent_base;
-    dest[reinterpret_cast<uintptr_t>(ptr)] = r;
-    // Load accounting lives here, not in the selectors, so it stays correct
-    // whether the NIC was chosen by selectNicFor or handed in by a fan-out.
-    nic_load_[nic_idx]++;
-    return true;
+    return mr;
 }
 
 cuObjErr_t
@@ -731,118 +682,85 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     if (!connected_) {
         return CU_OBJ_FAIL;
     }
-    if (size > UINT32_MAX) {
-        NIXL_ERROR << "ibverbs_dc: registration size " << size
-                   << " exceeds the 32-bit DC descriptor SIZE field";
-        return CU_OBJ_FAIL;
-    }
 
     std::lock_guard<std::mutex> lk(mu_);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
 
-    // Spread the buffer over the rails one request-sized chunk at a time, cycling
-    // rails as it goes.
-    //
-    // Splitting it into a few contiguous pieces instead (half the buffer per rail)
-    // does not work: callers transfer from the buffer base, so a transfer shorter
-    // than the buffer lands entirely in the first piece and the rails holding the
-    // rest stay idle. Measured that way, two of four rails sat at exactly 0 Gb/s
-    // for every block size below the piece length. Interleaving at the request
-    // granularity means a transfer spanning N chunks touches min(N, rails) rails,
-    // so a single buffer can fill the node instead of being capped at one rail's
-    // line rate. Costs one MR per chunk.
-    const std::vector<int> rails = fanRailsFor(dev_id);
-    const size_t chunks = split_size_ > 0 ? (size + split_size_ - 1) / split_size_ : 1;
-    if (chunks < 2 || rails.size() < 2) {
-        // Nothing to interleave. dev_id >= 0 (VRAM) selects a PCIe-affine NIC for
-        // the GPU; dev_id < 0 (host memory) keeps the global round-robin.
-        if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base, regions_)) {
-            return CU_OBJ_FAIL;
-        }
-        return CU_OBJ_SUCCESS;
-    }
-
-    // Advance the starting rail per registration so buffers with fewer chunks than
-    // there are rails still spread across them rather than all starting on rail 0.
-    const size_t rotor = fan_rotor_++;
-    for (size_t i = 0; i < chunks; ++i) {
-        const size_t off = i * split_size_;
-        const size_t len = std::min(split_size_, size - off);
-        const int nic = rails[(rotor + i) % rails.size()];
-        if (!registerPiece(
-                reinterpret_cast<void *>(base + off), len, dev_id, nic, base, regions_)) {
-            // Unwind the chunks already registered so the caller sees all-or-nothing.
-            releaseRegistration(base);
-            return CU_OBJ_FAIL;
+    // One MR per rail, each covering the whole buffer. A descriptor carries the
+    // request's own address and length, and an rkey covers any sub-range of its
+    // MR, so a single MR per NIC serves every offset: no need for one MR per
+    // request-sized chunk. That keeps the MR count at rails-per-buffer instead of
+    // bytes/split_size, and leaves the rail choice to descriptorFor, where the
+    // live load is known, rather than freezing it at registration time.
+    Buffer buf;
+    buf.len = size;
+    buf.dev_id = dev_id;
+    for (int nic_idx : all_nics_) {
+        if (ibv_mr *mr = registerRail(ptr, size, nic_idx)) {
+            buf.rails.push_back({mr, nic_idx});
         }
     }
-
-    // One more MR over the whole buffer, on a single rail. The endpoint only
-    // accepts whole-object writes, so a WRITE arrives as one request spanning the
-    // entire buffer, and no chunk MR can describe it: a descriptor carries one
-    // rkey and one DCTN, so the range has to sit inside a single region. Reads keep
-    // using the chunk MRs and stay spread; writes fall back to this one and are
-    // confined to its rail, which selectNicFor varies from buffer to buffer.
-    if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base, spans_)) {
-        releaseRegistration(base);
+    if (buf.rails.empty()) {
+        NIXL_ERROR << "ibverbs_dc: no NIC accepted the registration of " << size << " bytes at "
+                   << ptr;
         return CU_OBJ_FAIL;
     }
-
-    NIXL_DEBUG << "ibverbs_dc: interleaved registration 0x" << std::hex << base << std::dec << " ("
-               << size << " bytes) over " << rails.size() << " rail(s) in " << chunks
-               << " chunk(s) of " << split_size_ << ", plus a spanning MR, dev_id=" << dev_id;
-    return CU_OBJ_SUCCESS;
-}
-
-size_t
-IbverbsDcRdmaTokenClient::releaseRegistration(uintptr_t parent_base) {
-    // mu_ held by caller. Pieces of one registration are contiguous from
-    // parent_base, so walk forward while they still belong to it.
-    size_t released = 0;
-    for (std::map<uintptr_t, Region> *m : {&regions_, &spans_}) {
-        auto it = m->lower_bound(parent_base);
-        while (it != m->end() && it->second.parent_base == parent_base) {
-            if (it->second.mr) {
-                ibv_dereg_mr(it->second.mr);
-            }
-            if (nic_load_[it->second.nic_idx] > 0) {
-                nic_load_[it->second.nic_idx]--;
-            }
-            it = m->erase(it);
-            released++;
-        }
+    if (buf.rails.size() < all_nics_.size()) {
+        NIXL_WARN << "ibverbs_dc: " << ptr << " registered on " << buf.rails.size() << " of "
+                  << all_nics_.size() << " rails; the rest stay unreachable for this buffer";
     }
-    return released;
+
+    NIXL_DEBUG << "ibverbs_dc: registered 0x" << std::hex << reinterpret_cast<uintptr_t>(ptr)
+               << std::dec << " (" << size << " bytes, dev_id=" << dev_id << ") on "
+               << buf.rails.size() << " rail(s)";
+    buffers_[reinterpret_cast<uintptr_t>(ptr)] = std::move(buf);
+    return CU_OBJ_SUCCESS;
 }
 
 cuObjErr_t
 IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (releaseRegistration(reinterpret_cast<uintptr_t>(ptr)) == 0) {
+    auto it = buffers_.find(reinterpret_cast<uintptr_t>(ptr));
+    if (it == buffers_.end()) {
         NIXL_ERROR << "ibverbs_dc: cuMemObjPutDescriptor: ptr " << ptr << " not registered";
         return CU_OBJ_FAIL;
     }
+    for (auto &rail : it->second.rails) {
+        if (rail.mr) {
+            ibv_dereg_mr(rail.mr);
+        }
+    }
+    buffers_.erase(it);
     return CU_OBJ_SUCCESS;
 }
 
 void
-IbverbsDcRdmaTokenClient::logAssignment() {
-    // mu_ held by caller. Summarize registered regions as GPU -> per-NIC counts.
-    std::map<int, std::vector<size_t>> per_gpu; // dev_id -> count per NIC index
-    std::vector<size_t> per_nic(nics_.size(), 0);
-    for (const auto &kv : regions_) {
-        const Region &r = kv.second;
-        per_nic[r.nic_idx]++;
-        auto &v = per_gpu[r.dev_id];
-        if (v.empty()) {
-            v.assign(nics_.size(), 0);
-        }
-        v[r.nic_idx]++;
+IbverbsDcRdmaTokenClient::logLayout() {
+    // mu_ held by caller.
+    std::map<int, size_t> buffers_per_gpu;
+    size_t mrs = 0;
+    for (const auto &kv : buffers_) {
+        buffers_per_gpu[kv.second.dev_id]++;
+        mrs += kv.second.rails.size();
     }
+    std::string line;
+    for (const auto &g : buffers_per_gpu) {
+        line += (line.empty() ? "" : " ");
+        line += (g.first < 0 ? std::string("host") :
+                               "gpu" + std::to_string(visibleToUserGpu(g.first)));
+        line += ":" + std::to_string(g.second);
+    }
+    NIXL_INFO << "ibverbs_dc: " << buffers_.size() << " buffer(s) over " << nics_.size()
+              << " rail(s) = " << mrs << " MR(s); buffers per owner: " << line;
+}
 
-    NIXL_INFO << "ibverbs_dc: GPU->NIC buffer assignment (" << regions_.size()
-              << " registered regions):";
-    for (const auto &g : per_gpu) {
+void
+IbverbsDcRdmaTokenClient::logRequestSpread() {
+    // mu_ held by caller.
+    if (gpu_nic_requests_.empty()) {
+        return;
+    }
+    NIXL_INFO << "ibverbs_dc: GPU->NIC request spread:";
+    for (const auto &g : gpu_nic_requests_) {
         std::string line;
         for (size_t i = 0; i < nics_.size(); ++i) {
             if (g.second[i] == 0) {
@@ -860,46 +778,54 @@ IbverbsDcRdmaTokenClient::logAssignment() {
     std::string totals;
     for (size_t i = 0; i < nics_.size(); ++i) {
         totals += (totals.empty() ? "" : " ") + nics_[i].dev_name + ":" +
-                  std::to_string(per_nic[i]);
+                  std::to_string(nic_issued_[i]);
     }
     NIXL_INFO << "ibverbs_dc:   per-NIC totals: " << totals;
 }
 
 std::string
 IbverbsDcRdmaTokenClient::descriptorFor(void *ptr, size_t size) {
-    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
     std::lock_guard<std::mutex> lk(mu_);
-    // Registrations are complete by the first transfer; dump the layout once.
-    if (!assignment_logged_) {
-        logAssignment();
-        assignment_logged_ = true;
+    if (!layout_logged_) {
+        logLayout();
+        layout_logged_ = true;
     }
-    // Find the region [base, base+len) that contains [addr, addr+size). Chunk MRs
-    // first, so a request that fits one keeps the rail it was interleaved onto;
-    // the spanning MRs only catch a request too large for any chunk, which is a
-    // whole-object write.
-    const Region *found = nullptr;
-    for (const std::map<uintptr_t, Region> *m : {&regions_, &spans_}) {
-        auto it = m->upper_bound(addr);
-        if (it == m->begin()) {
-            continue;
-        }
-        --it;
-        if (addr >= it->first && addr + size <= it->first + it->second.len) {
-            found = &it->second;
-            break;
-        }
-    }
-    if (!found) {
+
+    if (size > UINT32_MAX) {
+        NIXL_ERROR << "ibverbs_dc: request size " << size
+                   << " exceeds the 32-bit DC descriptor SIZE field";
         return std::string();
     }
-    const Region &r = *found;
-    const NicCtx &nic = nics_[r.nic_idx];
+
+    // Find the buffer [base, base+len) containing [addr, addr+size).
+    auto it = buffers_.upper_bound(addr);
+    if (it == buffers_.begin()) {
+        return std::string();
+    }
+    --it;
+    const Buffer &buf = it->second;
+    if (addr < it->first || addr + size > it->first + buf.len) {
+        return std::string();
+    }
+
+    // The rail is picked per request, not per registration, so consecutive
+    // requests against one buffer spread across its NICs and the choice tracks
+    // whatever the live load happens to be.
+    const RailMr &rail = buf.rails[pickRail(buf)];
+    NicCtx &nic = nics_[rail.nic_idx];
+    nic_issued_[rail.nic_idx]++;
+    auto &counts = gpu_nic_requests_[buf.dev_id];
+    if (counts.empty()) {
+        counts.assign(nics_.size(), 0);
+    }
+    counts[rail.nic_idx]++;
+
     return formatDcDescriptor(static_cast<uint64_t>(addr),
                               static_cast<uint32_t>(size),
-                              r.mr->rkey,
+                              rail.mr->rkey,
                               nic.lid,
-                              r.dctn,
+                              nic.dctns[nic.lag_seq++ % nic.num_lag_ports],
                               nic.gid);
 }
 
