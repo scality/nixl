@@ -211,6 +211,7 @@ public:
     static std::string obj_accelerated_type;
     static size_t obj_num_threads;
     static size_t obj_split_size;
+    static std::string obj_max_inflight;
     static std::string obj_rdma_nics;
     static std::string obj_rdma_dc_key;
     static bool obj_unique_keys;

@@ -265,6 +265,10 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
             if (xferBenchConfig::obj_num_threads > 0) {
                 backend_params["num_threads"] = std::to_string(xferBenchConfig::obj_num_threads);
             }
+            if (!xferBenchConfig::obj_max_inflight.empty()) {
+                backend_params["max_inflight"] = xferBenchConfig::obj_max_inflight;
+                std::cout << " (max inflight: " << xferBenchConfig::obj_max_inflight << ")";
+            }
             if (xferBenchConfig::obj_split_size > 0) {
                 backend_params["split_size"] = std::to_string(xferBenchConfig::obj_split_size);
                 std::cout << " (split size: " << xferBenchConfig::obj_split_size << ")";
