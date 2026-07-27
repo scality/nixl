@@ -372,6 +372,19 @@ ScalityObjEngineImpl::ScalityObjEngineImpl(const nixlBackendInitParams *init_par
         dckey = parseRdmaDcKey(cufile); // "" if absent/commented
     }
     dcKey_ = dckey.empty() ? 0xffeeddccULL : std::strtoull(dckey.c_str(), nullptr, 0);
+
+    const std::string split = paramOr(params, "split_size", "");
+    if (!split.empty()) {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(split.c_str(), &end, 0);
+        if (end != split.c_str() && *end == '\0') {
+            splitSize_ = static_cast<size_t>(parsed);
+        } else {
+            NIXL_WARN << "Ignoring non-numeric split_size: " << split;
+        }
+    }
+    NIXL_INFO << "Object request split_size="
+              << (splitSize_ == 0 ? std::string("disabled") : std::to_string(splitSize_));
 }
 
 nixl_status_t
@@ -387,7 +400,7 @@ ScalityObjEngineImpl::ensureHostClient() {
                       "in cufile.json";
         return NIXL_ERR_BACKEND;
     }
-    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_);
+    auto client = std::make_shared<IbverbsDcRdmaTokenClient>(rdmaNics_, dcKey_, splitSize_);
     if (!client->isConnected()) {
         NIXL_ERROR << "Failed to initialize the ibverbs DC client for DRAM/VRAM transfers";
         return NIXL_ERR_BACKEND;
@@ -511,41 +524,54 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
     }
 
     for (int i = 0; i < local.descCount(); ++i) {
-        scalityObjTransferRequestH req(local[i].addr, local[i].len, remote[i].addr);
-
         auto obj_key_search = devIdToObjKey_.find(remote[i].devId);
         if (obj_key_search == devIdToObjKey_.end()) {
             NIXL_ERROR << "The object segment key " << remote[i].devId
                        << " is not registered with the backend";
             return NIXL_ERR_INVALID_PARAM;
         }
-        req.obj_key = obj_key_search->second;
 
-        if (operation == NIXL_WRITE) {
-            ssize_t cuda_status =
-                tokenClient->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
-            if (cuda_status < 0) {
-                NIXL_ERROR << "cuObjPut failed with status: " << cuda_status;
-                return NIXL_ERR_BACKEND;
+        // One descriptor becomes as many ranged requests as split_size dictates,
+        // so callers can hand down a whole tensor and let the backend pick the
+        // wire granularity. Sub-ranges resolve through the registration that
+        // contains them, which is what lets a fanned-out buffer reach several
+        // NICs; for a single-MR buffer they all share its NIC and QP.
+        const size_t total = local[i].len;
+        const size_t step = (splitSize_ == 0) ? total : splitSize_;
+        const size_t nreq = objRequestCount(total, splitSize_);
+        for (size_t r = 0; r < nreq; ++r) {
+            const size_t off = r * step;
+            const size_t len = std::min(step, total - off);
+            scalityObjTransferRequestH req(
+                local[i].addr + off, len, remote[i].addr + off);
+            req.obj_key = obj_key_search->second;
+
+            if (operation == NIXL_WRITE) {
+                ssize_t cuda_status =
+                    tokenClient->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
+                if (cuda_status < 0) {
+                    NIXL_ERROR << "cuObjPut failed with status: " << cuda_status;
+                    return NIXL_ERR_BACKEND;
+                }
+            } else if (operation == NIXL_READ) {
+                ssize_t cuda_status =
+                    tokenClient->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
+                if (cuda_status < 0) {
+                    NIXL_ERROR << "cuObjGet failed with status: " << cuda_status;
+                    return NIXL_ERR_BACKEND;
+                }
             }
-        } else if (operation == NIXL_READ) {
-            ssize_t cuda_status =
-                tokenClient->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
-            if (cuda_status < 0) {
-                NIXL_ERROR << "cuObjGet failed with status: " << cuda_status;
-                return NIXL_ERR_BACKEND;
-            }
+            req.rdma_desc = req.ctx.rdma_desc;
+            // Log only the descriptor length, never the raw RDMA token (sensitive).
+            NIXL_DEBUG << absl::StrFormat(
+                "prepXfer: addr=0x%016x, size=%zu, offset=%zu, rdma_desc_len=%zu",
+                req.addr,
+                req.size,
+                req.offset,
+                req.rdma_desc.size());
+
+            req_h->reqs_.push_back(std::move(req));
         }
-        req.rdma_desc = req.ctx.rdma_desc;
-        // Log only the descriptor length, never the raw RDMA token (sensitive).
-        NIXL_DEBUG << absl::StrFormat(
-            "prepXfer: addr=0x%016x, size=%zu, offset=%zu, rdma_desc_len=%zu",
-            req.addr,
-            req.size,
-            req.offset,
-            req.rdma_desc.size());
-
-        req_h->reqs_.push_back(req);
     }
 
     handle = req_h.release();

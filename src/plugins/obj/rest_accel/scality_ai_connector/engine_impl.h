@@ -21,6 +21,7 @@
 #include "obj_backend.h"
 #include "rest_accel/scality_ai_connector/client.h"
 #include "rest_accel/scality_ai_connector/rdma_token_client.h"
+#include "rest_accel/scality_ai_connector/split.h"
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -122,6 +123,13 @@ private:
     std::vector<std::string> rdmaNics_;
     /// DC access key for the ibverbs DC client.
     uint64_t dcKey_ = 0xffeeddccULL;
+    /// Bytes per object request. A transfer descriptor of any size is cut into
+    /// requests of at most this, so callers hand down whole tensors and the
+    /// backend decides the wire granularity. 0 disables splitting (one request
+    /// per descriptor, whatever its size). Resolved from customParams
+    /// 'split_size' at construction and shared with the DC token client, which
+    /// aligns its registrations to it.
+    size_t splitSize_ = kDefaultSplitSize;
     /// Scality AI Connector HTTP client with RDMA support
     std::shared_ptr<iRestClient> connectorClient_;
 };

@@ -46,11 +46,18 @@
 class IbverbsDcRdmaTokenClient : public iRdmaTokenClient {
 public:
     /**
-     * @param nic_ips  IPv4 addresses selecting the RDMA devices (one DC context
-     *                 per IP); memory regions are round-robined across them.
-     * @param dc_key   DC access key the server's DCI side must present.
+     * @param nic_ips     IPv4 addresses selecting the RDMA devices (one DC context
+     *                    per IP); memory regions are round-robined across them.
+     * @param dc_key      DC access key the server's DCI side must present.
+     * @param split_size  Bytes per object request, as used by the engine. A
+     *                    registration that fans out across NICs aligns its piece
+     *                    boundaries to this so no request ever straddles two
+     *                    pieces (descriptorFor requires containment). 0 means the
+     *                    engine does not split, so registrations never fan out.
      */
-    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips, uint64_t dc_key);
+    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
+                             uint64_t dc_key,
+                             size_t split_size);
     ~IbverbsDcRdmaTokenClient() override;
 
     IbverbsDcRdmaTokenClient(const IbverbsDcRdmaTokenClient &) = delete;
@@ -88,12 +95,17 @@ private:
     };
 
     /// One registered memory region: its MR plus the NIC/DCTN it was bound to.
+    /// A caller registration may fan out into several adjacent Regions on
+    /// different NICs; every piece carries the caller's base address in
+    /// parent_base so release can find its siblings.
     struct Region {
         ibv_mr *mr = nullptr;
         size_t len = 0;
         int nic_idx = 0;
         uint32_t dctn = 0;
         int dev_id = -1; ///< GPU ordinal (VRAM) or -1 (host), for the assignment dump.
+        uintptr_t parent_base = 0; ///< Address the caller registered; equals the
+                                   ///< piece base for a single-piece registration.
     };
 
     /// Build (and INIT->RTR) a NIC's DC context for the given IP. Returns false on error.
@@ -110,14 +122,30 @@ private:
     logAssignment();
 
     /// Pick the NIC index to register a buffer on. dev_id < 0 (host memory)
-    /// balances across all NICs; dev_id >= 0 (VRAM) balances within the GPU's
-    /// affine NIC set (see affineNicsFor). Caller must hold mu_.
+    /// balances across all NICs; dev_id >= 0 (VRAM) prefers the GPU's affine
+    /// rails but can overflow onto the others (see affineNicsFor). Pure: the
+    /// load is bumped by registerPiece. Caller must hold mu_.
     int
     selectNicFor(int dev_id);
     /// Least-loaded NIC among candidates (fewest live registrations; ties break
-    /// to the lowest index). Bumps the chosen NIC's load. Caller must hold mu_.
+    /// to the lowest index). Pure. Caller must hold mu_.
     int
     leastLoadedNic(const std::vector<int> &candidates);
+    /// NIC indices carrying no live registration, affine rails first. Empty means
+    /// every rail is already in use, so a new buffer needs no fan-out to reach
+    /// them. Caller must hold mu_.
+    std::vector<int>
+    idleNicsFor(int dev_id);
+    /// Register [ptr, ptr+size) as a single MR on one selected NIC, recording it
+    /// under parent_base. Returns false and registers nothing on failure.
+    /// Caller must hold mu_.
+    bool
+    registerPiece(void *ptr, size_t size, int dev_id, int nic_idx, uintptr_t parent_base);
+    /// Deregister every piece belonging to the registration at parent_base and
+    /// drop its NIC load. Returns the number of pieces released (0 if unknown).
+    /// Caller must hold mu_.
+    size_t
+    releaseRegistration(uintptr_t parent_base);
     /// Resolve (and cache) the set of NIC indices affine to a GPU. Prefers NICs
     /// that share a PCIe switch with the GPU (PXB/PIX-local); when no NIC is
     /// switch-local (the RDMA NICs sit on a shared bridge equidistant from every
@@ -146,6 +174,9 @@ private:
     /// Only relevant under `trust dscp`. 0 = default lane; overridable via
     /// UCX_IB_TRAFFIC_CLASS, shared with the UCX backend.
     uint8_t traffic_class_ = 0;
+    /// Engine request granularity; piece boundaries are kept a multiple of this
+    /// so a request never straddles two pieces. 0 disables fan-out entirely.
+    size_t split_size_ = 0;
 
     mutable std::mutex mu_;
     /// base address -> region, ordered so a sub-address can be found by range.
