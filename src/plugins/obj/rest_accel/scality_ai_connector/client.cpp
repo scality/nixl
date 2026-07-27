@@ -43,9 +43,8 @@ std::once_flag curl_init_flag;
 constexpr int kMaxRetries = 3;
 
 /// True if libcurl produced no HTTP response at all, so the endpoint either never
-/// saw the request or never answered it. Repeating one is safe even for PUT, since
-/// both methods are idempotent in effect. A request that did get a response is
-/// left alone: a 4xx/5xx is the server's answer, not a lost request.
+/// saw the request or never answered it. A request that did get a response is left
+/// alone: a 4xx/5xx is the server's answer, not a lost request.
 bool
 isTransient(CURLcode res) {
     switch (res) {
@@ -363,7 +362,12 @@ RestClient::reapCompletions() {
         // one blip. It goes to the back of pending_, so the requests already queued
         // are attempted before it comes round again, and the easy handle keeps every
         // option it was built with: only the partial response body has to go.
-        if (isTransient(res) && ctx->attempts < kMaxRetries) {
+        //
+        // GET and HEAD only. A PUT whose response was lost may well have been
+        // applied, and the endpoint versions objects and answers a second write of
+        // the same key with 409 "cannot overwrite", so retrying turns a transfer
+        // that had succeeded into a failed one.
+        if (ctx->method != restMethod::PUT && isTransient(res) && ctx->attempts < kMaxRetries) {
             ctx->attempts++;
             ctx->response_body.clear();
             totalRetries_++;
