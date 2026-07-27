@@ -333,10 +333,12 @@ RestClient::submitRdmaRequest(const char *op_name,
     if (is_upload) {
         // Content-Length: 0; data is transferred via RDMA, not the HTTP body.
         ctx->headers = curl_slist_append(ctx->headers, "Content-Length: 0");
-    } else if (offset > 0 && data_len > 0) {
-        // Partial read: convey the object byte-range to sproxyd so biziod RDMA-writes
-        // object[offset : offset+data_len] into the (offset-0) local buffer. The offset==0
-        // path is unchanged (no Range header), preserving the proven whole-object read.
+    } else if (data_len > 0) {
+        // Convey the object byte-range to sproxyd so biziod RDMA-writes
+        // object[offset : offset+data_len] into the local buffer. Always sent, offset 0
+        // included: the caller registered exactly data_len bytes, so an unranged GET
+        // would have the server fetch the whole object (an 8-byte safetensors header
+        // probe would pull a multi-GB shard). Same as the s3_accel clients.
         std::string range_header =
             absl::StrFormat("Range: bytes=%zu-%zu", offset, offset + data_len - 1);
         ctx->headers = curl_slist_append(ctx->headers, range_header.c_str());
