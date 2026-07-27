@@ -29,9 +29,22 @@ nixl_common_deps = [
     dependency('asio', required: true),
 ]
 
-# Get git commit hash
-git_hash = run_command('git', 'rev-parse', '--short=8', 'HEAD', check: false, capture: true)
-git_commit = git_hash.returncode() == 0 ? git_hash.stdout().strip() : 'unknown'
+# Resolve the git revision into a generated header rather than a -D on the
+# command line. run_command() would execute at configure time and freeze the
+# result into cpp_args, where ninja has nothing to invalidate it: every later
+# build reports whichever revision was checked out when meson setup last ran,
+# which is exactly when you most want the truth. vcs_tag() re-resolves on every
+# build and rewrites the header only when the value actually changes, so it costs
+# one git call and no spurious recompiles. '-dirty' marks an uncommitted tree.
+#
+# --exclude='*' keeps describe away from tags so it falls back to the abbreviated
+# hash; without it a tagged commit would report the tag instead.
+nixl_git_hash_h = vcs_tag(
+    command: ['git', 'describe', '--always', '--abbrev=8', '--dirty', '--exclude=*'],
+    input: 'nixl_git_hash.h.in',
+    output: 'nixl_git_hash.h',
+    fallback: 'unknown',
+)
 
 # Define a shared library for common utilities
 nixl_common_lib = shared_library('nixl_common',
@@ -40,11 +53,11 @@ nixl_common_lib = shared_library('nixl_common',
     'uuid_v4.cpp',
     'configuration.cpp',
     'nixl_duration.cpp',
+    nixl_git_hash_h,
     dependencies: nixl_common_deps,
     include_directories: [nixl_common_inc, nixl_inc_dirs],
     cpp_args: [
         '-DNIXL_VERSION="' + meson.project_version() + '"',
-        '-DNIXL_GIT_HASH="' + git_commit + '"'
     ],
     install: true,
 )
