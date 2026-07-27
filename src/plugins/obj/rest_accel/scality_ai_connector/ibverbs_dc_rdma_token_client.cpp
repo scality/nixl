@@ -50,6 +50,9 @@ constexpr int kDcPort = 1;
 /// Large enough that the normal jitter between symmetric rails cannot trip it.
 constexpr uint64_t kNonAffineHandicap = 64;
 
+/// Requests between one-line spread summaries.
+constexpr uint64_t kSpreadLogInterval = 1u << 20;
+
 /// Canonicalize a sysfs symlink to its /sys/devices/... target. Empty on failure.
 std::string
 canonicalPath(const std::string &path) {
@@ -505,7 +508,7 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
     }
     connected_ = true;
     NIXL_INFO << "ibverbs_dc: DC transport ready across " << nics_.size() << " NIC(s), key=0x"
-              << std::hex << dc_key << std::dec << ", RoCE sl=" << (int)sl_
+              << std::hex << std::noshowbase << dc_key << std::dec << ", RoCE sl=" << (int)sl_
               << " traffic_class=" << (int)traffic_class_ << " (DSCP " << (traffic_class_ >> 2)
               << ")";
 }
@@ -513,7 +516,7 @@ IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string
 IbverbsDcRdmaTokenClient::~IbverbsDcRdmaTokenClient() {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        logRequestSpread();
+        logRequestSpread(true);
         for (auto &kv : buffers_) {
             for (auto &rail : kv.second.rails) {
                 if (rail.mr) {
@@ -618,17 +621,17 @@ IbverbsDcRdmaTokenClient::affineNicsFor(int dev_id) {
         affine = cand;
     }
 
-    if (gpu_path.empty()) {
-        NIXL_WARN << "ibverbs_dc: no PCIe path for GPU " << dev_id << "; using all NICs";
-    } else {
-        std::string names;
-        for (int i : affine) {
-            names += (names.empty() ? "" : ",") + nics_[i].dev_name;
-        }
-        NIXL_INFO << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id) << " (numa " << gpu_numa
-                  << ") -> affine NIC(s): " << names;
+    // logLayout reports the resolved affinity; only the failure to resolve it is
+    // worth a line of its own.
+    if (gpu_path.empty() && dev_id >= 0) {
+        NIXL_WARN << "ibverbs_dc: no PCIe path for GPU " << dev_id
+                  << "; every NIC treated as affine";
+    } else if (gpu_numa < 0 && dev_id >= 0) {
+        NIXL_WARN << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+                  << " reports no NUMA node; every NIC treated as affine";
     }
 
+    gpu_numa_[dev_id] = gpu_numa;
     auto res = gpu_affine_nics_.emplace(dev_id, std::move(affine));
     return res.first->second;
 }
@@ -736,30 +739,59 @@ IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
 void
 IbverbsDcRdmaTokenClient::logLayout() {
     // mu_ held by caller.
-    std::map<int, size_t> buffers_per_gpu;
+    std::string rails;
+    for (const auto &nic : nics_) {
+        rails += (rails.empty() ? "" : " ") + nic.dev_name + "(numa" +
+                 std::to_string(nic.numa_node) + ")";
+    }
+    NIXL_INFO << "ibverbs_dc: rails: " << rails;
+
+    std::map<int, size_t> buffers_per_owner;
     size_t mrs = 0;
     for (const auto &kv : buffers_) {
-        buffers_per_gpu[kv.second.dev_id]++;
+        buffers_per_owner[kv.second.dev_id]++;
         mrs += kv.second.rails.size();
     }
-    std::string line;
-    for (const auto &g : buffers_per_gpu) {
-        line += (line.empty() ? "" : " ");
-        line += (g.first < 0 ? std::string("host") :
-                               "gpu" + std::to_string(visibleToUserGpu(g.first)));
-        line += ":" + std::to_string(g.second);
+    NIXL_INFO << "ibverbs_dc: " << buffers_.size()
+              << " buffer(s) registered on every rail = " << mrs
+              << " MR(s); the rail per request is chosen at transfer time";
+    for (const auto &owner : buffers_per_owner) {
+        const int dev_id = owner.first;
+        if (dev_id < 0) {
+            NIXL_INFO << "ibverbs_dc:   host memory: " << owner.second
+                      << " buffer(s), no NUMA preference";
+            continue;
+        }
+        std::string names;
+        for (int i : affineNicsFor(dev_id)) {
+            names += (names.empty() ? "" : ",") + nics_[i].dev_name;
+        }
+        NIXL_INFO << "ibverbs_dc:   GPU " << visibleToUserGpu(dev_id) << " (numa "
+                  << gpu_numa_[dev_id] << "): " << owner.second << " buffer(s), prefers " << names
+                  << ", spills to the other rails when those two are the busier pair";
     }
-    NIXL_INFO << "ibverbs_dc: " << buffers_.size() << " buffer(s) over " << nics_.size()
-              << " rail(s) = " << mrs << " MR(s); buffers per owner: " << line;
 }
 
 void
-IbverbsDcRdmaTokenClient::logRequestSpread() {
+IbverbsDcRdmaTokenClient::logRequestSpread(bool detailed) {
     // mu_ held by caller.
-    if (gpu_nic_requests_.empty()) {
+    uint64_t total = 0;
+    for (uint64_t n : nic_issued_) {
+        total += n;
+    }
+    if (total == 0) {
         return;
     }
-    NIXL_INFO << "ibverbs_dc: GPU->NIC request spread:";
+    std::string per_nic;
+    for (size_t i = 0; i < nics_.size(); ++i) {
+        per_nic += (per_nic.empty() ? "" : " ") + nics_[i].dev_name + ":" +
+                   std::to_string(100 * nic_issued_[i] / total) + "%";
+    }
+    NIXL_INFO << "ibverbs_dc: " << total << " request(s), " << (100 * cross_numa_ / total)
+              << "% off the owning GPU's NUMA node: " << per_nic;
+    if (!detailed) {
+        return;
+    }
     for (const auto &g : gpu_nic_requests_) {
         std::string line;
         for (size_t i = 0; i < nics_.size(); ++i) {
@@ -775,12 +807,6 @@ IbverbsDcRdmaTokenClient::logRequestSpread() {
             NIXL_INFO << "ibverbs_dc:   GPU " << visibleToUserGpu(g.first) << " -> " << line;
         }
     }
-    std::string totals;
-    for (size_t i = 0; i < nics_.size(); ++i) {
-        totals += (totals.empty() ? "" : " ") + nics_[i].dev_name + ":" +
-                  std::to_string(nic_issued_[i]);
-    }
-    NIXL_INFO << "ibverbs_dc:   per-NIC totals: " << totals;
 }
 
 std::string
@@ -820,6 +846,18 @@ IbverbsDcRdmaTokenClient::descriptorFor(void *ptr, size_t size) {
         counts.assign(nics_.size(), 0);
     }
     counts[rail.nic_idx]++;
+    if (buf.dev_id >= 0) {
+        const std::vector<int> &affine = affineNicsFor(buf.dev_id);
+        if (std::find(affine.begin(), affine.end(), rail.nic_idx) == affine.end()) {
+            cross_numa_++;
+        }
+    }
+    // Periodic, because a run that is killed rather than finished never reaches
+    // the teardown dump, and that is exactly when the spread is worth seeing.
+    if (++since_spread_log_ >= kSpreadLogInterval) {
+        since_spread_log_ = 0;
+        logRequestSpread(false);
+    }
 
     return formatDcDescriptor(static_cast<uint64_t>(addr),
                               static_cast<uint32_t>(size),
