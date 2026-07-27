@@ -316,7 +316,12 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
         });
     } else {
         bool success = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
-        if (!success) {
+        // Once descriptor exhaustion is established every remaining request fails
+        // the same way for the same reason, already stated once above. Logging each
+        // buries that line under hundreds of identical ones; the total is reported
+        // at teardown instead.
+        const bool redundant = fdExhausted_ && res == CURLE_COULDNT_CONNECT;
+        if (!success && !redundant) {
             NIXL_ERROR << absl::StrFormat(
                 "%s: failed url=%s curl_code=%d (%s) os_errno=%s http_code=%ld body=%s",
                 ctx->op_name,
@@ -453,6 +458,12 @@ RestClient::~RestClient() {
               << ", new_connections=" << newConnects_ << ", retries=" << totalRetries_
               << " (new_connections close to requests means keepalive is not working and "
                  "the endpoint will exhaust ephemeral ports)";
+    if (fdExhausted_) {
+        NIXL_ERROR << "RestClient: ran out of file descriptors; " << fdAbandoned_
+                   << " queued request(s) were failed without being attempted, and "
+                      "connect failures after the first were not logged individually. "
+                      "See the earlier fd budget line.";
+    }
 }
 
 std::string
@@ -500,6 +511,13 @@ RestClient::reapCompletions() {
             fdExhaustionLogged_ = true;
             rlimit lim{};
             const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
+            const std::optional<std::size_t> open_now = openFdCount();
+            // Out of descriptors if the count could not even be taken, or if it
+            // leaves no room for another connection. Either way the fault is local
+            // and cannot clear while the caller holds what it holds.
+            fdExhausted_ = !open_now.has_value() ||
+                (have_limit && lim.rlim_cur != RLIM_INFINITY &&
+                 *open_now + 1 >= lim.rlim_cur);
             NIXL_ERROR << absl::StrFormat(
                 "RestClient: first connect failure. fds open=%s, soft_limit=%s, "
                 "max_inflight=%zu, curl says '%s'. Every running request holds a "
@@ -524,7 +542,14 @@ RestClient::reapCompletions() {
         // applied, and the endpoint versions objects and answers a second write of
         // the same key with 409 "cannot overwrite", so retrying turns a transfer
         // that had succeeded into a failed one.
-        if (ctx->method != restMethod::PUT && isTransient(res) && ctx->attempts < kMaxRetries) {
+        //
+        // Never when out of descriptors. socket() fails without touching the
+        // network, so every attempt returns in microseconds and all three are spent
+        // before anything could have changed -- one observed run burned its whole
+        // retry budget across four objects inside 300us. That is pure noise on a
+        // fault that only the operator can clear.
+        if (ctx->method != restMethod::PUT && isTransient(res) && !fdExhausted_ &&
+            ctx->attempts < kMaxRetries) {
             ctx->attempts++;
             ctx->response_body.clear();
             totalRetries_++;
@@ -602,13 +627,27 @@ RestClient::pollerLoop() {
         // 4. Hand finished transfers' callbacks to the worker pool.
         reapCompletions();
 
-        // 5. Completions above freed slots; refill before sleeping so a capped
+        // 5. Out of descriptors: fail the backlog now rather than starting each
+        //    request only for it to hit the same wall. Nothing queued can connect
+        //    while the limit stands, so attempting them costs a log line each and
+        //    delays the caller learning the run is over. Counted, not logged
+        //    individually; the total goes out at teardown.
+        if (fdExhausted_ && !pending_.empty()) {
+            while (!pending_.empty()) {
+                std::unique_ptr<RequestCtx> ctx = std::move(pending_.front());
+                pending_.pop_front();
+                fdAbandoned_++;
+                finishRequest(ctx.release(), CURLE_COULDNT_CONNECT, 0);
+            }
+        }
+
+        // 6. Completions above freed slots; refill before sleeping so a capped
         //    queue does not stall waiting for the next socket event.
         if (!stopping) {
             startPending();
         }
 
-        // 6. On shutdown, abort everything queued or in flight so every callback
+        // 7. On shutdown, abort everything queued or in flight so every callback
         //    fires exactly once.
         if (stopping) {
             for (RequestCtx *ctx : inflight_) {
@@ -624,7 +663,7 @@ RestClient::pollerLoop() {
             break;
         }
 
-        // 7. Block until socket activity, the 1s backstop, or curl_multi_wakeup().
+        // 8. Block until socket activity, the 1s backstop, or curl_multi_wakeup().
         //    Requests still in pending_ imply the in-flight set is full, so a
         //    completion (socket event) is what frees the next slot.
         int numfds = 0;
