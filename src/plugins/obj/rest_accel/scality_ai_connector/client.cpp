@@ -314,9 +314,10 @@ RestClient::~RestClient() {
         curl_multi_cleanup(multi_);
     }
     // At INFO because it answers the first question of any throughput tuning:
-    // whether the endpoint was kept busy. peak_pending > 0 means requests queued
-    // behind max_inflight, so the cap was the limit; peak_inflight well below the
-    // cap means the caller never submitted enough to saturate anything.
+    // whether the endpoint was kept busy. peak_pending > 0 means requests were
+    // still waiting after a fill pass, so max_inflight was the binding constraint;
+    // peak_inflight well below the cap means the caller never submitted enough to
+    // saturate anything.
     NIXL_INFO << "RestClient concurrency: peak_inflight=" << peakInflight_
               << ", peak_pending=" << peakPending_ << ", max_inflight="
               << (maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
@@ -381,7 +382,6 @@ RestClient::reapCompletions() {
 
 void
 RestClient::startPending() {
-    peakPending_ = std::max(peakPending_, pending_.size());
     while (!pending_.empty() && (maxInflight_ == 0 || inflight_.size() < maxInflight_)) {
         std::unique_ptr<RequestCtx> ctx = std::move(pending_.front());
         pending_.pop_front();
@@ -397,6 +397,11 @@ RestClient::startPending() {
         inflight_.insert(raw);
         peakInflight_ = std::max(peakInflight_, inflight_.size());
     }
+    // Measured on the way out, so it counts only what the in-flight cap actually
+    // held back. Sampling before the loop instead counts a burst of arrivals that
+    // this very call is about to start, which reads as cap pressure that never
+    // happened.
+    peakPending_ = std::max(peakPending_, pending_.size());
 }
 
 void
