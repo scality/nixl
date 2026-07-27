@@ -214,6 +214,39 @@ TEST_F(RestClientTest, GetSendsCorrectUrlAndHeaders) {
     EXPECT_NE(req.find("x-scal-rdma: rdma-get-token"), std::string::npos)
         << "x-scal-rdma missing in:\n"
         << req;
+    EXPECT_NE(req.find("Range: bytes=128-639"), std::string::npos) << "Range missing in:\n" << req;
+    EXPECT_TRUE(success.load()) << "getObjectRdmaAsync reported failure";
+}
+
+// A sized read at offset 0 must still be ranged, else the server fetches the
+// whole object into a buffer registered for only data_len bytes.
+TEST_F(RestClientTest, GetAtOffsetZeroSendsRangeHeader) {
+    TcpServer server;
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    std::vector<char> buf(8);
+
+    std::atomic<bool> done{false}, success{false};
+    client.getObjectRdmaAsync("headerprobe",
+                              reinterpret_cast<uintptr_t>(buf.data()),
+                              buf.size(),
+                              /*offset=*/0,
+                              "rdma-get-token",
+                              [&](bool ok) {
+                                  success = ok;
+                                  done = true;
+                              });
+
+    std::string req = server.capturedRequest();
+    waitForCallback(done);
+
+    EXPECT_NE(req.find("GET /headerprobe"), std::string::npos)
+        << "Expected 'GET /headerprobe' in:\n"
+        << req;
+    EXPECT_NE(req.find("Range: bytes=0-7"), std::string::npos)
+        << "offset-0 read must be ranged in:\n"
+        << req;
     EXPECT_TRUE(success.load()) << "getObjectRdmaAsync reported failure";
 }
 
