@@ -208,6 +208,12 @@ NB_ARG_UINT64(obj_num_threads,
               0,
               "HTTP worker pool size for the accelerated OBJ connector. "
               "0 means use the engine default. Only used when obj_accelerated_enable=true");
+NB_ARG_UINT64(obj_split_size,
+              0,
+              "Bytes per object request for the accelerated OBJ connector. A transfer is cut "
+              "into requests of at most this size, and registrations are interleaved across the "
+              "RDMA NICs at the same granularity, so a transfer spanning N of them reaches N "
+              "NICs. 0 means use the engine default. Only used when obj_accelerated_enable=true");
 NB_ARG_STRING(obj_rdma_nics,
               "",
               "RDMA NICs for accelerated OBJ DRAM transfers: comma-separated IPv4 addresses or "
@@ -327,6 +333,7 @@ size_t xferBenchConfig::obj_crt_min_limit = 0;
 bool xferBenchConfig::obj_accelerated_enable = false;
 std::string xferBenchConfig::obj_accelerated_type = "";
 size_t xferBenchConfig::obj_num_threads = 0;
+size_t xferBenchConfig::obj_split_size = 0;
 std::string xferBenchConfig::obj_rdma_nics = "";
 std::string xferBenchConfig::obj_rdma_dc_key = "";
 bool xferBenchConfig::obj_unique_keys = false;
@@ -482,6 +489,7 @@ xferBenchConfig::loadParams(void) {
             obj_accelerated_enable = NB_ARG(obj_accelerated_enable);
             obj_accelerated_type = NB_ARG(obj_accelerated_type);
             obj_num_threads = NB_ARG(obj_num_threads);
+            obj_split_size = NB_ARG(obj_split_size);
             obj_rdma_nics = NB_ARG(obj_rdma_nics);
             obj_rdma_dc_key = NB_ARG(obj_rdma_dc_key);
             obj_unique_keys = NB_ARG(obj_unique_keys);
@@ -784,6 +792,9 @@ xferBenchConfig::printConfig() {
                                                  "false (Accelerated disabled)");
             printOption("OBJ S3 Accelerated type (--obj_accelerated_type=type)",
                         obj_accelerated_type.empty() ? "(default)" : obj_accelerated_type);
+            printOption("OBJ accelerated request split size (--obj_split_size=N bytes)",
+                        obj_split_size > 0 ? std::to_string(obj_split_size) :
+                                             "0 (engine default)");
             printOption("OBJ accelerated connector threads (--obj_num_threads=N)",
                         obj_num_threads > 0 ? std::to_string(obj_num_threads) :
                                               "0 (engine default)");
