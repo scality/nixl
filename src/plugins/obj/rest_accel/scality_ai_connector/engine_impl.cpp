@@ -537,8 +537,14 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
         // contains them, which is what lets a fanned-out buffer reach several
         // NICs; for a single-MR buffer they all share its NIC and QP.
         const size_t total = local[i].len;
-        const size_t step = (splitSize_ == 0) ? total : splitSize_;
-        const size_t nreq = objRequestCount(total, splitSize_);
+        // WRITE is never split: the endpoint accepts whole-object writes only and
+        // answers a second write of the same key with 409 "cannot overwrite", so a
+        // split descriptor would send N colliding PUTs. The token client registers
+        // a spanning MR alongside the interleaved chunks so the one big request can
+        // still be described.
+        const bool splittable = (operation != NIXL_WRITE) && (splitSize_ != 0);
+        const size_t step = splittable ? splitSize_ : total;
+        const size_t nreq = splittable ? objRequestCount(total, splitSize_) : 1;
         for (size_t r = 0; r < nreq; ++r) {
             const size_t off = r * step;
             const size_t len = std::min(step, total - off);

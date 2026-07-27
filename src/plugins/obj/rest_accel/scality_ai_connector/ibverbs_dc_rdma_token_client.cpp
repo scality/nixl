@@ -699,8 +699,12 @@ IbverbsDcRdmaTokenClient::fanRailsFor(int dev_id) {
 }
 
 bool
-IbverbsDcRdmaTokenClient::registerPiece(
-    void *ptr, size_t size, int dev_id, int nic_idx, uintptr_t parent_base) {
+IbverbsDcRdmaTokenClient::registerPiece(void *ptr,
+                                        size_t size,
+                                        int dev_id,
+                                        int nic_idx,
+                                        uintptr_t parent_base,
+                                        std::map<uintptr_t, Region> &dest) {
     // mu_ held by caller.
     NicCtx &nic = nics_[nic_idx];
 
@@ -726,7 +730,7 @@ IbverbsDcRdmaTokenClient::registerPiece(
     r.dev_id = dev_id;
     r.dctn = nic.dctns[nic.lag_seq++ % nic.num_lag_ports];
     r.parent_base = parent_base;
-    regions_[reinterpret_cast<uintptr_t>(ptr)] = r;
+    dest[reinterpret_cast<uintptr_t>(ptr)] = r;
     // Load accounting lives here, not in the selectors, so it stays correct
     // whether the NIC was chosen by selectNicFor or handed in by a fan-out.
     nic_load_[nic_idx]++;
@@ -763,7 +767,7 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     if (chunks < 2 || rails.size() < 2) {
         // Nothing to interleave. dev_id >= 0 (VRAM) selects a PCIe-affine NIC for
         // the GPU; dev_id < 0 (host memory) keeps the global round-robin.
-        if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base)) {
+        if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base, regions_)) {
             return CU_OBJ_FAIL;
         }
         return CU_OBJ_SUCCESS;
@@ -776,16 +780,28 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
         const size_t off = i * split_size_;
         const size_t len = std::min(split_size_, size - off);
         const int nic = rails[(rotor + i) % rails.size()];
-        if (!registerPiece(reinterpret_cast<void *>(base + off), len, dev_id, nic, base)) {
+        if (!registerPiece(
+                reinterpret_cast<void *>(base + off), len, dev_id, nic, base, regions_)) {
             // Unwind the chunks already registered so the caller sees all-or-nothing.
             releaseRegistration(base);
             return CU_OBJ_FAIL;
         }
     }
 
+    // One more MR over the whole buffer, on a single rail. The endpoint only
+    // accepts whole-object writes, so a WRITE arrives as one request spanning the
+    // entire buffer, and no chunk MR can describe it: a descriptor carries one
+    // rkey and one DCTN, so the range has to sit inside a single region. Reads keep
+    // using the chunk MRs and stay spread; writes fall back to this one and are
+    // confined to its rail, which selectNicFor varies from buffer to buffer.
+    if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base, spans_)) {
+        releaseRegistration(base);
+        return CU_OBJ_FAIL;
+    }
+
     NIXL_DEBUG << "ibverbs_dc: interleaved registration 0x" << std::hex << base << std::dec << " ("
                << size << " bytes) over " << rails.size() << " rail(s) in " << chunks
-               << " chunk(s) of " << split_size_ << ", dev_id=" << dev_id;
+               << " chunk(s) of " << split_size_ << ", plus a spanning MR, dev_id=" << dev_id;
     return CU_OBJ_SUCCESS;
 }
 
@@ -794,16 +810,18 @@ IbverbsDcRdmaTokenClient::releaseRegistration(uintptr_t parent_base) {
     // mu_ held by caller. Pieces of one registration are contiguous from
     // parent_base, so walk forward while they still belong to it.
     size_t released = 0;
-    auto it = regions_.lower_bound(parent_base);
-    while (it != regions_.end() && it->second.parent_base == parent_base) {
-        if (it->second.mr) {
-            ibv_dereg_mr(it->second.mr);
+    for (std::map<uintptr_t, Region> *m : {&regions_, &spans_}) {
+        auto it = m->lower_bound(parent_base);
+        while (it != m->end() && it->second.parent_base == parent_base) {
+            if (it->second.mr) {
+                ibv_dereg_mr(it->second.mr);
+            }
+            if (nic_load_[it->second.nic_idx] > 0) {
+                nic_load_[it->second.nic_idx]--;
+            }
+            it = m->erase(it);
+            released++;
         }
-        if (nic_load_[it->second.nic_idx] > 0) {
-            nic_load_[it->second.nic_idx]--;
-        }
-        it = regions_.erase(it);
-        released++;
     }
     return released;
 }
@@ -867,16 +885,26 @@ IbverbsDcRdmaTokenClient::descriptorFor(void *ptr, size_t size) {
         logAssignment();
         assignment_logged_ = true;
     }
-    // Find the region [base, base+len) that contains addr.
-    auto it = regions_.upper_bound(addr);
-    if (it == regions_.begin()) {
+    // Find the region [base, base+len) that contains [addr, addr+size). Chunk MRs
+    // first, so a request that fits one keeps the rail it was interleaved onto;
+    // the spanning MRs only catch a request too large for any chunk, which is a
+    // whole-object write.
+    const Region *found = nullptr;
+    for (const std::map<uintptr_t, Region> *m : {&regions_, &spans_}) {
+        auto it = m->upper_bound(addr);
+        if (it == m->begin()) {
+            continue;
+        }
+        --it;
+        if (addr >= it->first && addr + size <= it->first + it->second.len) {
+            found = &it->second;
+            break;
+        }
+    }
+    if (!found) {
         return std::string();
     }
-    --it;
-    const Region &r = it->second;
-    if (addr < it->first || addr + size > it->first + r.len) {
-        return std::string();
-    }
+    const Region &r = *found;
     const NicCtx &nic = nics_[r.nic_idx];
     return formatDcDescriptor(static_cast<uint64_t>(addr),
                               static_cast<uint32_t>(size),
