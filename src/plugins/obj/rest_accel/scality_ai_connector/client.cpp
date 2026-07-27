@@ -425,10 +425,13 @@ RestClient::RestClient(nixl_b_params_t *custom_params)
         cap_from_params ? "configured" : "default");
 
     // A default lower than kDefaultMaxInflight means the descriptor limit, not
-    // this client, chose it. Say so, or the number looks arbitrary to anyone
+    // this client, chose it. At WARN because it is a constraint the environment
+    // imposed and the operator can lift: concurrency is below what this backend
+    // would otherwise use, which shows up as throughput left on the table rather
+    // than as an error. Also stops the number looking arbitrary to anyone
     // comparing runs across machines with different ulimits.
     if (!cap_from_params && maxInflight_ < kDefaultMaxInflight) {
-        NIXL_INFO << absl::StrFormat(
+        NIXL_WARN << absl::StrFormat(
             "RestClient: max_inflight defaulted to %zu, a 1/%zu share of "
             "RLIMIT_NOFILE, rather than the built-in %zu which would not leave the "
             "caller enough descriptors. Set max_inflight explicitly to override, or "
