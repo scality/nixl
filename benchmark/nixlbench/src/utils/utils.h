@@ -375,6 +375,10 @@ private:
     buildCommonAzCliBlobParams(const std::string &blob_name);
 
 public:
+    // Per-object chatter is only emitted when NIXL_LOG_LEVEL selects DEBUG or
+    // TRACE, matching the levels NIXL core (utils/common/nixl_log.h) accepts.
+    static bool
+    debugEnabled();
     static void
     setRT(xferBenchRT *rt);
     static void

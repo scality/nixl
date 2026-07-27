@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -1419,6 +1420,20 @@ xferBenchUtils::buildAwsCredentials() {
     return env_setup;
 }
 
+bool
+xferBenchUtils::debugEnabled() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("NIXL_LOG_LEVEL");
+        if (!env) {
+            return false;
+        }
+        std::string level(env);
+        std::transform(level.begin(), level.end(), level.begin(), ::toupper);
+        return level == "DEBUG" || level == "TRACE";
+    }();
+    return enabled;
+}
+
 // --- libcurl helpers for the REST object setup/cleanup path ---
 
 namespace {
@@ -1497,9 +1512,11 @@ xferBenchUtils::putObjRest(size_t buffer_size, const std::string &name) {
     std::string url = endpoint + "/" + name;
     std::string response_body;
 
-    restLogLine(std::cout,
-                "Putting REST object: " + name + " (size: " + std::to_string(buffer_size) +
-                    " bytes)");
+    if (debugEnabled()) {
+        restLogLine(std::cout,
+                    "Putting REST object: " + name + " (size: " + std::to_string(buffer_size) +
+                        " bytes)");
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (!xferBenchConfig::obj_ca_bundle.empty()) {
@@ -1555,7 +1572,9 @@ xferBenchUtils::rmObjRest(const std::string &name) {
     std::string url = endpoint + "/" + name;
     std::string response_body;
 
-    restLogLine(std::cout, "Removing REST object: " + name);
+    if (debugEnabled()) {
+        restLogLine(std::cout, "Removing REST object: " + name);
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     if (!xferBenchConfig::obj_ca_bundle.empty()) {
@@ -1651,8 +1670,10 @@ xferBenchUtils::rmObjRestBatch(const std::vector<std::string> &names) {
         }
 
         std::string response_body;
-        restLogLine(std::cout,
-                    "Batch-deleting " + std::to_string(end - start) + " REST objects");
+        if (debugEnabled()) {
+            restLogLine(std::cout,
+                        "Batch-deleting " + std::to_string(end - start) + " REST objects");
+        }
 
         struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
