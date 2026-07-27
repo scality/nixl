@@ -20,7 +20,10 @@
 #include <absl/strings/str_format.h>
 #include <asio/post.hpp>
 #include <curl/curl.h>
+#include <dirent.h>
+#include <sys/resource.h>
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -90,6 +93,54 @@ parseMaxInflight(nixl_b_params_t *params) {
         throw std::invalid_argument("RestClient: max_inflight must be a non-negative integer");
     }
     return parsed;
+}
+
+/// The errno libcurl saw from the failing syscall, rendered for a log line, or
+/// "0" if it recorded none.
+///
+/// Worth having because CURLcode alone cannot distinguish two very different
+/// faults: a refused connection and a process out of file descriptors both
+/// surface as CURLE_COULDNT_CONNECT, and they want opposite fixes (lower
+/// max_inflight versus raise RLIMIT_NOFILE). EMFILE is 24, ECONNREFUSED 111.
+/// strerror is not thread-safe, but every caller is the poller thread.
+std::string
+osErrnoText(CURL *easy) {
+    long err = 0;
+    if (easy) {
+        curl_easy_getinfo(easy, CURLINFO_OS_ERRNO, &err);
+    }
+    if (err == 0) {
+        return "0";
+    }
+    return absl::StrFormat("%ld (%s)", err, std::strerror(static_cast<int>(err)));
+}
+
+/// True if the errno means the process ran out of file descriptors, either its
+/// own limit (EMFILE) or the system's (ENFILE).
+bool
+isFdExhaustion(CURL *easy) {
+    long err = 0;
+    if (easy) {
+        curl_easy_getinfo(easy, CURLINFO_OS_ERRNO, &err);
+    }
+    return err == EMFILE || err == ENFILE;
+}
+
+/// File descriptors the process currently holds, or 0 if /proc is unavailable.
+/// Reading /proc/self/fd holds one descriptor of its own, which is discounted
+/// along with "." and "..".
+std::size_t
+openFdCount() {
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        return 0;
+    }
+    std::size_t count = 0;
+    while (readdir(dir) != nullptr) {
+        count++;
+    }
+    closedir(dir);
+    return count > 3 ? count - 3 : 0;
 }
 
 } // namespace
@@ -202,9 +253,11 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
     if (ctx->method == restMethod::HEAD) {
         std::optional<bool> result;
         if (res != CURLE_OK) {
-            NIXL_ERROR << absl::StrFormat("checkObjectExistsAsync: curl_code=%d for HEAD %s",
-                                          static_cast<int>(res),
-                                          ctx->url);
+            NIXL_ERROR << absl::StrFormat(
+                "checkObjectExistsAsync: curl_code=%d os_errno=%s for HEAD %s",
+                static_cast<int>(res),
+                osErrnoText(ctx->easy),
+                ctx->url);
             result = std::nullopt;
         } else if (http_code >= 200 && http_code < 300) {
             result = true;
@@ -228,13 +281,14 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
     } else {
         bool success = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
         if (!success) {
-            NIXL_ERROR << absl::StrFormat("%s: failed url=%s curl_code=%d http_code=%ld body=%s",
-                                          ctx->op_name,
-                                          ctx->url,
-                                          static_cast<int>(res),
-                                          http_code,
-                                          ctx->response_body.empty() ? "<empty>" :
-                                                                       ctx->response_body);
+            NIXL_ERROR << absl::StrFormat(
+                "%s: failed url=%s curl_code=%d os_errno=%s http_code=%ld body=%s",
+                ctx->op_name,
+                ctx->url,
+                static_cast<int>(res),
+                osErrnoText(ctx->easy),
+                http_code,
+                ctx->response_body.empty() ? "<empty>" : ctx->response_body);
         } else {
             NIXL_DEBUG << absl::StrFormat(
                 "%s: success url=%s http_code=%ld", ctx->op_name, ctx->url, http_code);
@@ -292,6 +346,44 @@ RestClient::RestClient(nixl_b_params_t *custom_params)
         endpoint_,
         numThreads_,
         maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
+
+    // Every running request holds a connection, so max_inflight is a file
+    // descriptor requirement as much as a concurrency setting. Report the budget:
+    // when it is short, requests fail at connect with EMFILE, which looks exactly
+    // like an endpoint refusing them and sends debugging in the wrong direction.
+    //
+    // The open count is only a floor. This runs at backend-creation time, before
+    // the caller registers memory or opens its fabric contexts, so the eventual
+    // baseline is higher -- on one 128-thread benchmark it reached 639.
+    rlimit lim{};
+    const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
+    const std::size_t open_now = openFdCount();
+    if (have_limit && lim.rlim_cur != RLIM_INFINITY) {
+        NIXL_INFO << absl::StrFormat(
+            "RestClient fd budget: open=%zu (so far), soft_limit=%llu, "
+            "max_inflight=%zu, headroom=%lld",
+            open_now,
+            static_cast<unsigned long long>(lim.rlim_cur),
+            maxInflight_,
+            static_cast<long long>(lim.rlim_cur) - static_cast<long long>(open_now) -
+                static_cast<long long>(maxInflight_));
+        if (maxInflight_ != 0 && open_now + maxInflight_ > lim.rlim_cur) {
+            NIXL_WARN << absl::StrFormat(
+                "RestClient: max_inflight=%zu plus %zu descriptors already open "
+                "exceeds RLIMIT_NOFILE=%llu. Requests will fail at connect with "
+                "EMFILE and be reported as curl_code=7, indistinguishable from a "
+                "refused connection. Lower max_inflight or raise 'ulimit -n'.",
+                maxInflight_,
+                open_now,
+                static_cast<unsigned long long>(lim.rlim_cur));
+        }
+    } else {
+        NIXL_INFO << absl::StrFormat(
+            "RestClient fd budget: open=%zu (so far), soft_limit=unlimited, "
+            "max_inflight=%zu",
+            open_now,
+            maxInflight_);
+    }
 }
 
 RestClient::~RestClient() {
@@ -358,6 +450,29 @@ RestClient::reapCompletions() {
         curl_multi_remove_handle(multi_, easy);
         inflight_.erase(ctx);
 
+        // Running out of descriptors is the one connect failure whose cause is
+        // entirely local, and the only moment the descriptor count means anything
+        // is now: at construction the caller has not yet registered memory or
+        // opened its fabric contexts, and by teardown every connection is closed.
+        // Sample it once, on the first occurrence, so a retry storm cannot turn
+        // this into a log flood.
+        if (res != CURLE_OK && !fdExhaustionLogged_ && isFdExhaustion(easy)) {
+            fdExhaustionLogged_ = true;
+            rlimit lim{};
+            const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
+            NIXL_ERROR << absl::StrFormat(
+                "RestClient: out of file descriptors (open=%zu, soft_limit=%s, "
+                "max_inflight=%zu). Every running request holds a connection, so "
+                "the cap cannot exceed the descriptors left after the caller's own "
+                "use. Lower max_inflight or raise 'ulimit -n'. Further occurrences "
+                "are not logged.",
+                openFdCount(),
+                (have_limit && lim.rlim_cur != RLIM_INFINITY) ?
+                    std::to_string(lim.rlim_cur) :
+                    std::string("unlimited"),
+                maxInflight_);
+        }
+
         // Retry a lost request rather than failing the caller's whole transfer for
         // one blip. It goes to the back of pending_, so the requests already queued
         // are attempted before it comes round again, and the easy handle keeps every
@@ -371,9 +486,10 @@ RestClient::reapCompletions() {
             ctx->attempts++;
             ctx->response_body.clear();
             totalRetries_++;
-            NIXL_WARN << absl::StrFormat("%s: curl_code=%d url=%s, retry %d/%d",
+            NIXL_WARN << absl::StrFormat("%s: curl_code=%d os_errno=%s url=%s, retry %d/%d",
                                          ctx->op_name,
                                          static_cast<int>(res),
+                                         osErrnoText(ctx->easy),
                                          ctx->url,
                                          ctx->attempts,
                                          kMaxRetries);
