@@ -35,7 +35,12 @@
 
 /// Default bytes per object request. Overridable via the 'split_size' backend
 /// parameter; 0 there disables splitting.
-constexpr size_t kDefaultSplitSize = 16 * 1024 * 1024;
+///
+/// 8 MiB rather than 16: it doubles the requests a transfer of a given size is
+/// cut into, which both raises the concurrency the endpoint sees and halves the
+/// transfer size at which a registration's chunks reach every RDMA NIC. An
+/// 8-GPU VRAM READ at this granularity reached 360 of 400 Gb/s.
+constexpr size_t kDefaultSplitSize = 8 * 1024 * 1024;
 
 /// How many ranged requests a descriptor of `total` bytes becomes.
 ///
