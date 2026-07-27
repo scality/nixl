@@ -40,8 +40,67 @@
 
 #include "nixl_types.h"
 #include "rest_accel/scality_ai_connector/client.h"
+#include "rest_accel/scality_ai_connector/split.h"
 
 namespace gtest::obj {
+
+// ---------------------------------------------------------------------------
+// Request splitting arithmetic
+//
+// prepXfer cuts one transfer descriptor into objRequestCount() ranged requests,
+// request r covering [r * split_size, min((r+1) * split_size, total)). The split
+// happens in the engine, above RestClient, so it is not observable from the HTTP
+// harness below; these cover the arithmetic and its edge cases directly.
+// ---------------------------------------------------------------------------
+
+TEST(ObjRequestSplitTest, ExactMultipleTilesEvenly) {
+    EXPECT_EQ(objRequestCount(128u << 20, 16u << 20), 8u);
+}
+
+TEST(ObjRequestSplitTest, RemainderGetsItsOwnRequest) {
+    EXPECT_EQ(objRequestCount((128u << 20) + 1, 16u << 20), 9u);
+    EXPECT_EQ(objRequestCount(100, 16), 7u); // 6 full + 4-byte tail
+}
+
+TEST(ObjRequestSplitTest, BelowSplitSizeIsOneRequest) {
+    EXPECT_EQ(objRequestCount(1, 16u << 20), 1u);
+    EXPECT_EQ(objRequestCount(16u << 20, 16u << 20), 1u);
+}
+
+TEST(ObjRequestSplitTest, ZeroLengthStillYieldsOneRequest) {
+    // Pre-split behaviour was one request per descriptor regardless of length;
+    // an empty descriptor must not silently vanish.
+    EXPECT_EQ(objRequestCount(0, 16u << 20), 1u);
+    EXPECT_EQ(objRequestCount(0, 0), 1u);
+}
+
+TEST(ObjRequestSplitTest, SplitSizeZeroDisablesSplitting) {
+    EXPECT_EQ(objRequestCount(1u << 30, 0), 1u);
+}
+
+TEST(ObjRequestSplitTest, TilingIsContiguousAndExact) {
+    // Reconstruct what prepXfer emits and check the ranges tile the descriptor
+    // exactly once: no gaps, no overlaps, nothing past the end.
+    for (size_t total : {size_t{0}, size_t{1}, size_t{15}, size_t{16}, size_t{17}, size_t{1024}}) {
+        for (size_t split : {size_t{1}, size_t{4}, size_t{16}, size_t{4096}}) {
+            const size_t nreq = objRequestCount(total, split);
+            const size_t step = (split == 0) ? total : split;
+            size_t covered = 0;
+            size_t expected_off = 0;
+            for (size_t r = 0; r < nreq; ++r) {
+                const size_t off = r * step;
+                const size_t len = std::min(step, total - off);
+                EXPECT_EQ(off, expected_off) << "gap/overlap at total=" << total
+                                             << " split=" << split << " r=" << r;
+                EXPECT_LE(off + len, total) << "range past end at total=" << total;
+                covered += len;
+                expected_off = off + len;
+            }
+            EXPECT_EQ(covered, total) << "incomplete coverage at total=" << total
+                                      << " split=" << split;
+        }
+    }
+}
 
 // A throwaway single-request HTTP server: binds to localhost:0, reads one full
 // HTTP request, replies "200 OK", and hands the raw request text back.

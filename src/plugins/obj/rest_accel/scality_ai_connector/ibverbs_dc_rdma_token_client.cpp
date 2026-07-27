@@ -471,7 +471,9 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 }
 
 IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
-                                                   uint64_t dc_key) {
+                                                   uint64_t dc_key,
+                                                   size_t split_size)
+    : split_size_(split_size) {
     if (nic_ips.empty()) {
         NIXL_ERROR << "ibverbs_dc: no NIC addresses provided (rdma_nics is empty)";
         return;
@@ -647,7 +649,6 @@ IbverbsDcRdmaTokenClient::leastLoadedNic(const std::vector<int> &candidates) {
             best = idx;
         }
     }
-    nic_load_[best]++;
     return best;
 }
 
@@ -679,25 +680,34 @@ IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
             best = idx;
         }
     }
-    nic_load_[best]++;
     return best;
 }
 
-cuObjErr_t
-IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_id) {
-    if (!connected_) {
-        return CU_OBJ_FAIL;
+std::vector<int>
+IbverbsDcRdmaTokenClient::idleNicsFor(int dev_id) {
+    // mu_ held by caller. Affine rails first so a fan-out that needs fewer pieces
+    // than there are idle rails still prefers the GPU's own; selectNicFor applies
+    // the same preference without restricting to them.
+    const std::vector<int> &affine = affineNicsFor(dev_id);
+    std::vector<int> idle;
+    for (int n : affine) {
+        if (nic_load_[n] == 0) {
+            idle.push_back(n);
+        }
     }
-    if (size > UINT32_MAX) {
-        NIXL_ERROR << "ibverbs_dc: registration size " << size
-                   << " exceeds the 32-bit DC descriptor SIZE field";
-        return CU_OBJ_FAIL;
+    for (int n : all_nics_) {
+        const bool is_affine = std::find(affine.begin(), affine.end(), n) != affine.end();
+        if (!is_affine && nic_load_[n] == 0) {
+            idle.push_back(n);
+        }
     }
+    return idle;
+}
 
-    std::lock_guard<std::mutex> lk(mu_);
-    // dev_id >= 0 (VRAM) selects a PCIe-affine NIC for the GPU; dev_id < 0 (host
-    // memory) keeps the global round-robin. See selectNicFor.
-    int nic_idx = selectNicFor(dev_id);
+bool
+IbverbsDcRdmaTokenClient::registerPiece(
+    void *ptr, size_t size, int dev_id, int nic_idx, uintptr_t parent_base) {
+    // mu_ held by caller.
     NicCtx &nic = nics_[nic_idx];
 
     /* Relaxed ordering lets the NIC pipeline the PCIe writes into GPU BAR instead
@@ -712,7 +722,7 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     ibv_mr *mr = ibv_reg_mr(nic.pd, ptr, size, access);
     if (!mr) {
         NIXL_ERROR << "ibverbs_dc: ibv_reg_mr failed (ptr=" << ptr << ", size=" << size << ")";
-        return CU_OBJ_FAIL;
+        return false;
     }
 
     Region r;
@@ -721,25 +731,113 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     r.nic_idx = nic_idx;
     r.dev_id = dev_id;
     r.dctn = nic.dctns[nic.lag_seq++ % nic.num_lag_ports];
+    r.parent_base = parent_base;
     regions_[reinterpret_cast<uintptr_t>(ptr)] = r;
+    // Load accounting lives here, not in the selectors, so it stays correct
+    // whether the NIC was chosen by selectNicFor or handed in by a fan-out.
+    nic_load_[nic_idx]++;
+    return true;
+}
+
+cuObjErr_t
+IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_id) {
+    if (!connected_) {
+        return CU_OBJ_FAIL;
+    }
+    if (size > UINT32_MAX) {
+        NIXL_ERROR << "ibverbs_dc: registration size " << size
+                   << " exceeds the 32-bit DC descriptor SIZE field";
+        return CU_OBJ_FAIL;
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+
+    // A single MR binds the whole buffer to one NIC, so every request carved out
+    // of it rides that one rail. That is normally fine: selectNicFor balances
+    // consecutive registrations across rails, so concurrent buffers cover them
+    // all. It degenerates only when too few registrations are live to go round --
+    // the start of a load, or buffers so large that the caller holds just one or
+    // two at a time. Detect that directly and fan this buffer out over the rails
+    // nothing is using, rather than guessing from its size.
+    std::vector<int> idle = idleNicsFor(dev_id);
+    size_t pieces = idle.size();
+    if (split_size_ > 0 && pieces > 1) {
+        // Never make pieces smaller than a request, or no request could sit
+        // inside one and descriptorFor would reject every lookup.
+        pieces = std::min(pieces, size / split_size_);
+    } else {
+        pieces = 1;
+    }
+
+    if (pieces <= 1) {
+        // dev_id >= 0 (VRAM) selects a PCIe-affine NIC for the GPU; dev_id < 0
+        // (host memory) keeps the global round-robin. See selectNicFor.
+        if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base)) {
+            return CU_OBJ_FAIL;
+        }
+        return CU_OBJ_SUCCESS;
+    }
+
+    // Round the piece up to a split_size multiple so piece boundaries land on
+    // request boundaries; descriptorFor requires a request to be contained in one
+    // region. The last piece absorbs the remainder and may be shorter.
+    const size_t chunks = (size + split_size_ - 1) / split_size_;
+    const size_t chunks_per_piece = (chunks + pieces - 1) / pieces;
+    const size_t piece_len = chunks_per_piece * split_size_;
+
+    size_t done = 0;
+    size_t used = 0;
+    while (done < size && used < pieces) {
+        const size_t len = std::min(piece_len, size - done);
+        if (!registerPiece(reinterpret_cast<void *>(base + done), len, dev_id, idle[used], base)) {
+            // Unwind the pieces already registered so the caller sees all-or-nothing.
+            releaseRegistration(base);
+            return CU_OBJ_FAIL;
+        }
+        done += len;
+        used++;
+    }
+    if (done < size) {
+        NIXL_ERROR << "ibverbs_dc: piece arithmetic left " << (size - done)
+                   << " bytes unregistered (size=" << size << ", pieces=" << pieces
+                   << ", piece_len=" << piece_len << ")";
+        releaseRegistration(base);
+        return CU_OBJ_FAIL;
+    }
+
+    NIXL_DEBUG << "ibverbs_dc: fanned registration 0x" << std::hex << base << std::dec << " ("
+               << size << " bytes) across " << used << " idle NIC(s), piece_len=" << piece_len
+               << ", dev_id=" << dev_id;
     return CU_OBJ_SUCCESS;
+}
+
+size_t
+IbverbsDcRdmaTokenClient::releaseRegistration(uintptr_t parent_base) {
+    // mu_ held by caller. Pieces of one registration are contiguous from
+    // parent_base, so walk forward while they still belong to it.
+    size_t released = 0;
+    auto it = regions_.lower_bound(parent_base);
+    while (it != regions_.end() && it->second.parent_base == parent_base) {
+        if (it->second.mr) {
+            ibv_dereg_mr(it->second.mr);
+        }
+        if (nic_load_[it->second.nic_idx] > 0) {
+            nic_load_[it->second.nic_idx]--;
+        }
+        it = regions_.erase(it);
+        released++;
+    }
+    return released;
 }
 
 cuObjErr_t
 IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
     std::lock_guard<std::mutex> lk(mu_);
-    auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
-    if (it == regions_.end()) {
+    if (releaseRegistration(reinterpret_cast<uintptr_t>(ptr)) == 0) {
         NIXL_ERROR << "ibverbs_dc: cuMemObjPutDescriptor: ptr " << ptr << " not registered";
         return CU_OBJ_FAIL;
     }
-    if (it->second.mr) {
-        ibv_dereg_mr(it->second.mr);
-    }
-    if (nic_load_[it->second.nic_idx] > 0) {
-        nic_load_[it->second.nic_idx]--;
-    }
-    regions_.erase(it);
     return CU_OBJ_SUCCESS;
 }
 
