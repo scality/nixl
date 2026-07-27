@@ -313,11 +313,13 @@ RestClient::~RestClient() {
     if (multi_) {
         curl_multi_cleanup(multi_);
     }
-    // peakPending_ > 0 means requests waited on the cap, so max_inflight was the
-    // limit; peakInflight_ below the cap means the producer never kept up.
-    NIXL_DEBUG << "RestClient teardown: peak_inflight=" << peakInflight_
-               << ", peak_pending=" << peakPending_ << ", max_inflight="
-               << (maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
+    // At INFO because it answers the first question of any throughput tuning:
+    // whether the endpoint was kept busy. peak_pending > 0 means requests queued
+    // behind max_inflight, so the cap was the limit; peak_inflight well below the
+    // cap means the caller never submitted enough to saturate anything.
+    NIXL_INFO << "RestClient concurrency: peak_inflight=" << peakInflight_
+              << ", peak_pending=" << peakPending_ << ", max_inflight="
+              << (maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
     NIXL_INFO << "RestClient connections: requests=" << totalRequests_
               << ", new_connections=" << newConnects_ << ", retries=" << totalRetries_
               << " (new_connections close to requests means keepalive is not working and "
