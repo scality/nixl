@@ -39,6 +39,28 @@ captureBody(void *ptr, size_t size, size_t nmemb, void *userdata) {
 
 std::once_flag curl_init_flag;
 
+/// Extra attempts allowed after a connection-level failure.
+constexpr int kMaxRetries = 3;
+
+/// True if libcurl produced no HTTP response at all, so the endpoint either never
+/// saw the request or never answered it. Repeating one is safe even for PUT, since
+/// both methods are idempotent in effect. A request that did get a response is
+/// left alone: a 4xx/5xx is the server's answer, not a lost request.
+bool
+isTransient(CURLcode res) {
+    switch (res) {
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_COULDNT_RESOLVE_HOST:
+    case CURLE_OPERATION_TIMEDOUT:
+    case CURLE_SEND_ERROR:
+    case CURLE_RECV_ERROR:
+    case CURLE_GOT_NOTHING:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::size_t
 parseNumThreads(nixl_b_params_t *params) {
     if (!params || params->count("num_threads") == 0) {
@@ -86,6 +108,7 @@ struct RestClient::RequestCtx {
     std::string response_body;
     const char *op_name = "";
     restMethod method = restMethod::GET;
+    int attempts = 0; // retries already spent on a connection-level failure
     std::function<void(bool)> bool_cb; // Put/Get
     std::function<void(std::optional<bool>)> check_cb; // Head
 
@@ -296,7 +319,7 @@ RestClient::~RestClient() {
                << ", peak_pending=" << peakPending_ << ", max_inflight="
                << (maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
     NIXL_INFO << "RestClient connections: requests=" << totalRequests_
-              << ", new_connections=" << newConnects_
+              << ", new_connections=" << newConnects_ << ", retries=" << totalRetries_
               << " (new_connections close to requests means keepalive is not working and "
                  "the endpoint will exhaust ephemeral ports)";
 }
@@ -332,6 +355,24 @@ RestClient::reapCompletions() {
 
         curl_multi_remove_handle(multi_, easy);
         inflight_.erase(ctx);
+
+        // Retry a lost request rather than failing the caller's whole transfer for
+        // one blip. It goes to the back of pending_, so the requests already queued
+        // are attempted before it comes round again, and the easy handle keeps every
+        // option it was built with: only the partial response body has to go.
+        if (isTransient(res) && ctx->attempts < kMaxRetries) {
+            ctx->attempts++;
+            ctx->response_body.clear();
+            totalRetries_++;
+            NIXL_WARN << absl::StrFormat("%s: curl_code=%d url=%s, retry %d/%d",
+                                         ctx->op_name,
+                                         static_cast<int>(res),
+                                         ctx->url,
+                                         ctx->attempts,
+                                         kMaxRetries);
+            pending_.emplace_back(ctx);
+            continue;
+        }
         finishRequest(ctx, res, http_code);
     }
 }
