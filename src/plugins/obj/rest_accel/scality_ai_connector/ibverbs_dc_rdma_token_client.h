@@ -49,15 +49,8 @@ public:
      * @param nic_ips     IPv4 addresses selecting the RDMA devices (one DC context
      *                    per IP); memory regions are round-robined across them.
      * @param dc_key      DC access key the server's DCI side must present.
-     * @param split_size  Bytes per object request, as used by the engine. A
-     *                    registration that fans out across NICs aligns its piece
-     *                    boundaries to this so no request ever straddles two
-     *                    pieces (descriptorFor requires containment). 0 means the
-     *                    engine does not split, so registrations never fan out.
      */
-    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
-                             uint64_t dc_key,
-                             size_t split_size);
+    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips, uint64_t dc_key);
     ~IbverbsDcRdmaTokenClient() override;
 
     IbverbsDcRdmaTokenClient(const IbverbsDcRdmaTokenClient &) = delete;
@@ -131,12 +124,7 @@ private:
     /// to the lowest index). Pure. Caller must hold mu_.
     int
     leastLoadedNic(const std::vector<int> &candidates);
-    /// NIC indices carrying no live registration, affine rails first. Empty means
-    /// every rail is already in use, so a new buffer needs no fan-out to reach
-    /// them. Caller must hold mu_.
-    std::vector<int>
-    idleNicsFor(int dev_id);
-    /// Register [ptr, ptr+size) as a single MR on one selected NIC, recording it
+    /// Register [ptr, ptr+size) as a single MR on the selected NIC, recording it
     /// under parent_base. Returns false and registers nothing on failure.
     /// Caller must hold mu_.
     bool
@@ -174,10 +162,6 @@ private:
     /// Only relevant under `trust dscp`. 0 = default lane; overridable via
     /// UCX_IB_TRAFFIC_CLASS, shared with the UCX backend.
     uint8_t traffic_class_ = 0;
-    /// Engine request granularity; piece boundaries are kept a multiple of this
-    /// so a request never straddles two pieces. 0 disables fan-out entirely.
-    size_t split_size_ = 0;
-
     mutable std::mutex mu_;
     /// base address -> region, ordered so a sub-address can be found by range.
     std::map<uintptr_t, Region> regions_;

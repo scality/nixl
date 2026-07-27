@@ -471,9 +471,7 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 }
 
 IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
-                                                   uint64_t dc_key,
-                                                   size_t split_size)
-    : split_size_(split_size) {
+                                                   uint64_t dc_key) {
     if (nic_ips.empty()) {
         NIXL_ERROR << "ibverbs_dc: no NIC addresses provided (rdma_nics is empty)";
         return;
@@ -683,27 +681,6 @@ IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
     return best;
 }
 
-std::vector<int>
-IbverbsDcRdmaTokenClient::idleNicsFor(int dev_id) {
-    // mu_ held by caller. Affine rails first so a fan-out that needs fewer pieces
-    // than there are idle rails still prefers the GPU's own; selectNicFor applies
-    // the same preference without restricting to them.
-    const std::vector<int> &affine = affineNicsFor(dev_id);
-    std::vector<int> idle;
-    for (int n : affine) {
-        if (nic_load_[n] == 0) {
-            idle.push_back(n);
-        }
-    }
-    for (int n : all_nics_) {
-        const bool is_affine = std::find(affine.begin(), affine.end(), n) != affine.end();
-        if (!is_affine && nic_load_[n] == 0) {
-            idle.push_back(n);
-        }
-    }
-    return idle;
-}
-
 bool
 IbverbsDcRdmaTokenClient::registerPiece(
     void *ptr, size_t size, int dev_id, int nic_idx, uintptr_t parent_base) {
@@ -753,62 +730,26 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     std::lock_guard<std::mutex> lk(mu_);
     const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
 
-    // A single MR binds the whole buffer to one NIC, so every request carved out
-    // of it rides that one rail. That is normally fine: selectNicFor balances
-    // consecutive registrations across rails, so concurrent buffers cover them
-    // all. It degenerates only when too few registrations are live to go round --
-    // the start of a load, or buffers so large that the caller holds just one or
-    // two at a time. Detect that directly and fan this buffer out over the rails
-    // nothing is using, rather than guessing from its size.
-    std::vector<int> idle = idleNicsFor(dev_id);
-    size_t pieces = idle.size();
-    if (split_size_ > 0 && pieces > 1) {
-        // Never make pieces smaller than a request, or no request could sit
-        // inside one and descriptorFor would reject every lookup.
-        pieces = std::min(pieces, size / split_size_);
-    } else {
-        pieces = 1;
-    }
-
-    if (pieces <= 1) {
-        // dev_id >= 0 (VRAM) selects a PCIe-affine NIC for the GPU; dev_id < 0
-        // (host memory) keeps the global round-robin. See selectNicFor.
-        if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base)) {
-            return CU_OBJ_FAIL;
-        }
-        return CU_OBJ_SUCCESS;
-    }
-
-    // Round the piece up to a split_size multiple so piece boundaries land on
-    // request boundaries; descriptorFor requires a request to be contained in one
-    // region. The last piece absorbs the remainder and may be shorter.
-    const size_t chunks = (size + split_size_ - 1) / split_size_;
-    const size_t chunks_per_piece = (chunks + pieces - 1) / pieces;
-    const size_t piece_len = chunks_per_piece * split_size_;
-
-    size_t done = 0;
-    size_t used = 0;
-    while (done < size && used < pieces) {
-        const size_t len = std::min(piece_len, size - done);
-        if (!registerPiece(reinterpret_cast<void *>(base + done), len, dev_id, idle[used], base)) {
-            // Unwind the pieces already registered so the caller sees all-or-nothing.
-            releaseRegistration(base);
-            return CU_OBJ_FAIL;
-        }
-        done += len;
-        used++;
-    }
-    if (done < size) {
-        NIXL_ERROR << "ibverbs_dc: piece arithmetic left " << (size - done)
-                   << " bytes unregistered (size=" << size << ", pieces=" << pieces
-                   << ", piece_len=" << piece_len << ")";
-        releaseRegistration(base);
+    // One MR for the whole buffer, on one rail. Splitting a buffer into contiguous
+    // pieces on different rails looks like it would spread that buffer's traffic,
+    // but it does not: callers transfer from the buffer base, so any transfer
+    // shorter than the buffer lands entirely in the first piece and the rails
+    // holding the rest stay idle. Measured on an 8-GPU VRAM READ sweep, two of
+    // four rails sat at exactly 0 Gb/s for every block size below the piece
+    // length.
+    //
+    // Balance comes from spreading whole buffers across rails instead, which
+    // selectNicFor does and which holds at every transfer size. It quantizes when
+    // the live buffers do not divide evenly over the rails (3 buffers over 2 rails
+    // is 2:1 at best), so it needs enough concurrent buffers to go round. That is
+    // the normal case: a caller after the whole node's bandwidth has to keep every
+    // rail busy anyway.
+    //
+    // dev_id >= 0 (VRAM) selects a PCIe-affine NIC for the GPU; dev_id < 0 (host
+    // memory) keeps the global round-robin. See selectNicFor.
+    if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base)) {
         return CU_OBJ_FAIL;
     }
-
-    NIXL_DEBUG << "ibverbs_dc: fanned registration 0x" << std::hex << base << std::dec << " ("
-               << size << " bytes) across " << used << " idle NIC(s), piece_len=" << piece_len
-               << ", dev_id=" << dev_id;
     return CU_OBJ_SUCCESS;
 }
 
