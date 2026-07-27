@@ -183,6 +183,9 @@ private:
     std::size_t newConnects_ = 0;
     /// Connection-level failures re-attempted rather than reported to the caller.
     std::size_t totalRetries_ = 0;
+    /// Set once the descriptor-exhaustion diagnostic has been emitted, so a retry
+    /// storm reports it once rather than per request. Poller-thread only.
+    bool fdExhaustionLogged_ = false;
 
     /**
      * Build the full URL for a given key.
