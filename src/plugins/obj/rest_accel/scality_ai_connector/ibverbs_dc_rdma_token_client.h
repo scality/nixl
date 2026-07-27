@@ -137,11 +137,16 @@ private:
     /// bigger one reaches every rail. Caller must hold mu_.
     std::vector<int>
     fanRailsFor(int dev_id);
-    /// Register [ptr, ptr+size) as a single MR on the selected NIC, recording it
-    /// under parent_base. Returns false and registers nothing on failure.
+    /// Register [ptr, ptr+size) as a single MR on the selected NIC, recording it in
+    /// `dest` under parent_base. Returns false and registers nothing on failure.
     /// Caller must hold mu_.
     bool
-    registerPiece(void *ptr, size_t size, int dev_id, int nic_idx, uintptr_t parent_base);
+    registerPiece(void *ptr,
+                  size_t size,
+                  int dev_id,
+                  int nic_idx,
+                  uintptr_t parent_base,
+                  std::map<uintptr_t, Region> &dest);
     /// Deregister every piece belonging to the registration at parent_base and
     /// drop its NIC load. Returns the number of pieces released (0 if unknown).
     /// Caller must hold mu_.
@@ -185,6 +190,12 @@ private:
     mutable std::mutex mu_;
     /// base address -> region, ordered so a sub-address can be found by range.
     std::map<uintptr_t, Region> regions_;
+    /// base address -> one MR spanning a whole registration, for requests too large
+    /// to fit any chunk of it. The endpoint only accepts whole-object writes, so a
+    /// WRITE covers the entire buffer, and a descriptor carries a single rkey and
+    /// DCTN: such a request needs one region spanning the lot. Consulted only after
+    /// regions_ misses, so reads keep their interleaved rails.
+    std::map<uintptr_t, Region> spans_;
 };
 
 #endif // NIXL_SRC_PLUGINS_OBJ_REST_ACCEL_SCALITY_AI_CONNECTOR_IBVERBS_DC_RDMA_TOKEN_CLIENT_H
