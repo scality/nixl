@@ -181,6 +181,8 @@ private:
     // below requests means the handle cache is doing its job. Poller-thread only.
     std::size_t totalRequests_ = 0;
     std::size_t newConnects_ = 0;
+    /// Connection-level failures re-attempted rather than reported to the caller.
+    std::size_t totalRetries_ = 0;
 
     /**
      * Build the full URL for a given key.
