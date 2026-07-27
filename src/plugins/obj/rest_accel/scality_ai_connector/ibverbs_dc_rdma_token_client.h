@@ -122,9 +122,10 @@ private:
     /// One-shot NIXL_INFO dump of the registered MR layout. Caller holds mu_.
     void
     logLayout();
-    /// NIXL_INFO dump of how many requests each GPU sent down each rail.
+    /// NIXL_INFO summary of how requests were spread over the rails. `detailed`
+    /// adds the per-GPU breakdown under the one-line summary.
     void
-    logRequestSpread();
+    logRequestSpread(bool detailed);
 
     /// Index into buf.rails for the next request against buf. Prefers the GPU's
     /// affine rails, handing the rest kNonAffineHandicap so they stay unused
@@ -152,10 +153,18 @@ private:
     /// fewer requests is the cheaper next hop, so an idle rail is picked up
     /// automatically and a busy one sheds to its neighbours.
     std::vector<uint64_t> nic_issued_;
+    /// Requests that left the owning GPU's NUMA node. The headline number: it
+    /// should sit near 0 whenever every NUMA node has GPUs driving it, and rise
+    /// only when one node's rails have no local work to keep them busy.
+    uint64_t cross_numa_ = 0;
+    /// Requests since the last spread summary.
+    uint64_t since_spread_log_ = 0;
     /// dev_id -> requests sent down each NIC, for the teardown dump.
     std::map<int, std::vector<uint64_t>> gpu_nic_requests_;
     /// dev_id -> affine NIC indices, resolved once per GPU.
     std::map<int, std::vector<int>> gpu_affine_nics_;
+    /// dev_id -> NUMA node, cached alongside gpu_affine_nics_ for logging.
+    std::map<int, int> gpu_numa_;
     /// Guard so the MR layout is dumped once, at the first transfer.
     bool layout_logged_ = false;
     /// RoCE service level for the DCT AV. Under `trust pcp` this selects the
