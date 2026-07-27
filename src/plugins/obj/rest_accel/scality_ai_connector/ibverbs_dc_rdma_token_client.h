@@ -49,8 +49,16 @@ public:
      * @param nic_ips     IPv4 addresses selecting the RDMA devices (one DC context
      *                    per IP); memory regions are round-robined across them.
      * @param dc_key      DC access key the server's DCI side must present.
+     * @param split_size  Bytes per object request, as used by the engine. A
+     *                    registration is cut into chunks of this size and the
+     *                    chunks are spread over the NICs, so every request lands
+     *                    inside exactly one chunk (descriptorFor requires
+     *                    containment). 0 means the engine does not split, so a
+     *                    registration stays on one NIC.
      */
-    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips, uint64_t dc_key);
+    IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
+                             uint64_t dc_key,
+                             size_t split_size);
     ~IbverbsDcRdmaTokenClient() override;
 
     IbverbsDcRdmaTokenClient(const IbverbsDcRdmaTokenClient &) = delete;
@@ -124,6 +132,11 @@ private:
     /// to the lowest index). Pure. Caller must hold mu_.
     int
     leastLoadedNic(const std::vector<int> &candidates);
+    /// NIC indices to spread a registration's chunks over, affine rails first so a
+    /// buffer with fewer chunks than rails still favours the GPU's own, while a
+    /// bigger one reaches every rail. Caller must hold mu_.
+    std::vector<int>
+    fanRailsFor(int dev_id);
     /// Register [ptr, ptr+size) as a single MR on the selected NIC, recording it
     /// under parent_base. Returns false and registers nothing on failure.
     /// Caller must hold mu_.
@@ -154,6 +167,13 @@ private:
     std::map<int, std::vector<int>> gpu_affine_nics_;
     /// Guard so the GPU->NIC assignment is dumped once, at the first transfer.
     bool assignment_logged_ = false;
+    /// Engine request granularity. A registration is split into chunks of this and
+    /// the chunks are spread over the rails, so a request never straddles two.
+    /// 0 means the engine does not split, so a registration stays on one NIC.
+    size_t split_size_ = 0;
+    /// Rail the next registration starts its interleave on, so buffers with fewer
+    /// chunks than there are rails still spread instead of all starting on rail 0.
+    size_t fan_rotor_ = 0;
     /// RoCE service level for the DCT AV. Under `trust pcp` this selects the
     /// egress priority (SL -> PCP), so 3 targets the lossless PFC lane by
     /// default. Overridable via UCX_IB_SL (0-15), shared with the UCX backend.

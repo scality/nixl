@@ -471,7 +471,9 @@ IbverbsDcRdmaTokenClient::setupNic(const std::string &ip, uint64_t dc_key, NicCt
 }
 
 IbverbsDcRdmaTokenClient::IbverbsDcRdmaTokenClient(const std::vector<std::string> &nic_ips,
-                                                   uint64_t dc_key) {
+                                                   uint64_t dc_key,
+                                                   size_t split_size)
+    : split_size_(split_size) {
     if (nic_ips.empty()) {
         NIXL_ERROR << "ibverbs_dc: no NIC addresses provided (rdma_nics is empty)";
         return;
@@ -681,6 +683,21 @@ IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
     return best;
 }
 
+std::vector<int>
+IbverbsDcRdmaTokenClient::fanRailsFor(int dev_id) {
+    // mu_ held by caller. Affine rails first, then the rest, so a buffer with fewer
+    // chunks than rails favours the GPU's own while a bigger one still reaches every
+    // rail. Host memory (dev_id < 0) is affine to all NICs already.
+    const std::vector<int> &affine = affineNicsFor(dev_id);
+    std::vector<int> rails = affine;
+    for (int idx : all_nics_) {
+        if (std::find(affine.begin(), affine.end(), idx) == affine.end()) {
+            rails.push_back(idx);
+        }
+    }
+    return rails;
+}
+
 bool
 IbverbsDcRdmaTokenClient::registerPiece(
     void *ptr, size_t size, int dev_id, int nic_idx, uintptr_t parent_base) {
@@ -730,26 +747,45 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     std::lock_guard<std::mutex> lk(mu_);
     const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
 
-    // One MR for the whole buffer, on one rail. Splitting a buffer into contiguous
-    // pieces on different rails looks like it would spread that buffer's traffic,
-    // but it does not: callers transfer from the buffer base, so any transfer
-    // shorter than the buffer lands entirely in the first piece and the rails
-    // holding the rest stay idle. Measured on an 8-GPU VRAM READ sweep, two of
-    // four rails sat at exactly 0 Gb/s for every block size below the piece
-    // length.
+    // Spread the buffer over the rails one request-sized chunk at a time, cycling
+    // rails as it goes.
     //
-    // Balance comes from spreading whole buffers across rails instead, which
-    // selectNicFor does and which holds at every transfer size. It quantizes when
-    // the live buffers do not divide evenly over the rails (3 buffers over 2 rails
-    // is 2:1 at best), so it needs enough concurrent buffers to go round. That is
-    // the normal case: a caller after the whole node's bandwidth has to keep every
-    // rail busy anyway.
-    //
-    // dev_id >= 0 (VRAM) selects a PCIe-affine NIC for the GPU; dev_id < 0 (host
-    // memory) keeps the global round-robin. See selectNicFor.
-    if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base)) {
-        return CU_OBJ_FAIL;
+    // Splitting it into a few contiguous pieces instead (half the buffer per rail)
+    // does not work: callers transfer from the buffer base, so a transfer shorter
+    // than the buffer lands entirely in the first piece and the rails holding the
+    // rest stay idle. Measured that way, two of four rails sat at exactly 0 Gb/s
+    // for every block size below the piece length. Interleaving at the request
+    // granularity means a transfer spanning N chunks touches min(N, rails) rails,
+    // so a single buffer can fill the node instead of being capped at one rail's
+    // line rate. Costs one MR per chunk.
+    const std::vector<int> rails = fanRailsFor(dev_id);
+    const size_t chunks = split_size_ > 0 ? (size + split_size_ - 1) / split_size_ : 1;
+    if (chunks < 2 || rails.size() < 2) {
+        // Nothing to interleave. dev_id >= 0 (VRAM) selects a PCIe-affine NIC for
+        // the GPU; dev_id < 0 (host memory) keeps the global round-robin.
+        if (!registerPiece(ptr, size, dev_id, selectNicFor(dev_id), base)) {
+            return CU_OBJ_FAIL;
+        }
+        return CU_OBJ_SUCCESS;
     }
+
+    // Advance the starting rail per registration so buffers with fewer chunks than
+    // there are rails still spread across them rather than all starting on rail 0.
+    const size_t rotor = fan_rotor_++;
+    for (size_t i = 0; i < chunks; ++i) {
+        const size_t off = i * split_size_;
+        const size_t len = std::min(split_size_, size - off);
+        const int nic = rails[(rotor + i) % rails.size()];
+        if (!registerPiece(reinterpret_cast<void *>(base + off), len, dev_id, nic, base)) {
+            // Unwind the chunks already registered so the caller sees all-or-nothing.
+            releaseRegistration(base);
+            return CU_OBJ_FAIL;
+        }
+    }
+
+    NIXL_DEBUG << "ibverbs_dc: interleaved registration 0x" << std::hex << base << std::dec << " ("
+               << size << " bytes) over " << rails.size() << " rail(s) in " << chunks
+               << " chunk(s) of " << split_size_ << ", dev_id=" << dev_id;
     return CU_OBJ_SUCCESS;
 }
 
