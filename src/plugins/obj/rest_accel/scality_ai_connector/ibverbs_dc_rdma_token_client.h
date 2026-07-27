@@ -127,15 +127,14 @@ private:
     /// load is bumped by registerPiece. Caller must hold mu_.
     int
     selectNicFor(int dev_id);
-    /// Least-loaded NIC among candidates (fewest live registrations; ties break
+    /// Least-loaded NIC among candidates (fewest live registered bytes; ties break
     /// to the lowest index). Pure. Caller must hold mu_.
     int
     leastLoadedNic(const std::vector<int> &candidates);
-    /// NIC indices carrying no live registration, affine rails first. Empty means
-    /// every rail is already in use, so a new buffer needs no fan-out to reach
-    /// them. Caller must hold mu_.
+    /// NIC indices a new buffer should be split across: the GPU's affine rails,
+    /// so every buffer contributes equally to each of them. Caller must hold mu_.
     std::vector<int>
-    idleNicsFor(int dev_id);
+    fanOutNicsFor(int dev_id);
     /// Register [ptr, ptr+size) as a single MR on one selected NIC, recording it
     /// under parent_base. Returns false and registers nothing on failure.
     /// Caller must hold mu_.
@@ -159,8 +158,10 @@ private:
     bool connected_ = false;
     /// All NIC indices [0, nics_.size()); candidate set for host-memory balancing.
     std::vector<int> all_nics_;
-    /// Live registration count per NIC, used to balance new registrations across
-    /// the affine set (a per-GPU cursor can't spread when each GPU registers once).
+    /// Live registered bytes per NIC, used to balance new registrations across the
+    /// affine set (a per-GPU cursor can't spread when each GPU registers once).
+    /// Bytes rather than a registration count so a fan-out piece weighs only its
+    /// own share of the buffer it came from.
     std::vector<uint64_t> nic_load_;
     /// dev_id -> affine NIC indices, resolved once per GPU.
     std::map<int, std::vector<int>> gpu_affine_nics_;

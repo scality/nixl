@@ -40,13 +40,14 @@ namespace {
 
 constexpr int kDcPort = 1;
 
-/// Handicap (in live registrations) applied to a NIC that is NOT in a GPU's
-/// affine set when picking a rail for a VRAM registration. Affine rails are
-/// preferred while loads are close, but once they run this many registrations
-/// ahead the overflow spills onto the remaining NICs, so no NIC stays idle
-/// under load. 0 would make selection pure global least-loaded (affinity
-/// ignored); larger values prefer the affine rails more strongly.
-constexpr uint64_t kNonAffineHandicap = 2;
+/// Cost multiplier applied to a NIC that is NOT in a GPU's affine set when
+/// picking a rail for a VRAM registration. A non-affine rail has to carry less
+/// than 1/kNonAffineLoadMultiplier of an affine rail's bytes to win, so affine
+/// rails are preferred while loads are close yet the rest still absorb the
+/// overflow once the affine rails run ahead. Multiplicative rather than additive
+/// because the load is a byte count: any fixed offset is either negligible for
+/// large buffers or overwhelming for small ones. 1 would ignore affinity.
+constexpr uint64_t kNonAffineLoadMultiplier = 2;
 
 /// Canonicalize a sysfs symlink to its /sys/devices/... target. Empty on failure.
 std::string
@@ -659,21 +660,28 @@ IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
         return leastLoadedNic(all_nics_);
     }
     // VRAM: prefer the GPU's affine ("best") rails, but never restrict to them.
-    // Rank every NIC by live load, handing the non-affine rails a fixed handicap
-    // (kNonAffineHandicap) so affine rails win while loads are close yet the rest
-    // still absorb the overflow once the affine rails run ahead. A GPU whose
-    // affine set is a 2-NIC NUMA node therefore still reaches the other NUMA's
-    // NICs under load instead of leaving them idle. Least-loaded (not a per-GPU
-    // cursor) so multiple GPUs spread even when each registers one buffer.
+    // Rank every NIC by the bytes it already carries, scaling the non-affine
+    // rails by kNonAffineLoadMultiplier, so a GPU whose affine set is a 2-NIC
+    // NUMA node still reaches the other NUMA's NICs under load instead of
+    // leaving them idle. Least-loaded (not a per-GPU cursor) so multiple GPUs
+    // spread even when each registers one buffer.
     const std::vector<int> &affine = affineNicsFor(dev_id);
     auto cost = [&](int idx) -> uint64_t {
-        const bool is_affine =
-            std::find(affine.begin(), affine.end(), idx) != affine.end();
-        return nic_load_[idx] + (is_affine ? 0 : kNonAffineHandicap);
+        const bool is_affine = std::find(affine.begin(), affine.end(), idx) != affine.end();
+        return nic_load_[idx] * (is_affine ? 1 : kNonAffineLoadMultiplier);
     };
-    int best = all_nics_.front();
-    uint64_t best_cost = cost(best);
+    // Affine rails first, then the rest, and only a strictly lower cost displaces
+    // the incumbent: that way an all-zero load (nothing registered yet) still
+    // picks an affine rail instead of whichever happens to have the lowest index.
+    std::vector<int> candidates = affine;
     for (int idx : all_nics_) {
+        if (std::find(affine.begin(), affine.end(), idx) == affine.end()) {
+            candidates.push_back(idx);
+        }
+    }
+    int best = candidates.front();
+    uint64_t best_cost = cost(best);
+    for (int idx : candidates) {
         const uint64_t c = cost(idx);
         if (c < best_cost) {
             best_cost = c;
@@ -684,24 +692,13 @@ IbverbsDcRdmaTokenClient::selectNicFor(int dev_id) {
 }
 
 std::vector<int>
-IbverbsDcRdmaTokenClient::idleNicsFor(int dev_id) {
-    // mu_ held by caller. Affine rails first so a fan-out that needs fewer pieces
-    // than there are idle rails still prefers the GPU's own; selectNicFor applies
-    // the same preference without restricting to them.
-    const std::vector<int> &affine = affineNicsFor(dev_id);
-    std::vector<int> idle;
-    for (int n : affine) {
-        if (nic_load_[n] == 0) {
-            idle.push_back(n);
-        }
-    }
-    for (int n : all_nics_) {
-        const bool is_affine = std::find(affine.begin(), affine.end(), n) != affine.end();
-        if (!is_affine && nic_load_[n] == 0) {
-            idle.push_back(n);
-        }
-    }
-    return idle;
+IbverbsDcRdmaTokenClient::fanOutNicsFor(int dev_id) {
+    // mu_ held by caller. Every buffer spreads over the GPU's affine rails, so
+    // each rail ends up carrying the same share of every buffer. Deliberately not
+    // widened to the non-affine rails: for host memory affineNicsFor already
+    // returns all of them, and for VRAM crossing NUMA to gain a rail costs more
+    // than the extra rail is worth when the affine ones are equally loaded.
+    return affineNicsFor(dev_id);
 }
 
 bool
@@ -735,7 +732,10 @@ IbverbsDcRdmaTokenClient::registerPiece(
     regions_[reinterpret_cast<uintptr_t>(ptr)] = r;
     // Load accounting lives here, not in the selectors, so it stays correct
     // whether the NIC was chosen by selectNicFor or handed in by a fan-out.
-    nic_load_[nic_idx]++;
+    // Bytes, not registrations: a fan-out piece carries a fraction of its
+    // buffer's traffic, so counting it as a whole registration made every rail
+    // look equally busy after one fanned buffer and suppressed all later fan-out.
+    nic_load_[nic_idx] += size;
     return true;
 }
 
@@ -754,14 +754,14 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
 
     // A single MR binds the whole buffer to one NIC, so every request carved out
-    // of it rides that one rail. That is normally fine: selectNicFor balances
-    // consecutive registrations across rails, so concurrent buffers cover them
-    // all. It degenerates only when too few registrations are live to go round --
-    // the start of a load, or buffers so large that the caller holds just one or
-    // two at a time. Detect that directly and fan this buffer out over the rails
-    // nothing is using, rather than guessing from its size.
-    std::vector<int> idle = idleNicsFor(dev_id);
-    size_t pieces = idle.size();
+    // of it rides that one rail, and balancing whole buffers across rails only
+    // works when their number divides evenly: 4 GPU buffers over the 2 rails of a
+    // NUMA node balance, 3 cannot do better than 2:1, which leaves one rail at
+    // half the throughput of the others. Splitting every buffer across all of its
+    // affine rails removes the quantization: each rail carries the same share of
+    // each buffer regardless of how many buffers are live.
+    std::vector<int> fan = fanOutNicsFor(dev_id);
+    size_t pieces = fan.size();
     if (split_size_ > 0 && pieces > 1) {
         // Never make pieces smaller than a request, or no request could sit
         // inside one and descriptorFor would reject every lookup.
@@ -790,7 +790,7 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     size_t used = 0;
     while (done < size && used < pieces) {
         const size_t len = std::min(piece_len, size - done);
-        if (!registerPiece(reinterpret_cast<void *>(base + done), len, dev_id, idle[used], base)) {
+        if (!registerPiece(reinterpret_cast<void *>(base + done), len, dev_id, fan[used], base)) {
             // Unwind the pieces already registered so the caller sees all-or-nothing.
             releaseRegistration(base);
             return CU_OBJ_FAIL;
@@ -807,7 +807,7 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     }
 
     NIXL_DEBUG << "ibverbs_dc: fanned registration 0x" << std::hex << base << std::dec << " ("
-               << size << " bytes) across " << used << " idle NIC(s), piece_len=" << piece_len
+               << size << " bytes) across " << used << " affine NIC(s), piece_len=" << piece_len
                << ", dev_id=" << dev_id;
     return CU_OBJ_SUCCESS;
 }
@@ -822,9 +822,8 @@ IbverbsDcRdmaTokenClient::releaseRegistration(uintptr_t parent_base) {
         if (it->second.mr) {
             ibv_dereg_mr(it->second.mr);
         }
-        if (nic_load_[it->second.nic_idx] > 0) {
-            nic_load_[it->second.nic_idx]--;
-        }
+        uint64_t &load = nic_load_[it->second.nic_idx];
+        load -= std::min<uint64_t>(load, it->second.len);
         it = regions_.erase(it);
         released++;
     }
@@ -873,10 +872,14 @@ IbverbsDcRdmaTokenClient::logAssignment() {
             NIXL_INFO << "ibverbs_dc:   GPU " << visibleToUserGpu(g.first) << " -> " << line;
         }
     }
+    // Bytes alongside the region count: with every buffer fanned out, region
+    // counts can match while the pieces differ in size, and it is the bytes that
+    // decide whether the rails are actually balanced.
     std::string totals;
     for (size_t i = 0; i < nics_.size(); ++i) {
         totals += (totals.empty() ? "" : " ") + nics_[i].dev_name + ":" +
-                  std::to_string(per_nic[i]);
+                  std::to_string(per_nic[i]) + "(" +
+                  std::to_string(nic_load_[i] / (1024 * 1024)) + " MiB)";
     }
     NIXL_INFO << "ibverbs_dc:   per-NIC totals: " << totals;
 }
