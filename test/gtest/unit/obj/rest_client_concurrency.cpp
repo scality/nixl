@@ -195,6 +195,15 @@ makeRestParams(const std::string &endpoint, const std::string &num_threads) {
     return {{"endpoint_override", endpoint}, {"num_threads", num_threads}};
 }
 
+static nixl_b_params_t
+makeCappedRestParams(const std::string &endpoint,
+                     const std::string &num_threads,
+                     const std::string &max_inflight) {
+    return {{"endpoint_override", endpoint},
+            {"num_threads", num_threads},
+            {"max_inflight", max_inflight}};
+}
+
 class RestClientConcurrencyTest : public testing::Test {};
 
 // Many requests are in flight at once even though the client has a single poller
@@ -242,6 +251,93 @@ TEST_F(RestClientConcurrencyTest, ManyConcurrentInFlightExceedThreadCount) {
     }
     EXPECT_EQ(done.load(), kN) << "not all callbacks fired";
     EXPECT_EQ(ok.load(), kN) << "some requests did not succeed";
+}
+
+// max_inflight bounds simultaneously-running requests. Excess requests wait in
+// the pending queue and start as slots free, so all of them still complete.
+TEST_F(RestClientConcurrencyTest, MaxInflightCapsConcurrentConnections) {
+    constexpr int kN = 16;
+    constexpr int kCap = 4;
+
+    HoldingTcpServer server;
+    nixl_b_params_t params = makeCappedRestParams(
+        "http://127.0.0.1:" + std::to_string(server.port()), "2", std::to_string(kCap));
+    RestClient client(&params);
+
+    std::vector<char> buf(1024);
+    std::atomic<int> done{0};
+    std::atomic<int> ok{0};
+
+    for (int i = 0; i < kN; i++) {
+        client.getObjectRdmaAsync("key" + std::to_string(i),
+                                  reinterpret_cast<uintptr_t>(buf.data()),
+                                  buf.size(),
+                                  0,
+                                  "rdma-token",
+                                  [&](bool success) {
+                                      if (success) {
+                                          ok.fetch_add(1);
+                                      }
+                                      done.fetch_add(1);
+                                  });
+    }
+
+    // The cap should be reached but never exceeded. Give any surplus request time
+    // to arrive so the upper-bound assertion is meaningful rather than racy.
+    EXPECT_TRUE(server.waitUntilHeld(kCap))
+        << "never reached the cap; only " << server.maxConcurrent() << " concurrent";
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_LE(server.maxConcurrent(), kCap)
+        << "exceeded max_inflight=" << kCap << " with " << server.maxConcurrent();
+
+    // Releasing lets the held requests finish, which frees slots for the queued
+    // remainder; every request must eventually complete.
+    server.release();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (done.load() < kN && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(done.load(), kN) << "queued requests never ran";
+    EXPECT_EQ(ok.load(), kN) << "some requests did not succeed";
+    EXPECT_LE(server.maxConcurrent(), kCap) << "cap was exceeded while draining";
+}
+
+// Teardown must also fail requests that are still waiting for an in-flight slot,
+// not just the ones already running.
+TEST_F(RestClientConcurrencyTest, TeardownWithPendingRequestsFiresAllCallbacks) {
+    constexpr int kN = 16;
+    constexpr int kCap = 2;
+
+    HoldingTcpServer server; // never released → the running requests stay stuck
+    nixl_b_params_t params = makeCappedRestParams(
+        "http://127.0.0.1:" + std::to_string(server.port()), "2", std::to_string(kCap));
+
+    std::vector<char> buf(1024);
+    std::atomic<int> done{0};
+    std::atomic<int> ok{0};
+
+    {
+        RestClient client(&params);
+        for (int i = 0; i < kN; i++) {
+            client.getObjectRdmaAsync("key" + std::to_string(i),
+                                      reinterpret_cast<uintptr_t>(buf.data()),
+                                      buf.size(),
+                                      0,
+                                      "rdma-token",
+                                      [&](bool success) {
+                                          if (success) {
+                                              ok.fetch_add(1);
+                                          }
+                                          done.fetch_add(1);
+                                      });
+        }
+        // kCap requests are running; the other kN - kCap sit in pending_.
+        ASSERT_TRUE(server.waitUntilHeld(kCap)) << "no request reached the server";
+    }
+
+    EXPECT_EQ(done.load(), kN) << "pending requests were dropped without a callback";
+    EXPECT_EQ(ok.load(), 0) << "aborted requests should report failure";
 }
 
 // Destroying the client while requests are stuck in flight must return promptly
