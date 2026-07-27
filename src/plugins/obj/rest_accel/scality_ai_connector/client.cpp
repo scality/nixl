@@ -255,6 +255,13 @@ RestClient::RestClient(nixl_b_params_t *custom_params)
     if (!multi_) {
         throw std::runtime_error("RestClient: curl_multi_init failed");
     }
+    // Left unset, libcurl sizes the connection cache from the number of easy
+    // handles currently added to the multi. Handles are removed as soon as they
+    // complete, so that count tracks in-flight requests, not the connections
+    // worth keeping warm, and a new transfer evicts an idle keep-alive socket to
+    // make room. The eviction is a client-side close, which is what burns
+    // ephemeral ports. Size the cache to the in-flight cap instead.
+    curl_multi_setopt(multi_, CURLMOPT_MAXCONNECTS, static_cast<long>(easyCacheCap_));
     poller_ = std::thread(&RestClient::pollerLoop, this);
 
     NIXL_INFO << absl::StrFormat(
