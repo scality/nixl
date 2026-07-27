@@ -32,6 +32,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 #include "obj_backend.h"
 #include "nixl_types.h"
 
@@ -152,6 +153,16 @@ private:
     // the fd blow-up. 0 disables the cap.
     std::size_t maxInflight_;
 
+    // Idle easy handles kept for reuse. curl_easy_cleanup() drops the handle's
+    // live connection, so a handle-per-request pattern forces a fresh TCP
+    // connect every time and exhausts the client's ephemeral port range under
+    // load. curl_easy_reset() clears the options but keeps the connection, so
+    // recycling handles restores keepalive. Capped so a large submitted batch
+    // cannot leave thousands of idle connections parked here.
+    std::mutex easyMtx_;
+    std::vector<CURL *> easyCache_;
+    std::size_t easyCacheCap_;
+
     CURLM *multi_ = nullptr;
     std::thread poller_;
     std::mutex queueMtx_;
@@ -166,6 +177,10 @@ private:
     // simply never supplied enough work. Poller-thread only, so no locking.
     std::size_t peakInflight_ = 0;
     std::size_t peakPending_ = 0;
+    // Connection-reuse accounting, logged at teardown: new_connections well
+    // below requests means the handle cache is doing its job. Poller-thread only.
+    std::size_t totalRequests_ = 0;
+    std::size_t newConnects_ = 0;
 
     /**
      * Build the full URL for a given key.
@@ -196,6 +211,15 @@ private:
     /// Apply URL + method-specific curl options to a request's easy handle.
     static void
     buildEasy(RequestCtx *ctx);
+
+    /// Take an idle handle from easyCache_, or create one. Any thread.
+    CURL *
+    acquireEasy();
+
+    /// Reset a finished handle and return it to easyCache_, cleaning it up if the
+    /// cache is full. The handle must already be removed from multi_. Any thread.
+    void
+    releaseEasy(CURL *easy);
 
     /// Push a fully-built request onto the queue and wake the poller.
     void
