@@ -75,6 +75,7 @@ if cuobj_dep.found()
             'rest_accel/scality_ai_connector/engine_impl.cpp',
             'rest_accel/scality_ai_connector/engine_impl.h',
             'rest_accel/scality_ai_connector/rdma_ctx.h',
+            'rest_accel/scality_ai_connector/split.h',
             'rest_accel/scality_ai_connector/cufile_nics.h',
             'rest_accel/scality_ai_connector/rdma_token_client.h',
             'rest_accel/scality_ai_connector/cuobj_rdma_token_client.cpp',
