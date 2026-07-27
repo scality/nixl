@@ -86,8 +86,13 @@ public:
     checkObjectExistsAsync(std::string_view key, check_object_callback_t callback) = 0;
 };
 
-/// Default cap on concurrently-running requests. Sized to stay clear of a
-/// typical 1024 RLIMIT_NOFILE while leaving fds for sockets, plugins and files.
+/// Upper bound on the default cap for concurrently-running requests.
+///
+/// Not used as-is: every running request holds a connection and therefore a file
+/// descriptor, so the default is also clamped to a share of RLIMIT_NOFILE (see
+/// defaultMaxInflight). This value alone assumed the rest of the process would
+/// stay under the other half of a 1024 limit, which a caller with many threads
+/// and registrations does not -- one was measured at 639 on its own.
 constexpr std::size_t kDefaultMaxInflight = 512;
 
 /**
@@ -105,7 +110,11 @@ public:
      *                      Optional "num_threads" sizes the callback worker pool
      *                      (default: max(2, hardware_concurrency / 4)).
      *                      Optional "max_inflight" caps concurrently-running
-     *                      requests (default: kDefaultMaxInflight, "0" = unlimited).
+     *                      requests ("0" = unlimited). Left unset it defaults to
+     *                      min(kDefaultMaxInflight, RLIMIT_NOFILE / 4), since each
+     *                      running request holds a descriptor. An explicit value is
+     *                      honoured as given and only warned about if it will not
+     *                      fit.
      */
     explicit RestClient(nixl_b_params_t *custom_params);
 
