@@ -96,14 +96,27 @@ public:
 
 private:
     /// Token client for a given segment type: DRAM and VRAM both use the
-    /// ibverbs DC client (multi-NIC, GPU/NIC-affinity aware); OBJ falls back to
-    /// cuClient_. hostClient_ is built lazily on the first DRAM/VRAM
+    /// ibverbs DC client (multi-NIC, GPU/NIC-affinity aware); anything else falls
+    /// back to cuClient_. hostClient_ is built lazily on the first DRAM/VRAM
     /// registration, so this returns the ibverbs client only once it exists.
+    ///
+    /// prepXfer only ever asks about the local segment, which is DRAM or VRAM, so
+    /// in practice the fallback is not taken and cuClient_ is never built.
     const std::shared_ptr<iRdmaTokenClient> &
     clientFor(const nixl_mem_t &nixl_mem) const {
-        return ((nixl_mem == DRAM_SEG || nixl_mem == VRAM_SEG) && hostClient_) ? hostClient_
-                                                                               : cuClient_;
+        if ((nixl_mem == DRAM_SEG || nixl_mem == VRAM_SEG) && hostClient_) {
+            return hostClient_;
+        }
+        return ensureCuClient();
     }
+
+    /// Build the cuObject DC client on first use and return it.
+    ///
+    /// Deferred because construction costs around 1.4 seconds and nothing on the
+    /// DRAM/VRAM data path needs it. A connect failure is not fatal: the caller
+    /// checks isConnected() and fails that one transfer.
+    const std::shared_ptr<iRdmaTokenClient> &
+    ensureCuClient() const;
 
     /// Build the ibverbs DC client (once) from the resolved NIC list. Returns
     /// NIXL_ERR_BACKEND if no NICs were resolved or the client fails to connect.
@@ -114,7 +127,9 @@ private:
     std::unordered_map<uint64_t, std::string> devIdToObjKey_;
     /// RDMA token client (DC via cuObjClient); retained for OBJ only, no longer
     /// on the DRAM/VRAM data path (kept until a follow-up removal cleanup).
-    std::shared_ptr<iRdmaTokenClient> cuClient_;
+    /// Mutable so clientFor(), which is const, can build it on first use.
+    mutable std::shared_ptr<iRdmaTokenClient> cuClient_;
+    mutable std::mutex cuClientMu_;
     /// libibverbs DC token client for DRAM/VRAM multi-NIC spreading (lazy).
     std::shared_ptr<iRdmaTokenClient> hostClient_;
     std::mutex hostClientMu_;

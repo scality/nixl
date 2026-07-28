@@ -336,15 +336,12 @@ ScalityObjEngineImpl::ScalityObjEngineImpl(const nixlBackendInitParams *init_par
 
     NIXL_INFO << "Object storage backend initialized with Scality AI Connector RDMA client";
 
-    // DC transport via NVIDIA cuObject (CUOBJ_PROTO_RDMA_DC_V1).
-    cuClient_ = std::make_shared<CuObjRdmaTokenClient>(scality_ops);
-
-    if (!cuClient_ || !cuClient_->isConnected()) {
-        // cuObject is no longer on the DRAM/VRAM data path (both use the ibverbs
-        // DC client) and OBJ_SEG needs no RDMA client, so a cuObject connect
-        // failure is not fatal here.
-        NIXL_WARN << "cuObject client not connected; DRAM/VRAM use the ibverbs DC client.";
-    }
+    // cuClient_ is deliberately NOT built here. Constructing it costs ~1.4s -- on a
+    // 6s model load that is a quarter of the whole thing -- and nothing on the data
+    // path uses it: clientFor() hands back the ibverbs DC client for DRAM and VRAM,
+    // and prepXfer only ever asks about the local segment, which is one of those
+    // two. It remains as the fallback for any other segment type, built on first
+    // use by ensureCuClient().
 
     // DRAM transfers route through an in-process libibverbs DC client that
     // spreads host registrations across NICs (cuObject pins host memory to a
@@ -385,6 +382,24 @@ ScalityObjEngineImpl::ScalityObjEngineImpl(const nixlBackendInitParams *init_par
     }
     NIXL_INFO << "Object request split_size="
               << (splitSize_ == 0 ? std::string("disabled") : std::to_string(splitSize_));
+}
+
+const std::shared_ptr<iRdmaTokenClient> &
+ScalityObjEngineImpl::ensureCuClient() const {
+    std::lock_guard<std::mutex> lk(cuClientMu_);
+    if (cuClient_) {
+        return cuClient_;
+    }
+    // DC transport via NVIDIA cuObject (CUOBJ_PROTO_RDMA_DC_V1).
+    NIXL_INFO << "Building the cuObject DC client on first use "
+                 "(not needed for DRAM/VRAM transfers)";
+    cuClient_ = std::make_shared<CuObjRdmaTokenClient>(scality_ops);
+    if (!cuClient_->isConnected()) {
+        // Not fatal here: OBJ_SEG needs no RDMA client and DRAM/VRAM use the
+        // ibverbs DC client, so only a transfer that actually needs this one fails.
+        NIXL_WARN << "cuObject client not connected; DRAM/VRAM use the ibverbs DC client.";
+    }
+    return cuClient_;
 }
 
 nixl_status_t
