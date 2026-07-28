@@ -536,18 +536,32 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
         // wire granularity. The token client resolves each sub-range against the
         // registration containing it and picks a NIC per request, so splitting is
         // also what spreads one buffer's traffic across the rails.
+        //
+        // Boundaries are aligned to multiples of split_size in the object's own
+        // offset space rather than to the descriptor's start, so the head request
+        // is short and everything after it sits on a boundary. Splitting relatively
+        // would inherit the caller's alignment, and a caller reading tensors out of
+        // a safetensors blob starts at 8 + header_size + tensor_offset: every
+        // request would be skewed by the same arbitrary amount, so a read that
+        // should cover one backend stripe covers two.
         const size_t total = local[i].len;
+        const size_t base = remote[i].addr;
         // WRITE is never split: the endpoint accepts whole-object writes only and
         // answers a second write of the same key with 409 "cannot overwrite", so a
         // split descriptor would send N colliding PUTs.
         const bool splittable = (operation != NIXL_WRITE) && (splitSize_ != 0);
-        const size_t step = splittable ? splitSize_ : total;
-        const size_t nreq = splittable ? objRequestCount(total, splitSize_) : 1;
-        for (size_t r = 0; r < nreq; ++r) {
-            const size_t off = r * step;
-            const size_t len = std::min(step, total - off);
+        size_t off = 0;
+        do {
+            size_t len = total - off;
+            if (splittable) {
+                // Bytes from here to the next split_size boundary in the object.
+                const size_t to_boundary = splitSize_ - ((base + off) % splitSize_);
+                if (to_boundary < len) {
+                    len = to_boundary;
+                }
+            }
             scalityObjTransferRequestH req(
-                local[i].addr + off, len, remote[i].addr + off);
+                local[i].addr + off, len, base + off);
             req.obj_key = obj_key_search->second;
 
             if (operation == NIXL_WRITE) {
@@ -575,7 +589,10 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
                 req.rdma_desc.size());
 
             req_h->reqs_.push_back(std::move(req));
-        }
+            off += len;
+            // A zero-length descriptor yields exactly one empty request, so the
+            // loop must be exit-tested rather than entry-tested.
+        } while (off < total);
     }
 
     handle = req_h.release();

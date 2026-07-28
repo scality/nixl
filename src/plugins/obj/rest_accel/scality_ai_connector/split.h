@@ -42,18 +42,28 @@
 /// 8-GPU VRAM READ at this granularity reached 360 of 400 Gb/s.
 constexpr size_t kDefaultSplitSize = 8 * 1024 * 1024;
 
-/// How many ranged requests a descriptor of `total` bytes becomes.
+/// How many ranged requests a descriptor covering `total` bytes from absolute
+/// object offset `offset` becomes.
 ///
-/// Always at least 1: a zero-length descriptor still yields one empty request,
-/// matching the behaviour before splitting existed. `split_size` 0 disables
-/// splitting, giving one request whatever the size. Request r then covers
-/// [r * split_size, min((r + 1) * split_size, total)).
+/// Boundaries land on multiples of split_size in the OBJECT's offset space, not
+/// relative to the descriptor's own start. Splitting relatively would inherit
+/// whatever alignment the caller's descriptor happens to have, and a caller
+/// reading tensors out of a safetensors blob starts at 8 + header_size +
+/// tensor_offset -- an arbitrary offset, so every request is skewed by the same
+/// arbitrary amount and a read that would have covered one backend stripe covers
+/// two instead. Aligning costs one extra short request at the head of each
+/// descriptor and puts every request after it on a boundary.
+///
+/// Always at least 1, so a zero-length descriptor still yields one empty request
+/// as it did before splitting existed. `split_size` 0 disables splitting.
 constexpr size_t
-objRequestCount(size_t total, size_t split_size) {
+objRequestCount(size_t offset, size_t total, size_t split_size) {
     if (split_size == 0 || total == 0) {
         return 1;
     }
-    return (total + split_size - 1) / split_size;
+    const size_t to_boundary = split_size - (offset % split_size);
+    const size_t first = (total < to_boundary) ? total : to_boundary;
+    return 1 + (total - first + split_size - 1) / split_size;
 }
 
 #endif // NIXL_SRC_PLUGINS_OBJ_REST_ACCEL_SCALITY_AI_CONNECTOR_SPLIT_H
