@@ -182,6 +182,7 @@ private:
     // a reused pool once would cost rails-per-pool. Guarded by mu_.
     std::size_t reg_calls_ = 0;
     std::size_t reg_rails_ = 0;
+    std::size_t reg_bytes_ = 0;
     std::size_t reg_us_ = 0;
     std::size_t dereg_us_ = 0;
     mutable std::mutex mu_;
