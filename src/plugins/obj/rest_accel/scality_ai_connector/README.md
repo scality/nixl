@@ -91,6 +91,9 @@ The engine is selected and configured through the backend's `customParams`:
 | `num_threads` | no | `max(2, cpu_threads / 4)` | Size of the callback worker pool (see [Concurrency model](#concurrency-model)). |
 | `rdma_nics` | no | from `cufile.json` | NIC list for DRAM transfers (see [Multi-NIC DRAM](#multi-nic-dram)): comma-separated IPv4 addresses or device names, e.g. `10.10.40.208,10.10.48.208` or `mlx5_1,mlx5_2`. Empty falls back to `cufile.json` `rdma_dev_addr_list`. |
 | `rdma_dc_key` | no | from `cufile.json`, else `0xffeeddcc` | DC access key (hex) the server's DCI side must present, for DRAM transfers. Empty falls back to `cufile.json` `rdma_dc_key`. |
+| `max_inflight` | no | `min(512, RLIMIT_NOFILE / 4)` | Cap on requests running at once. Each holds a connection and therefore a descriptor, so the default is clamped to a share of `RLIMIT_NOFILE`; excess requests queue and start as slots free. `0` disables the cap. |
+| `split_size` | no | `8388608` (8 MiB) | Bytes per object request. A transfer descriptor of any size is cut into requests of at most this, on boundaries aligned in the object's own offset space. `0` disables splitting. |
+| `dram_rdma` | no | `true` | Whether DRAM transfers use RDMA. `false` makes DRAM reads plain HTTP with nothing pinned: no MR, and no NIC list needed at all. For callers whose host buffers hold metadata, where an `ibv_reg_mr` per rail costs more than the read itself. Reads only. VRAM is unaffected. |
 
 Requests are issued to `{endpoint_override}/{object_id}`.
 
