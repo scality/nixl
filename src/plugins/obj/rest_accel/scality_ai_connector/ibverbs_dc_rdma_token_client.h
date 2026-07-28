@@ -175,6 +175,15 @@ private:
     /// Only relevant under `trust dscp`. 0 = default lane; overridable via
     /// UCX_IB_TRAFFIC_CLASS, shared with the UCX backend.
     uint8_t traffic_class_ = 0;
+    // Registration cost, reported with the rail summary. Pinning GPU pages for RDMA
+    // is not free and a caller that registers per transfer pays it on the critical
+    // path, so this says whether the MR count is worth attacking: a loader doing one
+    // transfer per tensor group registers rails-per-group times, where registering
+    // a reused pool once would cost rails-per-pool. Guarded by mu_.
+    std::size_t reg_calls_ = 0;
+    std::size_t reg_rails_ = 0;
+    std::size_t reg_us_ = 0;
+    std::size_t dereg_us_ = 0;
     mutable std::mutex mu_;
     /// base address -> buffer, ordered so a sub-address can be found by range.
     std::map<uintptr_t, Buffer> buffers_;

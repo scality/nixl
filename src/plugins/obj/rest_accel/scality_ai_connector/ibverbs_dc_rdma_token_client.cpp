@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -686,6 +687,7 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
         return CU_OBJ_FAIL;
     }
 
+    const auto reg_start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(mu_);
 
     // One MR per rail, each covering the whole buffer. A descriptor carries the
@@ -716,11 +718,17 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
                << std::dec << " (" << size << " bytes, dev_id=" << dev_id << ") on "
                << buf.rails.size() << " rail(s)";
     buffers_[reinterpret_cast<uintptr_t>(ptr)] = std::move(buf);
+    reg_calls_++;
+    reg_rails_ += buf.rails.size();
+    reg_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - reg_start)
+                   .count();
     return CU_OBJ_SUCCESS;
 }
 
 cuObjErr_t
 IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
+    const auto dereg_start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(mu_);
     auto it = buffers_.find(reinterpret_cast<uintptr_t>(ptr));
     if (it == buffers_.end()) {
@@ -733,6 +741,9 @@ IbverbsDcRdmaTokenClient::cuMemObjPutDescriptor(void *ptr) {
         }
     }
     buffers_.erase(it);
+    dereg_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - dereg_start)
+                     .count();
     return CU_OBJ_SUCCESS;
 }
 
@@ -789,6 +800,13 @@ IbverbsDcRdmaTokenClient::logRequestSpread(bool detailed) {
     }
     NIXL_INFO << "ibverbs_dc: " << total << " request(s), " << (100 * cross_numa_ / total)
               << "% off the owning GPU's NUMA node: " << per_nic;
+    if (reg_calls_ > 0) {
+        NIXL_INFO << "ibverbs_dc: " << reg_calls_ << " registration(s) -> " << reg_rails_
+                  << " MR(s), " << (reg_us_ / 1000) << "ms registering + " << (dereg_us_ / 1000)
+                  << "ms releasing, " << ((reg_us_ + dereg_us_) / reg_calls_)
+                  << "us per registration. A caller that registers per transfer pays this on "
+                     "the critical path; registering a reused pool once would not.";
+    }
     if (!detailed) {
         return;
     }
