@@ -717,9 +717,11 @@ IbverbsDcRdmaTokenClient::cuMemObjGetDescriptor(void *ptr, size_t size, int dev_
     NIXL_DEBUG << "ibverbs_dc: registered 0x" << std::hex << reinterpret_cast<uintptr_t>(ptr)
                << std::dec << " (" << size << " bytes, dev_id=" << dev_id << ") on "
                << buf.rails.size() << " rail(s)";
-    buffers_[reinterpret_cast<uintptr_t>(ptr)] = std::move(buf);
+    // Counted before the move; reading buf.rails afterwards yields 0.
     reg_calls_++;
     reg_rails_ += buf.rails.size();
+    reg_bytes_ += size;
+    buffers_[reinterpret_cast<uintptr_t>(ptr)] = std::move(buf);
     reg_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::steady_clock::now() - reg_start)
                    .count();
@@ -802,10 +804,12 @@ IbverbsDcRdmaTokenClient::logRequestSpread(bool detailed) {
               << "% off the owning GPU's NUMA node: " << per_nic;
     if (reg_calls_ > 0) {
         NIXL_INFO << "ibverbs_dc: " << reg_calls_ << " registration(s) -> " << reg_rails_
-                  << " MR(s), " << (reg_us_ / 1000) << "ms registering + " << (dereg_us_ / 1000)
-                  << "ms releasing, " << ((reg_us_ + dereg_us_) / reg_calls_)
-                  << "us per registration. A caller that registers per transfer pays this on "
-                     "the critical path; registering a reused pool once would not.";
+                  << " MR(s) over " << (reg_bytes_ >> 20) << " MiB, " << (reg_us_ / 1000)
+                  << "ms registering + " << (dereg_us_ / 1000) << "ms releasing, "
+                  << ((reg_us_ + dereg_us_) / reg_calls_) << "us per registration ("
+                  << ((reg_us_ + dereg_us_) / (reg_rails_ ? reg_rails_ : 1)) << "us per MR)."
+                  << " A caller that registers per transfer pays this on the critical path;"
+                     " registering a reused pool once would not.";
     }
     if (!detailed) {
         return;
