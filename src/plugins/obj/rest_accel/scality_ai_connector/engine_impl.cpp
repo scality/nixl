@@ -189,6 +189,9 @@ public:
     std::string rdma_desc;
     std::string obj_key;
     rdma_ctx_t ctx;
+    /// Read the object into addr over plain HTTP rather than RDMA; rdma_desc is
+    /// empty and no token was taken. Set by prepXfer, honoured by postXfer.
+    bool host_body = false;
 
     scalityObjTransferRequestH() : addr(0), size(0), offset(0), rdma_desc(""), obj_key("") {}
 
@@ -380,8 +383,19 @@ ScalityObjEngineImpl::ScalityObjEngineImpl(const nixlBackendInitParams *init_par
             NIXL_WARN << "Ignoring non-numeric split_size: " << split;
         }
     }
+    const std::string dram_rdma = paramOr(params, "dram_rdma", "");
+    if (!dram_rdma.empty()) {
+        if (dram_rdma == "false" || dram_rdma == "0") {
+            dramRdma_ = false;
+        } else if (dram_rdma == "true" || dram_rdma == "1") {
+            dramRdma_ = true;
+        } else {
+            NIXL_WARN << "Ignoring non-boolean dram_rdma: " << dram_rdma;
+        }
+    }
     NIXL_INFO << "Object request split_size="
-              << (splitSize_ == 0 ? std::string("disabled") : std::to_string(splitSize_));
+              << (splitSize_ == 0 ? std::string("disabled") : std::to_string(splitSize_))
+              << ", DRAM transfers use " << (dramRdma_ ? "RDMA" : "plain HTTP (nothing pinned)");
 }
 
 const std::shared_ptr<iRdmaTokenClient> &
@@ -450,6 +464,18 @@ ScalityObjEngineImpl::registerMem(const nixlBlobDesc &mem,
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
+        // With RDMA off for DRAM there is nothing to pin: the transfer will read the
+        // object into this buffer over HTTP. Returning before ensureHostClient() is
+        // the point -- a caller reading only metadata then needs no NIC list at all.
+        if ((nixl_mem == DRAM_SEG) && !dramRdma_) {
+            NIXL_DEBUG << absl::StrFormat(
+                "registerMem: addr=0x%016x, len=%zu, DRAM without RDMA, no MR pinned",
+                mem.addr,
+                mem.len);
+            out = new nixlScalityObjMetadata(nixl_mem, mem.addr, mem.devId);
+            return NIXL_SUCCESS;
+        }
+
         // DRAM and VRAM both use the ibverbs DC client (multi-NIC, GPU/NIC
         // affinity for VRAM); build it on first use.
         nixl_status_t st = ensureHostClient();
@@ -499,6 +525,11 @@ ScalityObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
         } else if ((md->nixlMem == DRAM_SEG) || (md->nixlMem == VRAM_SEG)) {
             std::unique_ptr<nixlScalityObjMetadata> mem_md_ptr =
                 std::unique_ptr<nixlScalityObjMetadata>(md);
+            // Nothing was pinned, so there is nothing to release. Asking the token
+            // client would also build it purely to be told it has no such buffer.
+            if ((mem_md_ptr->nixlMem == DRAM_SEG) && !dramRdma_) {
+                return NIXL_SUCCESS;
+            }
             std::optional<CudaDeviceGuard> dev_guard;
             if (mem_md_ptr->nixlMem == VRAM_SEG) {
                 dev_guard.emplace((int)mem_md_ptr->devId);
@@ -530,12 +561,26 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
 
     auto req_h = std::make_unique<nixlScalityObjBackendReqH>();
 
+    // A DRAM transfer with RDMA off carries no tokens at all, so it must not require
+    // a token client: with nothing ever registered for RDMA there is no fabric to
+    // connect to, and demanding one here would fail a metadata read on a host that
+    // has no NICs configured.
+    const bool host_body = (local.getType() == DRAM_SEG) && !dramRdma_;
+    if (host_body && (operation == NIXL_WRITE)) {
+        NIXL_ERROR << "dram_rdma=false supports reads only; there is no plain-HTTP upload path. "
+                      "Set dram_rdma=true to write from DRAM.";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
     // Local buffers of one transfer share a segment type, so the token client is
     // chosen once: DRAM/VRAM via the ibverbs DC client, OBJ via cuObject.
-    const std::shared_ptr<iRdmaTokenClient> &tokenClient = clientFor(local.getType());
-    if (!tokenClient || !tokenClient->isConnected()) {
-        NIXL_ERROR << "RDMA token client is not connected.";
-        return NIXL_ERR_BACKEND;
+    std::shared_ptr<iRdmaTokenClient> tokenClient;
+    if (!host_body) {
+        tokenClient = clientFor(local.getType());
+        if (!tokenClient || !tokenClient->isConnected()) {
+            NIXL_ERROR << "RDMA token client is not connected.";
+            return NIXL_ERR_BACKEND;
+        }
     }
 
     for (int i = 0; i < local.descCount(); ++i) {
@@ -564,7 +609,12 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
         // WRITE is never split: the endpoint accepts whole-object writes only and
         // answers a second write of the same key with 409 "cannot overwrite", so a
         // split descriptor would send N colliding PUTs.
-        const bool splittable = (operation != NIXL_WRITE) && (splitSize_ != 0);
+        //
+        // A body read is never split either. Splitting exists to size RDMA requests
+        // and spread them over the rails, and this path has neither; cutting a
+        // metadata read into pieces would only multiply HTTP round trips.
+        const bool splittable =
+            (operation != NIXL_WRITE) && (splitSize_ != 0) && !host_body;
         size_t off = 0;
         do {
             size_t len = total - off;
@@ -579,7 +629,10 @@ ScalityObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
                 local[i].addr + off, len, base + off);
             req.obj_key = obj_key_search->second;
 
-            if (operation == NIXL_WRITE) {
+            if (host_body) {
+                // No token: postXfer reads the body straight into req.addr.
+                req.host_body = true;
+            } else if (operation == NIXL_WRITE) {
                 ssize_t cuda_status =
                     tokenClient->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
                 if (cuda_status < 0) {
@@ -632,7 +685,16 @@ ScalityObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
         auto status_promise = std::make_shared<std::promise<nixl_status_t>>();
         req_h->statusFutures_.push_back(status_promise->get_future());
 
-        if (operation == NIXL_WRITE) {
+        if (req.host_body) {
+            connectorClient_->getObjectBodyAsync(req.obj_key,
+                                                 (void *)req.addr,
+                                                 req.size,
+                                                 req.offset,
+                                                 [status_promise](bool success) {
+                                                     status_promise->set_value(
+                                                         success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
+                                                 });
+        } else if (operation == NIXL_WRITE) {
             connectorClient_->putObjectRdmaAsync(req.obj_key,
                                                  req.addr,
                                                  req.size,

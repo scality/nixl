@@ -144,6 +144,21 @@ private:
     /// per descriptor, whatever its size). Resolved from customParams
     /// 'split_size' at construction.
     size_t splitSize_ = kDefaultSplitSize;
+    /// Whether host (DRAM) transfers use RDMA. True by default. Set false via the
+    /// 'dram_rdma' parameter and DRAM pins nothing: registerMem creates no MR and
+    /// needs no NIC list, and transfers read the object over plain HTTP straight
+    /// into the caller's buffer.
+    ///
+    /// Registration cost tracks the number of memory regions, not their size: an
+    /// ibv_reg_mr costs about 1 ms and its ibv_dereg_mr about 0.65 ms whatever the
+    /// length, and a buffer is registered on every rail. An 8-byte metadata read
+    /// therefore costs several ms of pinning to move 8 bytes, which HTTP does not.
+    ///
+    /// Scoped to this backend instance and to DRAM, so VRAM transfers are
+    /// unaffected -- but it is not per-buffer, since the backend's registerMem
+    /// takes no per-call parameters. A caller that also moves bulk data through
+    /// DRAM on the same backend would get HTTP for that too.
+    bool dramRdma_ = true;
     /// Scality AI Connector HTTP client with RDMA support
     std::shared_ptr<iRestClient> connectorClient_;
 };
