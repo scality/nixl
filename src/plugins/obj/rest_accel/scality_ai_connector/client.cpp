@@ -41,6 +41,34 @@ captureBody(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return size * nmemb;
 }
 
+/// Destination of a plain-HTTP body read: the caller's buffer and its capacity.
+struct BodySink {
+    char *dst = nullptr;
+    size_t cap = 0;
+    size_t len = 0;      ///< bytes written so far
+    bool overflow = false;
+};
+
+/// Write callback for a body read, bounded by the caller's capacity.
+///
+/// The bound is load-bearing, not defensive. A server that ignores the Range header
+/// answers an 8-byte request with the whole object, which here would be a multi-GB
+/// shard arriving into an 8-byte buffer. Returning short of what libcurl offered
+/// aborts the transfer with CURLE_WRITE_ERROR, so that fails loudly instead of
+/// writing past the buffer.
+size_t
+writeToSink(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    auto *sink = static_cast<BodySink *>(userdata);
+    const size_t n = size * nmemb;
+    if (n > sink->cap - sink->len) {
+        sink->overflow = true;
+        return 0;
+    }
+    std::memcpy(sink->dst + sink->len, ptr, n);
+    sink->len += n;
+    return n;
+}
+
 std::once_flag curl_init_flag;
 
 /// Extra attempts allowed after a connection-level failure.
@@ -218,6 +246,9 @@ struct RestClient::RequestCtx {
     int attempts = 0; // retries already spent on a connection-level failure
     std::function<void(bool)> bool_cb; // Put/Get
     std::function<void(std::optional<bool>)> check_cb; // Head
+    /// Set only for a plain-HTTP body read. dst==nullptr means the body is error
+    /// text bound for response_body, as it is for every RDMA and HEAD request.
+    BodySink body_sink;
     /// libcurl's own description of the failure. Needed because CURLINFO_OS_ERRNO
     /// is only populated on some paths -- a connect that failed on socket() with
     /// EMFILE and one the peer refused can both arrive with errno unset -- whereas
@@ -264,8 +295,13 @@ RestClient::buildEasy(RequestCtx *ctx) {
     if (ctx->headers) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, ctx->headers);
     }
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, captureBody);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx->response_body);
+    if (ctx->body_sink.dst != nullptr) {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeToSink);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx->body_sink);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, captureBody);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx->response_body);
+    }
     curl_easy_setopt(curl, CURLOPT_PRIVATE, ctx);
     // Bound the control-plane request so a stalled endpoint can't leave a
     // transfer in-flight forever (the body is empty; bulk data is on RDMA).
@@ -349,6 +385,33 @@ RestClient::finishRequest(RequestCtx *ctx, CURLcode res, long http_code) {
         });
     } else {
         bool success = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
+        // A body read that returned fewer bytes than asked for is not an error: a
+        // speculative range reaching past the end of the object is answered as a
+        // complete 206 with a smaller Content-Length, and the caller wants those
+        // bytes. The two real faults are covered elsewhere and stay covered -- a
+        // body cut short against its own declared length is CURLE_PARTIAL_FILE,
+        // which the res check above already fails, and an over-long one trips the
+        // write bound. Status is not a test either: a ranged GET may answer 200 when
+        // the range spans the whole object.
+        if (ctx->body_sink.dst != nullptr) {
+            if (ctx->body_sink.overflow) {
+                NIXL_ERROR << absl::StrFormat(
+                    "%s: response exceeds the %zu-byte request for %s (http_code=%ld); the "
+                    "endpoint appears to have ignored the Range header",
+                    ctx->op_name,
+                    ctx->body_sink.cap,
+                    ctx->url,
+                    http_code);
+                success = false;
+            } else if (success && ctx->body_sink.len < ctx->body_sink.cap) {
+                NIXL_DEBUG << absl::StrFormat("%s: object ended after %zu of %zu requested bytes "
+                                              "for %s",
+                                              ctx->op_name,
+                                              ctx->body_sink.len,
+                                              ctx->body_sink.cap,
+                                              ctx->url);
+            }
+        }
         // Once descriptor exhaustion is established every remaining request fails
         // the same way for the same reason, already stated once above. Logging each
         // buries that line under hundreds of identical ones; the total is reported
@@ -608,6 +671,11 @@ RestClient::reapCompletions() {
             // buildEasy is not called again, so clear this here or the next attempt
             // reports whatever the last one failed with.
             ctx->error_buf[0] = '\0';
+            // Same reason, but this one is data rather than diagnostics: a body read
+            // that already wrote part of its buffer must start over at the front, or
+            // the retry appends after the bytes the failed attempt left behind.
+            ctx->body_sink.len = 0;
+            ctx->body_sink.overflow = false;
             NIXL_WARN << absl::StrFormat("%s: curl_code=%d (%s) os_errno=%s url=%s, retry %d/%d",
                                          ctx->op_name,
                                          static_cast<int>(res),
@@ -847,6 +915,60 @@ RestClient::getObjectRdmaAsync(std::string_view key,
     submitRdmaRequest(
         "getObjectRdmaAsync", key, rdma_desc, /*is_upload=*/false, std::move(callback),
         data_len, offset);
+}
+
+void
+RestClient::getObjectBodyAsync(std::string_view key,
+                               void *dst,
+                               size_t data_len,
+                               size_t offset,
+                               get_object_callback_t callback) {
+    NIXL_DEBUG << absl::StrFormat(
+        "getObjectBodyAsync: key=%s, dst=%p, data_len=%zu, offset=%zu", key, dst, data_len, offset);
+
+    if (dst == nullptr || data_len == 0) {
+        NIXL_ERROR << absl::StrFormat(
+            "getObjectBodyAsync: dst=%p data_len=%zu, returning failure", dst, data_len);
+        if (callback) {
+            callback(false);
+        }
+        return;
+    }
+
+    if (offset > (SIZE_MAX - (data_len - 1))) {
+        NIXL_ERROR << "getObjectBodyAsync: offset + data_len would overflow, returning failure";
+        if (callback) {
+            callback(false);
+        }
+        return;
+    }
+
+    auto ctx = std::make_unique<RequestCtx>();
+    ctx->client = this;
+    ctx->op_name = "getObjectBodyAsync";
+    ctx->method = restMethod::GET;
+    ctx->url = buildUrl(key);
+    ctx->bool_cb = std::move(callback);
+    ctx->body_sink.dst = static_cast<char *>(dst);
+    ctx->body_sink.cap = data_len;
+
+    ctx->easy = acquireEasy();
+    if (!ctx->easy) {
+        NIXL_ERROR << "getObjectBodyAsync: curl_easy_init failed";
+        if (ctx->bool_cb) {
+            ctx->bool_cb(false);
+        }
+        return;
+    }
+
+    // Deliberately no x-scal-rdma header: without it the endpoint answers with the
+    // bytes in the response body, which is what makes this path need no registration.
+    std::string range_header =
+        absl::StrFormat("Range: bytes=%zu-%zu", offset, offset + data_len - 1);
+    ctx->headers = curl_slist_append(ctx->headers, range_header.c_str());
+
+    buildEasy(ctx.get());
+    enqueue(std::move(ctx));
 }
 
 void

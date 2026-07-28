@@ -169,7 +169,12 @@ TEST(ObjRequestSplitTest, TilingIsContiguousAndExact) {
 }
 
 // A throwaway single-request HTTP server: binds to localhost:0, reads one full
-// HTTP request, replies "200 OK", and hands the raw request text back.
+// HTTP request, replies with the configured status (and optionally a body), and
+// hands the raw request text back.
+//
+// setBody() makes it serve bytes, which is what the plain-HTTP read path needs:
+// the RDMA path only ever cares about the request, but a body read has to be
+// checked against what actually lands in the caller's buffer.
 class TcpServer {
 public:
     explicit TcpServer(int status_code = 200, std::string reason = "OK")
@@ -213,6 +218,18 @@ public:
         return port_;
     }
 
+    /// Serve `body` after the status line. `declared_length` overrides the
+    /// Content-Length header so a truncated response can be simulated: claiming
+    /// more than is sent is what libcurl reports as CURLE_PARTIAL_FILE.
+    /// Must be called before the client connects.
+    void
+    setBody(std::string body, long declared_length = -1) {
+        body_ = std::move(body);
+        declared_length_ = (declared_length < 0) ? static_cast<long>(body_.size())
+                                                 : declared_length;
+        has_body_ = true;
+    }
+
     // Block until one full HTTP request is captured (or timeout); "" on timeout.
     std::string
     capturedRequest(int timeout_sec = 5) {
@@ -241,8 +258,12 @@ private:
             request.append(buf, static_cast<std::string::size_type>(n));
         }
 
+        const long content_length = has_body_ ? declared_length_ : 0;
         std::string response = "HTTP/1.1 " + std::to_string(status_code_) + " " + reason_ +
-            "\r\nContent-Length: 0\r\n\r\n";
+            "\r\nContent-Length: " + std::to_string(content_length) + "\r\n\r\n";
+        if (has_body_) {
+            response += body_;
+        }
         send(client_fd, response.data(), response.size(), 0);
         close(client_fd);
 
@@ -251,6 +272,9 @@ private:
 
     int status_code_;
     std::string reason_;
+    bool has_body_ = false;
+    std::string body_;
+    long declared_length_ = 0;
     int listen_fd_ = -1;
     int port_ = 0;
     std::thread thread_;
@@ -506,6 +530,148 @@ TEST_F(RestClientTest, CheckExistsReturnsErrorOn500) {
 
     EXPECT_TRUE(done.load()) << "Callback was never invoked";
     EXPECT_FALSE(result.has_value()) << "Expected error (nullopt) for HTTP 500";
+}
+
+// ---------------------------------------------------------------------------
+// getObjectBodyAsync: plain HTTP into the caller's buffer, no RDMA
+// ---------------------------------------------------------------------------
+
+TEST_F(RestClientTest, BodyGetSendsRangeAndNoRdmaHeader) {
+    TcpServer server(206, "Partial Content");
+    server.setBody("01234567");
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    char buf[8] = {};
+    std::atomic<bool> done{false};
+    bool ok = false;
+    client.getObjectBodyAsync("shard.safetensors", buf, sizeof(buf), 0, [&](bool success) {
+        ok = success;
+        done = true;
+    });
+
+    const std::string request = server.capturedRequest();
+    waitForCallback(done);
+
+    ASSERT_TRUE(done.load()) << "Callback was never invoked";
+    EXPECT_TRUE(ok);
+    EXPECT_NE(request.find("GET /shard.safetensors "), std::string::npos) << request;
+    // Offset 0 included: an unranged GET would pull the whole multi-GB shard.
+    EXPECT_NE(request.find("Range: bytes=0-7"), std::string::npos) << request;
+    // The absence of this header is what makes the endpoint answer with a body.
+    EXPECT_EQ(request.find("x-scal-rdma"), std::string::npos)
+        << "body read must not carry an RDMA descriptor: " << request;
+    EXPECT_EQ(std::string(buf, sizeof(buf)), "01234567");
+}
+
+TEST_F(RestClientTest, BodyGetHonoursOffset) {
+    TcpServer server(206, "Partial Content");
+    server.setBody("abcd");
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    char buf[4] = {};
+    std::atomic<bool> done{false};
+    client.getObjectBodyAsync("k", buf, sizeof(buf), 4096, [&](bool) { done = true; });
+
+    const std::string request = server.capturedRequest();
+    waitForCallback(done);
+
+    EXPECT_NE(request.find("Range: bytes=4096-4099"), std::string::npos) << request;
+}
+
+TEST_F(RestClientTest, BodyGetRejectsResponseLongerThanRequested) {
+    // A server that ignores Range answers an 8-byte request with the whole object.
+    // Without the write bound that is a heap overflow, so this must fail instead.
+    TcpServer server(200, "OK");
+    server.setBody(std::string(64 * 1024, 'x'));
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    struct Guarded {
+        char buf[8];
+        char canary[8];
+    } guarded;
+    std::memset(&guarded, 0, sizeof(guarded));
+
+    std::atomic<bool> done{false};
+    bool ok = true;
+    client.getObjectBodyAsync("k", guarded.buf, sizeof(guarded.buf), 0, [&](bool success) {
+        ok = success;
+        done = true;
+    });
+
+    server.capturedRequest();
+    waitForCallback(done);
+
+    ASSERT_TRUE(done.load()) << "Callback was never invoked";
+    EXPECT_FALSE(ok) << "an over-long response must fail the read";
+    EXPECT_EQ(std::string(guarded.canary, sizeof(guarded.canary)), std::string(8, '\0'))
+        << "wrote past the end of the caller's buffer";
+}
+
+TEST_F(RestClientTest, BodyGetAcceptsCompleteButShortResponse) {
+    // A speculative range reaching past the end of the object is answered as a
+    // complete 206 with fewer bytes. Those bytes are what the caller wanted.
+    TcpServer server(206, "Partial Content");
+    server.setBody("short");
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    char buf[64] = {};
+    std::atomic<bool> done{false};
+    bool ok = false;
+    client.getObjectBodyAsync("k", buf, sizeof(buf), 0, [&](bool success) {
+        ok = success;
+        done = true;
+    });
+
+    server.capturedRequest();
+    waitForCallback(done);
+
+    ASSERT_TRUE(done.load()) << "Callback was never invoked";
+    EXPECT_TRUE(ok) << "a complete but shorter response is not an error";
+    EXPECT_EQ(std::string(buf, 5), "short");
+    EXPECT_EQ(buf[5], '\0') << "the tail past the object's end must stay untouched";
+}
+
+TEST_F(RestClientTest, BodyGetFailsWhenTruncatedAgainstContentLength) {
+    // Distinct from the case above: the response promises 64 bytes and delivers 5,
+    // which is a transfer cut short. libcurl reports CURLE_PARTIAL_FILE.
+    TcpServer server(206, "Partial Content");
+    server.setBody("short", /*declared_length=*/64);
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    char buf[64] = {};
+    std::atomic<bool> done{false};
+    bool ok = true;
+    client.getObjectBodyAsync("k", buf, sizeof(buf), 0, [&](bool success) {
+        ok = success;
+        done = true;
+    });
+
+    server.capturedRequest();
+    waitForCallback(done, 10000);
+
+    ASSERT_TRUE(done.load()) << "Callback was never invoked";
+    EXPECT_FALSE(ok) << "a body cut short against its own Content-Length must fail";
+}
+
+TEST_F(RestClientTest, BodyGetRejectsNullDestinationAndZeroLength) {
+    // No TcpServer: both rejections happen before a request is built, and a server
+    // that never gets one would block in accept() until its destructor joined it.
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:1");
+    RestClient client(&params);
+
+    char buf[8] = {};
+    bool null_ok = true;
+    client.getObjectBodyAsync("k", nullptr, sizeof(buf), 0, [&](bool s) { null_ok = s; });
+    EXPECT_FALSE(null_ok) << "a null destination must fail without a request";
+
+    bool zero_ok = true;
+    client.getObjectBodyAsync("k", buf, 0, 0, [&](bool s) { zero_ok = s; });
+    EXPECT_FALSE(zero_ok) << "a zero-length read must fail without a request";
 }
 
 } // namespace gtest::obj
