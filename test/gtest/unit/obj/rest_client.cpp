@@ -47,57 +47,123 @@ namespace gtest::obj {
 // ---------------------------------------------------------------------------
 // Request splitting arithmetic
 //
-// prepXfer cuts one transfer descriptor into objRequestCount() ranged requests,
-// request r covering [r * split_size, min((r+1) * split_size, total)). The split
-// happens in the engine, above RestClient, so it is not observable from the HTTP
-// harness below; these cover the arithmetic and its edge cases directly.
+// prepXfer cuts one transfer descriptor into ranged requests whose boundaries fall
+// on multiples of split_size in the OBJECT's offset space, not relative to the
+// descriptor's start. The split happens in the engine, above RestClient, so it is
+// not observable from the HTTP harness below; these cover the arithmetic and its
+// edge cases directly.
+//
+// Reconstructs the emitted ranges the same way prepXfer does, so a change to one
+// has to be mirrored in the other.
 // ---------------------------------------------------------------------------
 
-TEST(ObjRequestSplitTest, ExactMultipleTilesEvenly) {
-    EXPECT_EQ(objRequestCount(128u << 20, 16u << 20), 8u);
+namespace {
+
+struct Range {
+    size_t offset; ///< absolute object offset
+    size_t len;
+};
+
+/// Replay prepXfer's loop for a descriptor of `total` bytes at object offset `base`.
+std::vector<Range>
+splitRanges(size_t base, size_t total, size_t split) {
+    std::vector<Range> out;
+    size_t off = 0;
+    do {
+        size_t len = total - off;
+        if (split != 0) {
+            const size_t to_boundary = split - ((base + off) % split);
+            if (to_boundary < len) {
+                len = to_boundary;
+            }
+        }
+        out.push_back({base + off, len});
+        off += len;
+    } while (off < total);
+    return out;
 }
 
-TEST(ObjRequestSplitTest, RemainderGetsItsOwnRequest) {
-    EXPECT_EQ(objRequestCount((128u << 20) + 1, 16u << 20), 9u);
-    EXPECT_EQ(objRequestCount(100, 16), 7u); // 6 full + 4-byte tail
+} // namespace
+
+TEST(ObjRequestSplitTest, AlignedBaseTilesEvenly) {
+    // base already on a boundary: no short head, exactly total/split requests.
+    EXPECT_EQ(objRequestCount(0, 128u << 20, 16u << 20), 8u);
+    const auto r = splitRanges(0, 128u << 20, 16u << 20);
+    ASSERT_EQ(r.size(), 8u);
+    for (const auto &x : r) {
+        EXPECT_EQ(x.len, 16u << 20);
+        EXPECT_EQ(x.offset % (16u << 20), 0u);
+    }
+}
+
+TEST(ObjRequestSplitTest, UnalignedBaseGetsShortHeadThenAligns) {
+    // This is the case that matters: a safetensors tensor starts at an arbitrary
+    // offset, and every request after the head must land on a boundary.
+    const size_t split = 8u << 20;
+    const size_t base = (8u << 20) + 1234; // one boundary in, plus a skew
+    const auto r = splitRanges(base, 32u << 20, split);
+
+    EXPECT_EQ(objRequestCount(base, 32u << 20, split), r.size());
+    ASSERT_GE(r.size(), 2u);
+    EXPECT_EQ(r.front().len, split - 1234) << "head should reach the next boundary";
+    for (size_t i = 1; i < r.size(); ++i) {
+        EXPECT_EQ(r[i].offset % split, 0u)
+            << "request " << i << " at offset " << r[i].offset << " is not aligned";
+    }
 }
 
 TEST(ObjRequestSplitTest, BelowSplitSizeIsOneRequest) {
-    EXPECT_EQ(objRequestCount(1, 16u << 20), 1u);
-    EXPECT_EQ(objRequestCount(16u << 20, 16u << 20), 1u);
+    EXPECT_EQ(objRequestCount(0, 1, 16u << 20), 1u);
+    EXPECT_EQ(objRequestCount(0, 16u << 20, 16u << 20), 1u);
 }
 
 TEST(ObjRequestSplitTest, ZeroLengthStillYieldsOneRequest) {
     // Pre-split behaviour was one request per descriptor regardless of length;
     // an empty descriptor must not silently vanish.
-    EXPECT_EQ(objRequestCount(0, 16u << 20), 1u);
-    EXPECT_EQ(objRequestCount(0, 0), 1u);
+    EXPECT_EQ(objRequestCount(0, 0, 16u << 20), 1u);
+    EXPECT_EQ(objRequestCount(12345, 0, 0), 1u);
+    EXPECT_EQ(splitRanges(12345, 0, 8u << 20).size(), 1u);
 }
 
 TEST(ObjRequestSplitTest, SplitSizeZeroDisablesSplitting) {
-    EXPECT_EQ(objRequestCount(1u << 30, 0), 1u);
+    EXPECT_EQ(objRequestCount(0, 1u << 30, 0), 1u);
+    EXPECT_EQ(splitRanges(999, 1u << 30, 0).size(), 1u);
+}
+
+TEST(ObjRequestSplitTest, AlignmentCostsAtMostOneExtraRequest) {
+    // The head request is the only price of aligning; anything more would mean the
+    // arithmetic is fragmenting the descriptor.
+    const size_t split = 8u << 20;
+    for (size_t skew : {size_t{0}, size_t{1}, size_t{4095}, split - 1}) {
+        const size_t aligned = objRequestCount(skew, 64u << 20, split);
+        const size_t relative = (64u << 20) / split;
+        EXPECT_LE(aligned, relative + 1) << "skew " << skew << " fragmented the split";
+    }
 }
 
 TEST(ObjRequestSplitTest, TilingIsContiguousAndExact) {
-    // Reconstruct what prepXfer emits and check the ranges tile the descriptor
-    // exactly once: no gaps, no overlaps, nothing past the end.
-    for (size_t total : {size_t{0}, size_t{1}, size_t{15}, size_t{16}, size_t{17}, size_t{1024}}) {
-        for (size_t split : {size_t{1}, size_t{4}, size_t{16}, size_t{4096}}) {
-            const size_t nreq = objRequestCount(total, split);
-            const size_t step = (split == 0) ? total : split;
-            size_t covered = 0;
-            size_t expected_off = 0;
-            for (size_t r = 0; r < nreq; ++r) {
-                const size_t off = r * step;
-                const size_t len = std::min(step, total - off);
-                EXPECT_EQ(off, expected_off) << "gap/overlap at total=" << total
-                                             << " split=" << split << " r=" << r;
-                EXPECT_LE(off + len, total) << "range past end at total=" << total;
-                covered += len;
-                expected_off = off + len;
+    // Ranges must tile the descriptor exactly once: no gaps, no overlaps, nothing
+    // past the end, and the count must match what objRequestCount predicts.
+    for (size_t base : {size_t{0}, size_t{1}, size_t{7}, size_t{16}, size_t{1000003}}) {
+        for (size_t total :
+             {size_t{0}, size_t{1}, size_t{15}, size_t{16}, size_t{17}, size_t{1024}}) {
+            for (size_t split : {size_t{1}, size_t{4}, size_t{16}, size_t{4096}}) {
+                const auto r = splitRanges(base, total, split);
+                EXPECT_EQ(r.size(), objRequestCount(base, total, split))
+                    << "count mismatch base=" << base << " total=" << total
+                    << " split=" << split;
+                size_t expected = base;
+                size_t covered = 0;
+                for (const auto &x : r) {
+                    EXPECT_EQ(x.offset, expected) << "gap/overlap base=" << base
+                                                  << " total=" << total
+                                                  << " split=" << split;
+                    covered += x.len;
+                    expected = x.offset + x.len;
+                }
+                EXPECT_EQ(covered, total) << "incomplete coverage base=" << base
+                                          << " total=" << total << " split=" << split;
             }
-            EXPECT_EQ(covered, total) << "incomplete coverage at total=" << total
-                                      << " split=" << split;
         }
     }
 }
