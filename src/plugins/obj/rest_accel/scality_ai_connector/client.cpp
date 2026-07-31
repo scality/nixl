@@ -47,6 +47,11 @@ struct BodySink {
     size_t cap = 0;
     size_t len = 0;      ///< bytes written so far
     bool overflow = false;
+    /// Read to decide whether this response is data or an error message. The write
+    /// callback runs after the headers are parsed, so the status is already known.
+    CURL *easy = nullptr;
+    /// Where an error response's body goes instead of the caller's buffer.
+    std::string *error_body = nullptr;
 };
 
 /// Write callback for a body read, bounded by the caller's capacity.
@@ -60,6 +65,22 @@ size_t
 writeToSink(void *ptr, size_t size, size_t nmemb, void *userdata) {
     auto *sink = static_cast<BodySink *>(userdata);
     const size_t n = size * nmemb;
+
+    // An error response carries a message, not data. Writing it into the caller's
+    // buffer would corrupt the destination of a read that failed, and would also
+    // lose the message: the failure log prints response_body, so a 404 explaining
+    // itself was showing up as "body=<empty>" while its text went into the caller's
+    // memory. Accept the bytes so the request still completes with its own status.
+    long http_code = 0;
+    if (sink->easy != nullptr &&
+        curl_easy_getinfo(sink->easy, CURLINFO_RESPONSE_CODE, &http_code) == CURLE_OK &&
+        http_code != 0 && (http_code < 200 || http_code >= 300)) {
+        if (sink->error_body != nullptr) {
+            sink->error_body->append(static_cast<char *>(ptr), n);
+        }
+        return n;
+    }
+
     if (n > sink->cap - sink->len) {
         sink->overflow = true;
         return 0;
@@ -951,6 +972,7 @@ RestClient::getObjectBodyAsync(std::string_view key,
     ctx->bool_cb = std::move(callback);
     ctx->body_sink.dst = static_cast<char *>(dst);
     ctx->body_sink.cap = data_len;
+    ctx->body_sink.error_body = &ctx->response_body;
 
     ctx->easy = acquireEasy();
     if (!ctx->easy) {
@@ -960,6 +982,8 @@ RestClient::getObjectBodyAsync(std::string_view key,
         }
         return;
     }
+    // Set after the handle exists; a retry reuses it, so this stays valid.
+    ctx->body_sink.easy = ctx->easy;
 
     // Deliberately no x-scal-rdma header: without it the endpoint answers with the
     // bytes in the response body, which is what makes this path need no registration.

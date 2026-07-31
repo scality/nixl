@@ -674,4 +674,33 @@ TEST_F(RestClientTest, BodyGetRejectsNullDestinationAndZeroLength) {
     EXPECT_FALSE(zero_ok) << "a zero-length read must fail without a request";
 }
 
+TEST_F(RestClientTest, BodyGetKeepsErrorResponseOutOfTheCallerBuffer) {
+    // A 404 carries an explanation, not data. Writing it into the destination would
+    // corrupt the buffer of a read that failed, and would also lose the message --
+    // the failure log prints the captured body, so the text has to go there instead.
+    TcpServer server(404, "Not Found");
+    server.setBody("no such object");
+    nixl_b_params_t params = makeRestParams("http://127.0.0.1:" + std::to_string(server.port()));
+    RestClient client(&params);
+
+    char buf[64];
+    std::memset(buf, 0xAB, sizeof(buf)); // poison: must survive untouched
+    std::atomic<bool> done{false};
+    bool ok = true;
+    client.getObjectBodyAsync("missing", buf, sizeof(buf), 0, [&](bool success) {
+        ok = success;
+        done = true;
+    });
+
+    server.capturedRequest();
+    waitForCallback(done);
+
+    ASSERT_TRUE(done.load()) << "Callback was never invoked";
+    EXPECT_FALSE(ok) << "a 404 must fail the read";
+    for (size_t i = 0; i < sizeof(buf); ++i) {
+        EXPECT_EQ(static_cast<unsigned char>(buf[i]), 0xABu)
+            << "error body was written into the caller's buffer at byte " << i;
+    }
+}
+
 } // namespace gtest::obj

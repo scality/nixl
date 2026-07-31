@@ -215,7 +215,25 @@ public:
     std::vector<std::future<nixl_status_t>> statusFutures_;
 
     nixlScalityObjBackendReqH() = default;
-    ~nixlScalityObjBackendReqH() = default;
+
+    /// Waits for every request of this transfer to finish.
+    ///
+    /// Load-bearing rather than tidiness. A request writes straight into the
+    /// caller's buffer -- the NIC does for an RDMA read, libcurl does for a plain
+    /// HTTP one -- and the caller frees that buffer once it has released the
+    /// handle. Destroying the handle while requests are running therefore leaves
+    /// them writing into freed memory, which surfaces as heap corruption rather
+    /// than as an error.
+    ///
+    /// Bounded by the client's own 30s per-request timeout. On the success path
+    /// every future is already resolved, so this costs nothing.
+    ~nixlScalityObjBackendReqH() {
+        for (auto &future : statusFutures_) {
+            if (future.valid()) {
+                future.wait();
+            }
+        }
+    }
 
     nixl_status_t
     getOverallStatus() {
@@ -223,19 +241,31 @@ public:
         auto it = statusFutures_.begin();
         while (it != statusFutures_.end()) {
             if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                auto current_status = it->get();
-                if (current_status != NIXL_SUCCESS) {
-                    statusFutures_.clear();
-                    return current_status;
-                }
+                const auto current_status = it->get();
                 it = statusFutures_.erase(it);
+                // Record the failure and keep the rest. Clearing the list here --
+                // which is what this did -- discards the only handle on the requests
+                // still running, so nothing can wait for them and the destructor
+                // above cannot protect the caller's buffer. Dropping a *ready*
+                // future is safe: it has no writer left behind it.
+                if (current_status != NIXL_SUCCESS && firstError_ == NIXL_SUCCESS) {
+                    firstError_ = current_status;
+                }
             } else {
                 ++it;
                 has_pending = true;
             }
         }
+        // Sticky, so polling after a failure keeps reporting it instead of turning
+        // back into SUCCESS once the surviving requests drain.
+        if (firstError_ != NIXL_SUCCESS) {
+            return firstError_;
+        }
         return has_pending ? NIXL_IN_PROG : NIXL_SUCCESS;
     }
+
+private:
+    nixl_status_t firstError_ = NIXL_SUCCESS;
 };
 
 /**
