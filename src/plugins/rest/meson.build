@@ -48,6 +48,7 @@ rest_deps = [
     rest_curl_dep,
     rest_ibverbs_dep,
     rest_mlx5_dep,
+    dl_dep,
 ]
 rest_compile_defs = []
 

@@ -83,6 +83,7 @@ The backend is created as `REST` and configured through its `customParams`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
+| `nic_affinity` | `gpu` | NICs GPU memory uses. `gpu` keeps each request on the NICs affine to its GPU (see [Multi-NIC](#multi-nic)); `all` spreads it over every NIC, like host memory, crossing NUMA nodes when it must. |
 | `rdma_dc_key` | from `cufile.json`, else `0xffeeddcc` | DC access key the server's DCI side must present, in hex (e.g. `0xffeeddcc`). |
 | `rdma_nics` | from `cufile.json` | NICs to register memory on: comma-separated IPv4 addresses or device names, e.g. `10.10.40.208,10.10.48.208` or `mlx5_1,mlx5_2`. |
 | `rdma_sl` | `3` | RoCE service level (0-15). Selects the egress priority under PCP trust. See [RoCE priority](#roce-priority). |
@@ -172,12 +173,24 @@ endpoint limits connections per client, lower `max_inflight` accordingly.
 
 ## Multi-NIC
 
-The connector opens one DC target per NIC. It registers each buffer on every
-NIC, with one memory region per NIC that covers the whole buffer. The NIC a
-request travels on is chosen when its RDMA descriptor is built, so consecutive
-requests against one buffer spread across the rails: each request goes to the
-NIC that has carried the fewest so far. With `split_size`, a single large READ
-descriptor is enough to reach every NIC.
+The connector opens one DC target per NIC. It registers each buffer on each NIC
+that the buffer can use (see below), with one memory region per NIC that covers
+the whole buffer. The NIC a request travels on is chosen when its RDMA descriptor
+is built, so consecutive requests against one buffer spread across the rails:
+each request goes to the NIC that has carried the fewest so far. With `split_size`,
+a single large READ descriptor is enough to reach every NIC.
+
+GPU memory uses only the NICs affine to its GPU: the ones sharing its PCIe
+switch when such a NIC exists, else every NIC on the GPU's NUMA node. GPU memory
+uses NICs on other NUMA nodes only in these cases:
+
+- no NIC is on the GPU's NUMA node: the buffer uses all the NICs;
+- the GPU's NUMA node is unknown: the buffer uses all the NICs;
+- none of the affine NICs could register the buffer: the buffer uses the other
+  NICs;
+- `nic_affinity=all`: every request picks among all the NICs.
+
+Host memory has no affinity and spreads over all NICs, on every NUMA node.
 
 Bonded (LAG) NICs are detected from sysfs; one DCT QP is created per physical
 port and RDMA descriptors cycle through them, so the distinct DCT numbers feed the
@@ -199,7 +212,8 @@ the server's own RoCE settings.
 ## How a transfer works
 
 1. **Register memory.** Local DRAM or VRAM buffers are registered for RDMA on
-   every NIC; remote object segments are mapped to their object ids.
+   the NICs they can use (see [Multi-NIC](#multi-nic)); remote object segments
+   are mapped to their object ids.
 2. **Prepare.** For each piece of the transfer the connector builds an RDMA
    descriptor for the buffer range (no data moves yet).
 3. **Post.** It issues the HTTP `PUT`/`GET` for the object id, carrying the
