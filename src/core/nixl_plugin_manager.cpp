@@ -876,6 +876,10 @@ void nixlPluginManager::registerBuiltinPlugins() {
     NIXL_REGISTER_STATIC_PLUGIN(Backend, INFINIA)
 #endif
 
+#ifdef STATIC_PLUGIN_REST
+    NIXL_REGISTER_STATIC_PLUGIN(Backend, REST)
+#endif
+
     NIXL_REGISTER_STATIC_PLUGIN(Telemetry, BUFFER)
     NIXL_REGISTER_STATIC_PLUGIN(Telemetry, NOP)
 }

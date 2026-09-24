@@ -37,6 +37,10 @@ if enabled_plugins.get('AZURE_BLOB')
     subdir('azure_blob')
 endif
 
+if enabled_plugins.get('REST')
+    subdir('rest')
+endif
+
 if enabled_plugins.get('LIBFABRIC')
     if not libfabric_dep.found() and is_explicit_enable
         error('LIBFABRIC plugin requested but libfabric dependency not found')
