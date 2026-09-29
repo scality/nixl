@@ -52,6 +52,13 @@ rest_deps = [
 ]
 rest_compile_defs = []
 
+# DMA-BUF registration of VRAM needs rdma-core 34 or later.
+if cpp.has_function('ibv_reg_dmabuf_mr',
+                    prefix: '#include <infiniband/verbs.h>',
+                    dependencies: rest_ibverbs_dep)
+    rest_compile_defs += [ '-DHAVE_IBV_REG_DMABUF_MR' ]
+endif
+
 if 'REST' in static_plugins
     rest_backend_lib = static_library(
         'REST',
