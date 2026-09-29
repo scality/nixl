@@ -164,6 +164,9 @@ public:
     std::string objKey;
     /// A 416 (range past the end of the object) is a success, not a failure.
     bool pastEndOk = false;
+    /// Read the object into addr over plain HTTP rather than RDMA; rdmaDesc is
+    /// empty. Set by prepXfer, honoured by postXfer.
+    bool hostBody = false;
 
     scalityObjTransferRequestH(uintptr_t a, size_t s, size_t off) : addr(a), size(s), offset(off) {}
 };
@@ -318,8 +321,18 @@ nixlRestEngine::nixlRestEngine(const nixlBackendInitParams *init_params,
             NIXL_WARN << "Ignoring non-numeric split_size: " << split;
         }
     }
+    const std::string dram_rdma = paramOr(params, "dram_rdma", "");
+    if (!dram_rdma.empty()) {
+        try {
+            dramRdma_ = nixl::config::configTraits<bool>::convert(dram_rdma);
+        }
+        catch (const std::runtime_error &) {
+            NIXL_WARN << "Ignoring non-boolean dram_rdma: " << dram_rdma;
+        }
+    }
     NIXL_INFO << "Object request split_size="
-              << (splitSize_ == 0 ? std::string("disabled") : std::to_string(splitSize_));
+              << (splitSize_ == 0 ? std::string("disabled") : std::to_string(splitSize_))
+              << ", DRAM transfers use " << (dramRdma_ ? "RDMA" : "plain HTTP (nothing pinned)");
 }
 
 nixl_status_t
@@ -360,6 +373,16 @@ nixlRestEngine::registerMem(const nixlBlobDesc &mem,
         devIdToObjKey_[mem.devId] = obj_md->objKey;
         out = obj_md.release();
     } else if ((nixl_mem == DRAM_SEG) || (nixl_mem == VRAM_SEG)) {
+        // With RDMA off for DRAM there is nothing to pin, and no NIC list is needed.
+        if ((nixl_mem == DRAM_SEG) && !dramRdma_) {
+            NIXL_DEBUG << absl::StrFormat(
+                "registerMem: addr=0x%016x, len=%zu, DRAM without RDMA, no MR pinned",
+                mem.addr,
+                mem.len);
+            out = new nixlScalityObjMetadata(nixl_mem, mem.addr, mem.devId);
+            return NIXL_SUCCESS;
+        }
+
         nixl_status_t st = ensureDescriptorProvider();
         if (st != NIXL_SUCCESS) {
             return st;
@@ -396,6 +419,10 @@ nixlRestEngine::deregisterMem(nixlBackendMD *meta) {
     if (md->nixlMem == OBJ_SEG) {
         devIdToObjKey_.erase(md->devId);
     } else if ((md->nixlMem == DRAM_SEG) || (md->nixlMem == VRAM_SEG)) {
+        // Nothing was pinned, so there is nothing to release.
+        if ((md->nixlMem == DRAM_SEG) && !dramRdma_) {
+            return NIXL_SUCCESS;
+        }
         const nixl_status_t st = descriptorProvider_->deregisterMemory((void *)(md->localAddr));
         if (st != NIXL_SUCCESS) {
             NIXL_ERROR << "RDMA deregistration at 0x" << std::hex << md->localAddr << std::dec
@@ -417,7 +444,15 @@ nixlRestEngine::prepXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    if (!descriptorProvider_ || !descriptorProvider_->isConnected()) {
+    // DRAM with RDMA off carries no RDMA descriptors, so it needs no descriptor
+    // provider (and no NICs).
+    const bool host_body = (local.getType() == DRAM_SEG) && !dramRdma_;
+    if (host_body && (operation == NIXL_WRITE)) {
+        NIXL_ERROR << "dram_rdma=false supports reads only; there is no plain-HTTP upload path. "
+                      "Set dram_rdma=true to write from DRAM.";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    if (!host_body && (!descriptorProvider_ || !descriptorProvider_->isConnected())) {
         NIXL_ERROR << "RDMA descriptor provider is not connected.";
         return NIXL_ERR_BACKEND;
     }
@@ -457,9 +492,11 @@ nixlRestEngine::prepXfer(const nixl_xfer_op_t &operation,
         //
         // WRITE is never split: a PUT writes the whole object, and there is no
         // partial-object write.
+        //
+        // A plain-HTTP body read is not split either: it has no rails to spread over.
         const size_t total = local[i].len;
         const size_t base = remote[i].addr;
-        const bool splittable = (operation != NIXL_WRITE) && (splitSize_ != 0);
+        const bool splittable = (operation != NIXL_WRITE) && (splitSize_ != 0) && !host_body;
         size_t off = 0;
         while (off < total) {
             size_t len = total - off;
@@ -475,9 +512,14 @@ nixlRestEngine::prepXfer(const nixl_xfer_op_t &operation,
             // Only the first piece must exist: a later one may lie past the end of an
             // object shorter than the descriptor.
             req.pastEndOk = (off > 0);
-            req.rdmaDesc = descriptorProvider_->makeDescriptor((void *)req.addr, req.size);
-            if (req.rdmaDesc.empty()) {
-                return NIXL_ERR_BACKEND;
+            if (host_body) {
+                // No RDMA descriptor: postXfer reads the body straight into req.addr.
+                req.hostBody = true;
+            } else {
+                req.rdmaDesc = descriptorProvider_->makeDescriptor((void *)req.addr, req.size);
+                if (req.rdmaDesc.empty()) {
+                    return NIXL_ERR_BACKEND;
+                }
             }
             // Log only the length: the RDMA descriptor grants access to the buffer.
             NIXL_DEBUG << absl::StrFormat(
@@ -518,7 +560,10 @@ nixlRestEngine::postXfer(const nixl_xfer_op_t &operation,
             status_promise->set_value(success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
         };
 
-        if (operation == NIXL_WRITE) {
+        if (req.hostBody) {
+            connectorClient_->getObjectBodyAsync(
+                req.objKey, (void *)req.addr, req.size, req.offset, on_done);
+        } else if (operation == NIXL_WRITE) {
             connectorClient_->putObjectRdmaAsync(
                 req.objKey, req.addr, req.size, req.offset, req.rdmaDesc, on_done);
         } else {
