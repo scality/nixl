@@ -15,6 +15,7 @@
 
 rest_unit_test_dep = declare_dependency(
     sources: files(
+        'rest_client.cpp',
         'utils.cpp',
     ),
     include_directories: [
