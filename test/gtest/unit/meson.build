@@ -32,6 +32,11 @@ if is_variable('redis_backend_interface')
     unit_test_deps += [redis_unit_test_dep]
 endif
 
+if is_variable('rest_backend_interface')
+    subdir('rest')
+    unit_test_deps += [rest_unit_test_dep]
+endif
+
 subdir('agent')
 unit_test_deps += [agent_unit_test_dep]
 
