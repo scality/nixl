@@ -15,6 +15,7 @@
 
 rest_unit_test_dep = declare_dependency(
     sources: files(
+        'engine.cpp',
         'rest_client.cpp',
         'rest_client_concurrency.cpp',
         'utils.cpp',
