@@ -268,8 +268,10 @@ nixlRestEngine::nixlRestEngine(const nixlBackendInitParams *init_params)
     : nixlRestEngine(init_params, nullptr) {}
 
 nixlRestEngine::nixlRestEngine(const nixlBackendInitParams *init_params,
-                               std::shared_ptr<iRestClient> connector_client)
-    : nixlBackendEngine(init_params) {
+                               std::shared_ptr<iRestClient> connector_client,
+                               std::shared_ptr<iRdmaDescriptorProvider> descriptor_provider)
+    : nixlBackendEngine(init_params),
+      descriptorProvider_(std::move(descriptor_provider)) {
     if (connector_client) {
         connectorClient_ = connector_client;
     } else {
