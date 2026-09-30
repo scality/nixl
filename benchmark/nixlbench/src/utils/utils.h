@@ -238,6 +238,7 @@ public:
     static std::string azure_blob_container_name;
     static std::string azure_blob_connection_string;
     static std::string rest_endpoint;
+    static bool rest_unique_keys;
     static int hf3fs_iopool_size;
     static std::string gusli_client_name;
     static int gusli_max_simultaneous_requests;
@@ -452,6 +453,8 @@ public:
     putObjRest(size_t buffer_size, const std::string &name);
     static bool
     rmObjRest(const std::string &name);
+    static bool
+    rmObjRestBatch(const std::vector<std::string> &names);
 
     static bool
     checkConsistency(std::vector<std::vector<xferBenchIOV>> &desc_lists);

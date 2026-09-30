@@ -690,6 +690,7 @@ devices can differ between the initiator and target processes.
 **REST Backend:**
 ```
 --rest_endpoint URL        # Base URL of the Scality AI Connector (required)
+--rest_unique_keys         # Write every posted WRITE to a new object key; the objects are removed at the end
 ```
 
 **GUSLI Backend:**
@@ -1045,6 +1046,12 @@ The plugin's other parameters, such as `max_inflight`, `request_timeout_ms` or
 `rdma_sl`, are set through `--backend_params` as well; the plugin README lists
 them. Without `--mode MG`, a process uses a single GPU, and so only that GPU's
 NICs.
+
+Each WRITE iteration writes the same objects again. `--rest_unique_keys` sends
+every posted WRITE to new keys instead, so the run measures the creation of new
+objects rather than overwrites, and removes those objects at the end with the
+endpoint's batch delete. Changing keys takes a new transfer request per WRITE,
+as `--recreate_xfer` does.
 
 ### Azure Blob Storage Backend
 For AZURE_BLOB plugin benchmarking, ETCD is optional for single instances.
