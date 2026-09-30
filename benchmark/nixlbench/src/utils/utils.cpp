@@ -193,6 +193,10 @@ NB_ARG_INT32(use_localized,
              "VMM locality domain: -1 disables programmatic localization, while 0 or 1 selects "
              "one locality domain (requires enable_vmm)");
 NB_ARG_BOOL(use_hugepages, false, "Allocate data buffers using hugepages (2MB pages)");
+NB_ARG_STRING(backend_params,
+              "",
+              "Backend parameters passed to the plugin as given, over the ones nixlbench sets: "
+              "'key=value;key=value' (only used with nixl worker)");
 
 // Storage backend(GDS, GDS_MT, POSIX, HF3FS, OBJ) options
 NB_ARG_STRING(filepath, "", "Directory where storage backends create their benchmark files");
@@ -439,6 +443,8 @@ std::string xferBenchConfig::gusli_device_byte_offsets = "";
 std::string xferBenchConfig::gusli_device_security = "";
 bool xferBenchConfig::gusli_try_use_uring = false;
 std::optional<nixl_b_params_t> xferBenchConfig::plugin_parameters = std::nullopt;
+std::string xferBenchConfig::backend_params = "";
+nixl_b_params_t xferBenchConfig::parsed_backend_params = {};
 bool xferBenchConfig::use_device_api = false;
 int xferBenchConfig::block_threads = 1;
 int xferBenchConfig::device_channel_num = 0;
@@ -666,6 +672,14 @@ xferBenchConfig::loadParams(void) {
                       << std::endl;
             return -1;
 #endif
+        }
+
+        backend_params = NB_ARG(backend_params);
+
+        std::string backend_params_error;
+        if (!parseBackendParams(backend_params, parsed_backend_params, backend_params_error)) {
+            std::cerr << "Invalid --backend_params: " << backend_params_error << std::endl;
+            return -1;
         }
 
         if (enable_vmm) {
@@ -1052,6 +1066,7 @@ xferBenchConfig::printConfig() {
                     std::to_string(prepared_xfer));
         printOption("Pipeline depth (--pipeline_depth=N)", std::to_string(pipeline_depth));
         printOption("Use hugepages (--use_hugepages=[0,1])", std::to_string(use_hugepages));
+        printOption("Backend params (--backend_params=key=value;...)", backend_params);
 
         // Print GDS options if backend is GDS
         if (backend == XFERBENCH_BACKEND_GDS) {
@@ -1231,6 +1246,33 @@ xferBenchConfig::isBlkStorageBackend() {
         backend_mems.begin(), backend_mems.end(), [](nixl_mem_t m) { return m == BLK_SEG; });
 }
 
+// Entries are separated by ';' rather than ',' so a value can itself be a
+// comma-separated list. Keys and values are kept exactly as written; the
+// plugin validates them when the backend is created.
+bool
+xferBenchConfig::parseBackendParams(const std::string &spec,
+                                    nixl_b_params_t &params,
+                                    std::string &error) {
+    params.clear();
+    std::stringstream entries(spec);
+    std::string entry;
+    while (std::getline(entries, entry, ';')) {
+        if (entry.empty()) {
+            continue;
+        }
+        const size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            error = "'" + entry + "' is not key=value";
+            return false;
+        }
+        const std::string key = entry.substr(0, eq);
+        if (!params.emplace(key, entry.substr(eq + 1)).second) {
+            error = "'" + key + "' is given twice";
+            return false;
+        }
+    }
+    return true;
+}
 
 /**********
  * xferBench Utils

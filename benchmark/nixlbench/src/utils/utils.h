@@ -245,6 +245,10 @@ public:
     static bool gusli_try_use_uring;
     // Opaque plugin parameters are populated only by the raw CLI path.
     static std::optional<nixl_b_params_t> plugin_parameters;
+    // --backend_params as given, and parsed: applied over the backend parameters
+    // nixlbench sets.
+    static std::string backend_params;
+    static nixl_b_params_t parsed_backend_params;
     static bool use_device_api;
     static int block_threads;
     static int device_channel_num;
@@ -285,6 +289,8 @@ public:
     isObjStorageBackend();
     static bool
     isBlkStorageBackend();
+    static bool
+    parseBackendParams(const std::string &spec, nixl_b_params_t &params, std::string &error);
 
 protected:
     static int

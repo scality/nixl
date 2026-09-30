@@ -588,6 +588,18 @@ wait
 --enable_vmm               # Enable VMM memory allocation for VRAM buffers
 --vmm_gdr_capable BOOL     # Set gpuDirectRDMACapable for non-localized VMM(default: true)
 --use_localized DOMAIN     # VMM locality: -1 disabled, 0 domain 0, 1 domain 1; requires --enable_vmm
+--backend_params LIST       # Backend parameters passed to the plugin as given, over the ones nixlbench sets:
+                           # 'key=value;key=value' (only used with nixl worker)
+```
+
+`--backend_params` reaches any backend parameter, including those nixlbench has
+no flag for. A key nixlbench also sets takes the given value; the others it
+sets are kept. Entries are separated by `;` so a value can be a comma-separated
+list, and each key may be given once:
+
+```bash
+./nixlbench --backend POSIX --filepath /tmp/nixlbench-data \
+    --backend_params 'ios_pool_size=4096;kernel_queue_size=512'
 ```
 
 `--vmm_gdr_capable` only controls non-localized VMM allocations. Explicit
