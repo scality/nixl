@@ -1675,9 +1675,14 @@ xferBenchUtils::putObjS3(size_t buffer_size, const std::string &name) {
             " --checksum-algorithm SHA256 --endpoint-url " + xferBenchConfig::obj_endpoint_override;
     }
 
+    if (!debugEnabled()) {
+        aws_cmd += " --only-show-errors";
+    }
     std::string full_cmd = buildAwsCredentials() + aws_cmd;
-    std::cout << "Putting S3 object: " << name << " in bucket: " << bucket_name
-              << " (size: " << buffer_size << " bytes)" << std::endl;
+    if (debugEnabled()) {
+        std::cout << "Putting S3 object: " << name << " in bucket: " << bucket_name
+                  << " (size: " << buffer_size << " bytes)" << std::endl;
+    }
 
     int result = system(full_cmd.c_str());
     if (result != 0) {
@@ -1703,8 +1708,13 @@ xferBenchUtils::getObjS3(const std::string &name) {
         aws_cmd += " --endpoint-url " + xferBenchConfig::obj_endpoint_override;
     }
 
+    if (!debugEnabled()) {
+        aws_cmd += " --only-show-errors";
+    }
     std::string full_cmd = buildAwsCredentials() + aws_cmd;
-    std::cout << "Getting S3 object: " << name << " from bucket: " << bucket_name << std::endl;
+    if (debugEnabled()) {
+        std::cout << "Getting S3 object: " << name << " from bucket: " << bucket_name << std::endl;
+    }
 
     int result = system(full_cmd.c_str());
     if (result != 0) {
@@ -1729,8 +1739,13 @@ xferBenchUtils::rmObjS3(const std::string &name) {
         aws_cmd += " --endpoint-url " + xferBenchConfig::obj_endpoint_override;
     }
 
+    if (!debugEnabled()) {
+        aws_cmd += " --only-show-errors";
+    }
     std::string full_cmd = buildAwsCredentials() + aws_cmd;
-    std::cout << "Removing S3 object: " << name << " from bucket: " << bucket_name << std::endl;
+    if (debugEnabled()) {
+        std::cout << "Removing S3 object: " << name << " from bucket: " << bucket_name << std::endl;
+    }
 
     int result = system(full_cmd.c_str());
     if (result != 0) {
@@ -1947,7 +1962,9 @@ xferBenchUtils::putObjAzure(size_t buffer_size, const std::string &name) {
         return false;
     }
     std::string full_cmd = "az storage blob upload " + az_cli_params + " -f " + filename;
-    std::cout << "Putting Azure blob: " << name << std::endl;
+    if (debugEnabled()) {
+        std::cout << "Putting Azure blob: " << name << std::endl;
+    }
 
     int result = system(full_cmd.c_str());
     if (result != 0) {
@@ -1968,7 +1985,9 @@ xferBenchUtils::getObjAzure(const std::string &name) {
         return false;
     }
     std::string full_cmd = "az storage blob download " + az_cli_params + " -f " + name;
-    std::cout << "Getting Azure blob: " << name << std::endl;
+    if (debugEnabled()) {
+        std::cout << "Getting Azure blob: " << name << std::endl;
+    }
 
     int result = system(full_cmd.c_str());
     if (result != 0) {
@@ -1986,7 +2005,9 @@ xferBenchUtils::rmObjAzure(const std::string &name) {
         return false;
     }
     std::string full_cmd = "az storage blob delete " + az_cli_params;
-    std::cout << "Removing Azure blob: " << name << std::endl;
+    if (debugEnabled()) {
+        std::cout << "Removing Azure blob: " << name << std::endl;
+    }
 
     int result = system(full_cmd.c_str());
     if (result != 0) {
