@@ -72,7 +72,7 @@ def nixl_bench_args(func):
     func = click.option(
         "--backend",
         type=str,
-        help="Communication backend [UCX, GDS, GDS_MT, POSIX, GPUNETIO, Mooncake, HF3FS, OBJ] (default: UCX)",
+        help="Communication backend [UCX, GDS, GDS_MT, POSIX, GPUNETIO, Mooncake, HF3FS, OBJ, REST] (default: UCX)",
     )(func)
     func = click.option(
         "--worker_type",
@@ -278,6 +278,17 @@ def nixl_bench_args(func):
         "--obj_ca_bundle",
         type=str,
         help="Path to CA bundle for S3 backend (only used with OBJ backend)",
+    )(func)
+    func = click.option(
+        "--rest_endpoint",
+        type=str,
+        help="Base URL of the Scality AI Connector (only used with REST backend)",
+    )(func)
+    func = click.option(
+        "--backend_params",
+        type=str,
+        help="Backend parameters passed to the plugin as given, over the ones nixlbench sets: "
+        "'key=value;key=value'",
     )(func)
     return func
 

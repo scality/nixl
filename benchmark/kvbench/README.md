@@ -311,6 +311,8 @@ These arguments are used by both `plan` and `profile` commands:
 | `--storage_enable_direct` | Enable direct I/O for storage operations |
 | `--filepath` | File path for storage operations |
 | `--enable_vmm` | Enable VMM memory allocation when DRAM is requested |
+| `--rest_endpoint` | Base URL of the Scality AI Connector (only used with REST backend) |
+| `--backend_params` | Backend parameters passed to the plugin as given, over the ones nixlbench sets: `'key=value;key=value'` |
 
 ### CTP Command Arguments
 
