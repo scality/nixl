@@ -309,6 +309,11 @@ cmake ../aws-sdk-cpp/ \
 make -j$(nproc) && sudo make install
 ```
 
+**libcurl (for the REST backend):**
+```bash
+sudo apt install libcurl4-openssl-dev
+```
+
 **Azure SDK for C++ (for Azure Blob Storage backend):**
 ```bash
 git clone --depth 1 https://github.com/Azure/azure-sdk-for-cpp.git --branch  azure-storage-blobs_12.15.0
@@ -682,6 +687,11 @@ devices can differ between the initiator and target processes.
 --azure_blob_connection_string CONNECTION_STRING  # Connection string for Azure Blob backend
 ```
 
+**REST Backend:**
+```
+--rest_endpoint URL        # Base URL of the Scality AI Connector (required)
+```
+
 **GUSLI Backend:**
 ```
 --device_list LIST                     # Device specs in format 'id:type:path' (e.g., '11:F:./store0.bin,27:K:/dev/nvme0n1')
@@ -1010,6 +1020,31 @@ Transfer times are higher than local storage, so consider reducing iterations:
 **Testing Options:**
 - Test read operations: `--op_type READ`
 - Validate data consistency: `--check_consistency`
+
+### REST Backend (Scality AI Connector)
+
+The REST plugin moves object bytes by RDMA between local DRAM or VRAM and a
+Scality AI Connector endpoint; see `src/plugins/rest/README.md`. nixlbench
+creates the objects a READ needs, and removes the objects of the run, with
+plain HTTP PUT and DELETE requests to `<endpoint>/<key>`. This needs nixlbench
+built with libcurl.
+
+```bash
+# VRAM WRITE from all 8 GPUs, each on its own NICs, NICs from cufile.json
+./nixlbench --backend REST --rest_endpoint http://10.0.0.1:10000 \
+  --initiator_seg_type VRAM --mode MG --num_initiator_dev 8 \
+  --op_type WRITE
+
+# DRAM READ over two NICs, in 4 MiB requests
+./nixlbench --backend REST --rest_endpoint http://10.0.0.1:10000 \
+  --op_type READ \
+  --backend_params 'rdma_nics=mlx5_1,mlx5_2;split_size=4194304'
+```
+
+The plugin's other parameters, such as `max_inflight`, `request_timeout_ms` or
+`rdma_sl`, are set through `--backend_params` as well; the plugin README lists
+them. Without `--mode MG`, a process uses a single GPU, and so only that GPU's
+NICs.
 
 ### Azure Blob Storage Backend
 For AZURE_BLOB plugin benchmarking, ETCD is optional for single instances.

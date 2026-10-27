@@ -20,6 +20,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <sys/time.h>
@@ -37,6 +39,10 @@
 #include "runtime/etcd/etcd_rt.h"
 #include "utils/neuron.h"
 #include "utils/utils.h"
+
+#if HAVE_LIBCURL
+#include <curl/curl.h>
+#endif
 
 namespace {
 
@@ -144,7 +150,7 @@ NB_ARG_STRING(worker_type, XFERBENCH_WORKER_NIXL, "Type of worker [nixl, nvshmem
 NB_ARG_STRING(backend,
               XFERBENCH_BACKEND_UCX,
               "Name of NIXL backend [UCX, GDS, GDS_MT, POSIX, GPUNETIO, Mooncake, HF3FS, OBJ, "
-              "REDIS, GUSLI, AZURE_BLOB] (only used with nixl worker)");
+              "REDIS, GUSLI, AZURE_BLOB, REST] (only used with nixl worker)");
 NB_ARG_STRING(initiator_seg_type,
               XFERBENCH_SEG_TYPE_DRAM,
               "Type of memory segment for initiator [DRAM, VRAM]. Note: Storage backends always "
@@ -312,6 +318,9 @@ NB_ARG_STRING(azure_blob_connection_string,
               "Connection string for Azure Blob backend (alternative to connect to Azurite for "
               "local testing)");
 
+// REST options - only used when backend is REST
+NB_ARG_STRING(rest_endpoint, "", "Base URL of the Scality AI Connector for REST backend");
+
 // HF3FS options - only used when backend is HF3FS
 NB_ARG_INT32(hf3fs_iopool_size, 64, "Size of io memory pool");
 
@@ -435,6 +444,7 @@ std::string xferBenchConfig::obj_accelerated_type = "";
 std::string xferBenchConfig::azure_blob_account_url = "";
 std::string xferBenchConfig::azure_blob_container_name = "";
 std::string xferBenchConfig::azure_blob_connection_string = "";
+std::string xferBenchConfig::rest_endpoint = "";
 int xferBenchConfig::hf3fs_iopool_size = 0;
 std::string xferBenchConfig::gusli_client_name = "";
 int xferBenchConfig::gusli_max_simultaneous_requests = 0;
@@ -779,6 +789,14 @@ xferBenchConfig::loadParams(void) {
             azure_blob_container_name = NB_ARG(azure_blob_container_name);
             azure_blob_connection_string = NB_ARG(azure_blob_connection_string);
         }
+
+        if (backend == XFERBENCH_BACKEND_REST) {
+            rest_endpoint = NB_ARG(rest_endpoint);
+            if (rest_endpoint.empty()) {
+                std::cerr << "--rest_endpoint is required for the REST backend" << std::endl;
+                return -1;
+            }
+        }
     }
 
     initiator_seg_type = NB_ARG(initiator_seg_type);
@@ -1047,9 +1065,9 @@ xferBenchConfig::printConfig() {
     }
     printOption("Worker type (--worker_type=[nixl,nvshmem])", worker_type);
     if (worker_type == XFERBENCH_WORKER_NIXL) {
-        printOption(
-            "Backend (--backend=[UCX,GDS,GDS_MT,POSIX,Mooncake,HF3FS,OBJ,REDIS,GUSLI,AZURE_BLOB])",
-            backend);
+        printOption("Backend (--backend=[UCX,GDS,GDS_MT,POSIX,Mooncake,HF3FS,OBJ,REDIS,GUSLI,"
+                    "AZURE_BLOB,REST])",
+                    backend);
         printOption("Enable pt (--enable_pt=[0,1])", std::to_string(enable_pt));
         printOption("Progress threads (--progress_threads=N)", std::to_string(progress_threads));
         printOption("Device list (--device_list=dev1,dev2,...)", device_list);
@@ -1123,6 +1141,10 @@ xferBenchConfig::printConfig() {
             printOption("Azure Blob Storage connection string "
                         "(--azure_blob_connection_string=connection-string)",
                         azure_blob_connection_string);
+        }
+
+        if (backend == XFERBENCH_BACKEND_REST) {
+            printOption("REST endpoint (--rest_endpoint=url)", rest_endpoint);
         }
 
         if (xferBenchConfig::isStorageBackend()) {
@@ -1793,6 +1815,8 @@ xferBenchUtils::putObj(size_t buffer_size, const std::string &name) {
         return putObjS3(buffer_size, name);
     } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_AZURE_BLOB) {
         return putObjAzure(buffer_size, name);
+    } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_REST) {
+        return putObjRest(buffer_size, name);
     } else {
         std::cerr << "Error: putObj called with unsupported object storage backend: "
                   << xferBenchConfig::backend << std::endl;
@@ -1831,6 +1855,8 @@ xferBenchUtils::rmObj(const std::string &name) {
         return rmObjS3(name);
     } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_AZURE_BLOB) {
         return rmObjAzure(name);
+    } else if (xferBenchConfig::backend == XFERBENCH_BACKEND_REST) {
+        return rmObjRest(name);
     } else {
         std::cerr << "Error: rmObj called with unsupported object storage backend: "
                   << xferBenchConfig::backend << std::endl;
@@ -1939,6 +1965,119 @@ xferBenchUtils::rmObjS3(const std::string &name) {
     }
     return true;
 }
+
+#if HAVE_LIBCURL
+namespace {
+
+size_t
+fillRestUpload(char *buffer, size_t size, size_t nitems, void *userdata) {
+    auto *remaining = static_cast<size_t *>(userdata);
+    const size_t n = std::min(size * nitems, *remaining);
+    std::memset(buffer, XFERBENCH_TARGET_BUFFER_ELEMENT, n);
+    *remaining -= n;
+    return n;
+}
+
+size_t
+captureRestResponse(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    static_cast<std::string *>(userdata)->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+// One handle per thread, reset between requests, so consecutive requests reuse
+// its connection.
+CURL *
+restHandle() {
+    static std::once_flag global_init;
+    std::call_once(global_init, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    thread_local std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(),
+                                                                            &curl_easy_cleanup);
+    if (handle) {
+        curl_easy_reset(handle.get());
+    }
+    return handle.get();
+}
+
+// PUT an object of `size` bytes, or DELETE it when `put` is false, at the URL
+// the connector itself uses: <endpoint>/<name>.
+bool
+restRequest(bool put, const std::string &name, size_t size) {
+    const char *method = put ? "PUT" : "DELETE";
+    const std::string url = xferBenchConfig::rest_endpoint + "/" + name;
+    CURL *curl = restHandle();
+    if (curl == nullptr) {
+        std::cerr << "Error: " << method << " " << url << ": no curl handle" << std::endl;
+        return false;
+    }
+
+    size_t remaining = size;
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    if (put) {
+        curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(size));
+        curl_easy_setopt(curl, CURLOPT_READFUNCTION, fillRestUpload);
+        curl_easy_setopt(curl, CURLOPT_READDATA, &remaining);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    }
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, captureRestResponse);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    // Give up on an endpoint that stops answering, without capping how long a
+    // large upload that is still moving may take.
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 30000L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+
+    const CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    // A missing object is already removed, as "aws s3 rm" treats it.
+    if (res == CURLE_OK && ((http_code >= 200 && http_code < 300) || (!put && http_code == 404))) {
+        return true;
+    }
+    std::cerr << "Error: " << method << " " << url << " failed: "
+              << (res != CURLE_OK ? curl_easy_strerror(res) : "HTTP " + std::to_string(http_code))
+              << (response.empty() ? "" : ": " + response) << std::endl;
+    return false;
+}
+
+} // namespace
+
+bool
+xferBenchUtils::putObjRest(size_t buffer_size, const std::string &name) {
+    if (debugEnabled()) {
+        std::cout << "Putting object: " << name << " (size: " << buffer_size << " bytes)"
+                  << std::endl;
+    }
+    return restRequest(true, name, buffer_size);
+}
+
+bool
+xferBenchUtils::rmObjRest(const std::string &name) {
+    if (debugEnabled()) {
+        std::cout << "Removing object: " << name << std::endl;
+    }
+    return restRequest(false, name, 0);
+}
+#else
+bool
+xferBenchUtils::putObjRest(size_t, const std::string &) {
+    std::cerr << "Error: nixlbench was built without libcurl, which the REST backend "
+                 "needs to create objects"
+              << std::endl;
+    return false;
+}
+
+bool
+xferBenchUtils::rmObjRest(const std::string &) {
+    std::cerr << "Error: nixlbench was built without libcurl, which the REST backend "
+                 "needs to remove objects"
+              << std::endl;
+    return false;
+}
+#endif
 
 int
 xferBenchUtils::createFile(size_t buffer_size, const std::string &filename) {
