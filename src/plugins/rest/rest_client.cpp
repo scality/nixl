@@ -418,7 +418,7 @@ restClient::finishRequest(requestCtx *ctx, CURLcode res, long http_code) {
     } else {
         bool success = (res == CURLE_OK) && (http_code >= 200 && http_code < 300);
         if (!success && ctx->pastEndOk && res == CURLE_OK && http_code == 416) {
-            NIXL_DEBUG << absl::StrFormat("%s: nothing past the end of %s", ctx->opName, ctx->url);
+            NIXL_TRACE << absl::StrFormat("%s: nothing past the end of %s", ctx->opName, ctx->url);
             success = true;
         }
         // A body shorter than requested is a success: a range past the end of the
@@ -444,7 +444,7 @@ restClient::finishRequest(requestCtx *ctx, CURLcode res, long http_code) {
                     http_code);
                 success = false;
             } else if (success && ctx->sink.len < ctx->sink.cap) {
-                NIXL_DEBUG << absl::StrFormat(
+                NIXL_TRACE << absl::StrFormat(
                     "%s: object ended after %zu of %zu requested bytes for %s",
                     ctx->opName,
                     ctx->sink.len,
@@ -466,7 +466,7 @@ restClient::finishRequest(requestCtx *ctx, CURLcode res, long http_code) {
                 http_code,
                 ctx->responseBody.empty() ? "<empty>" : ctx->responseBody);
         } else {
-            NIXL_DEBUG << absl::StrFormat(
+            NIXL_TRACE << absl::StrFormat(
                 "%s: success url=%s http_code=%ld", ctx->opName, ctx->url, http_code);
         }
         auto cb = std::move(ctx->boolCb);
@@ -807,7 +807,7 @@ restClient::putObjectRdmaAsync(std::string_view key,
                                std::string_view rdma_desc,
                                put_object_callback_t callback) {
     // The RDMA descriptor grants access to the buffer; log only its length.
-    NIXL_DEBUG << absl::StrFormat(
+    NIXL_TRACE << absl::StrFormat(
         "putObjectRdmaAsync: key=%s, data_ptr=%p, data_len=%zu, offset=%zu, rdma_desc_len=%zu",
         key,
         reinterpret_cast<void *>(data_ptr),
@@ -843,7 +843,7 @@ restClient::getObjectRdmaAsync(std::string_view key,
                                std::string_view rdma_desc,
                                bool past_end_ok,
                                get_object_callback_t callback) {
-    NIXL_DEBUG << absl::StrFormat(
+    NIXL_TRACE << absl::StrFormat(
         "getObjectRdmaAsync: key=%s, data_ptr=%p, data_len=%zu, offset=%zu, rdma_desc_len=%zu",
         key,
         reinterpret_cast<void *>(data_ptr),
@@ -891,7 +891,7 @@ restClient::getObjectBodyAsync(std::string_view key,
                                size_t data_len,
                                size_t offset,
                                get_object_callback_t callback) {
-    NIXL_DEBUG << absl::StrFormat(
+    NIXL_TRACE << absl::StrFormat(
         "getObjectBodyAsync: key=%s, dst=%p, data_len=%zu, offset=%zu", key, dst, data_len, offset);
 
     if (dst == nullptr || data_len == 0) {

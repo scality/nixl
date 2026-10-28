@@ -532,7 +532,7 @@ nixlRestEngine::prepXfer(const nixl_xfer_op_t &operation,
                 }
             }
             // Log only the length: the RDMA descriptor grants access to the buffer.
-            NIXL_DEBUG << absl::StrFormat(
+            NIXL_TRACE << absl::StrFormat(
                 "prepXfer: addr=0x%016x, size=%zu, offset=%zu, rdma_desc_len=%zu",
                 req.addr,
                 req.size,
