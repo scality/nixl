@@ -555,9 +555,11 @@ dcDescriptorProvider::setupNic(const std::string &nic_spec, uint64_t dc_key, nic
 dcDescriptorProvider::dcDescriptorProvider(const std::vector<std::string> &nics,
                                            uint64_t dc_key,
                                            uint8_t sl,
-                                           uint8_t traffic_class)
+                                           uint8_t traffic_class,
+                                           bool gpu_nic_affinity)
     : sl_(sl),
-      trafficClass_(traffic_class) {
+      trafficClass_(traffic_class),
+      gpuNicAffinity_(gpu_nic_affinity) {
     if (nics.empty()) {
         NIXL_ERROR << "ibverbs_dc: no NICs provided";
         return;
@@ -585,7 +587,7 @@ dcDescriptorProvider::dcDescriptorProvider(const std::vector<std::string> &nics,
     NIXL_INFO << "ibverbs_dc: DC transport ready across " << nics_.size() << " NIC(s), key=0x"
               << std::hex << std::noshowbase << dc_key << std::dec << ", RoCE sl=" << (int)sl_
               << " traffic_class=" << (int)trafficClass_ << " (DSCP " << (trafficClass_ >> 2)
-              << ")";
+              << "), GPU memory uses " << (gpuNicAffinity_ ? "its affine NICs" : "every NIC");
 }
 
 dcDescriptorProvider::~dcDescriptorProvider() {
@@ -720,10 +722,11 @@ dcDescriptorProvider::affineNicsFor(int dev_id) {
 
 size_t
 dcDescriptorProvider::pickRail(const buffer &buf) {
-    // VRAM uses only the rails affine to its GPU. Host memory has no affinity, and
-    // a buffer none of whose affine NICs took the registration uses every rail.
+    // VRAM uses only the rails affine to its GPU, unless affinity is off. Host
+    // memory has no affinity, and a buffer none of whose affine NICs took the
+    // registration uses every rail.
     const std::vector<int> *affine = nullptr;
-    if (buf.devId >= 0) {
+    if (buf.devId >= 0 && gpuNicAffinity_) {
         affine = &affineNicsFor(buf.devId);
     }
     auto is_affine = [&](int nic_idx) {

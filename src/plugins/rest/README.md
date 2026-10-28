@@ -88,6 +88,7 @@ The backend is created as `REST` and configured through its `customParams`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
+| `nic_affinity` | `gpu` | NICs GPU memory uses. `gpu` keeps each request on the NICs affine to its GPU (see [Multi-NIC](#multi-nic)); `all` spreads it over every NIC, like host memory, crossing NUMA nodes when it must. |
 | `rdma_dc_key` | from `cufile.json`, else `0xffeeddcc` | DC access key the server's DCI side must present, in hex (e.g. `0xffeeddcc`). |
 | `rdma_nics` | from `cufile.json` | NICs to register memory on: comma-separated IPv4 addresses or device names, e.g. `10.10.40.208,10.10.48.208` or `mlx5_1,mlx5_2`. |
 | `rdma_sl` | `3` | RoCE service level (0-15). Selects the egress priority under PCP trust. See [RoCE priority](#roce-priority). |
@@ -191,7 +192,8 @@ uses NICs on other NUMA nodes only in these cases:
 - no NIC is on the GPU's NUMA node: the buffer uses all the NICs;
 - the GPU's NUMA node is unknown: the buffer uses all the NICs;
 - none of the affine NICs could register the buffer: the buffer uses the other
-  NICs.
+  NICs;
+- `nic_affinity=all`: every request picks among all the NICs.
 
 Host memory has no affinity and spreads over all NICs, on every NUMA node.
 

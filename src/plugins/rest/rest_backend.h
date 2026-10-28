@@ -154,6 +154,9 @@ private:
     uint64_t dcKey_ = default_dc_key;
     uint8_t rdmaSl_ = default_rdma_sl;
     uint8_t rdmaTrafficClass_ = default_rdma_traffic_class;
+    /// 'nic_affinity': "gpu" (default) keeps VRAM requests on the NICs affine to
+    /// their GPU, "all" spreads them over every NIC.
+    bool gpuNicAffinity_ = true;
     /// Bytes per object request. A transfer descriptor of any size is cut into
     /// requests of at most this, so callers hand down whole tensors and the
     /// backend decides the wire granularity. 0 disables splitting.

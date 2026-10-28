@@ -54,11 +54,14 @@ public:
      * @param dc_key DC access key the server's DCI side must present.
      * @param sl     RoCE service level (0-15) of what the DC target sends.
      * @param traffic_class RoCE traffic class (ToS byte, DSCP = value >> 2).
+     * @param gpu_nic_affinity Whether VRAM requests stay on the NICs affine to
+     *               their GPU; false spreads them over every NIC, like host memory.
      */
     dcDescriptorProvider(const std::vector<std::string> &nics,
                          uint64_t dc_key,
                          uint8_t sl,
-                         uint8_t traffic_class);
+                         uint8_t traffic_class,
+                         bool gpu_nic_affinity = true);
     ~dcDescriptorProvider() override;
 
     dcDescriptorProvider(const dcDescriptorProvider &) = delete;
@@ -122,8 +125,8 @@ private:
     numLagPorts(const char *dev_name);
     /// Index into buf.rails for the next request against buf: the rail whose NIC
     /// has taken the fewest requests, among the NICs affine to the buffer's GPU for
-    /// VRAM (all rails if none of them holds the buffer), among all rails for host
-    /// memory. Caller must hold mu_.
+    /// VRAM (all rails if none of them holds the buffer, or if GPU affinity is
+    /// off), among all rails for host memory. Caller must hold mu_.
     size_t
     pickRail(const buffer &buf);
     /// Register [ptr, ptr+size) on one NIC. With a DMA-BUF fd (VRAM), try
@@ -188,6 +191,7 @@ private:
     /// it sends itself.
     uint8_t sl_;
     uint8_t trafficClass_;
+    bool gpuNicAffinity_;
     mutable std::mutex mu_;
     /// base address -> buffer, ordered so a sub-address can be found by range.
     std::map<uintptr_t, buffer> buffers_;

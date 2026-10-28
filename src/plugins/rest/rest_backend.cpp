@@ -314,6 +314,14 @@ nixlRestEngine::nixlRestEngine(const nixlBackendInitParams *init_params,
     rdmaTrafficClass_ = static_cast<uint8_t>(
         paramInRange(params, "rdma_traffic_class", 255, default_rdma_traffic_class));
 
+    const std::string nic_affinity = paramOr(params, "nic_affinity", "gpu");
+    if (nic_affinity == "all") {
+        gpuNicAffinity_ = false;
+    } else if (nic_affinity != "gpu") {
+        NIXL_WARN << "Ignoring nic_affinity=" << nic_affinity
+                  << " (expected gpu or all), using gpu";
+    }
+
     const std::string split = paramOr(params, "split_size", "");
     if (!split.empty()) {
         try {
@@ -349,8 +357,8 @@ nixlRestEngine::ensureDescriptorProvider() {
                    << cufileJsonPath();
         return NIXL_ERR_BACKEND;
     }
-    auto client =
-        std::make_shared<dcDescriptorProvider>(rdmaNics_, dcKey_, rdmaSl_, rdmaTrafficClass_);
+    auto client = std::make_shared<dcDescriptorProvider>(
+        rdmaNics_, dcKey_, rdmaSl_, rdmaTrafficClass_, gpuNicAffinity_);
     if (!client->isConnected()) {
         NIXL_ERROR << "Failed to initialize the DC descriptor provider";
         return NIXL_ERR_BACKEND;
