@@ -76,6 +76,10 @@ public:
     deregisterMemory(void *ptr) override;
     std::string
     makeDescriptor(void *ptr, size_t size) override;
+    /// cuFlushGPUDirectRDMAWrites on the GPU's primary context, skipped on a GPU
+    /// whose platform already orders RDMA writes for their owner.
+    nixl_status_t
+    flushRdmaWrites(int dev_id) override;
 
 private:
     /// Per-NIC DC target context, created once at construction.
@@ -143,6 +147,17 @@ private:
     /// once per GPU and logged. Caller must hold mu_.
     bool
     dmabufSupported(int dev_id);
+
+    /// How RDMA writes into a GPU's memory are made visible to it.
+    struct gpuFlush {
+        bool needed = false; ///< the platform does not order the writes for the GPU
+        void *ctx = nullptr; ///< retained primary context, when needed
+    };
+
+    /// Resolve (and cache) the flush state of a GPU, logged once. Caller must
+    /// hold mu_.
+    const gpuFlush &
+    flushStateFor(int dev_id);
     /// Resolve (and cache) the set of NIC indices affine to a GPU. Prefers NICs
     /// that share a PCIe switch with the GPU (PXB/PIX-local); when no NIC is
     /// switch-local (the RDMA NICs sit on a shared bridge equidistant from every
@@ -167,6 +182,8 @@ private:
     std::map<int, std::vector<int>> gpuAffineNics_;
     /// dev_id -> whether its VRAM is registered through DMA-BUF.
     std::map<int, bool> gpuDmabuf_;
+    /// dev_id -> flush state, resolved once per GPU.
+    std::map<int, gpuFlush> gpuFlush_;
     /// Requests handed out per NIC; pickRail favours the least used.
     std::vector<uint64_t> nicIssued_;
     /// Requests that left the owning GPU's affine rails.

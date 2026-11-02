@@ -229,7 +229,13 @@ public:
     void
     resetStatus() {
         firstError_ = NIXL_SUCCESS;
+        flushed_ = false;
     }
+
+    /// GPUs a READ writes into, flushed once before the transfer reports success.
+    std::vector<int> flushDevIds_;
+    /// Set once this post's flushes are done.
+    bool flushed_ = false;
 
 private:
     nixl_status_t firstError_ = NIXL_SUCCESS;
@@ -540,6 +546,12 @@ nixlRestEngine::prepXfer(const nixl_xfer_op_t &operation,
             req_h->reqs_.push_back(std::move(req));
             off += len;
         }
+
+        if ((operation == NIXL_READ) && (local.getType() == VRAM_SEG) &&
+            (std::find(req_h->flushDevIds_.begin(), req_h->flushDevIds_.end(), local[i].devId) ==
+             req_h->flushDevIds_.end())) {
+            req_h->flushDevIds_.push_back(local[i].devId);
+        }
     }
 
     handle = req_h.release();
@@ -590,7 +602,21 @@ nixlRestEngine::checkXfer(nixlBackendReqH *handle) const {
         return NIXL_ERR_INVALID_PARAM;
     }
     nixlRestBackendReqH *req_h = static_cast<nixlRestBackendReqH *>(handle);
-    return req_h->getOverallStatus();
+    const nixl_status_t status = req_h->getOverallStatus();
+    if (status != NIXL_SUCCESS || req_h->flushed_) {
+        return status;
+    }
+    // The server signals a READ done over HTTP, a path not ordered with its RDMA
+    // writes into the GPU: flush them, so a kernel the caller launches next sees
+    // the data.
+    for (const int dev_id : req_h->flushDevIds_) {
+        const nixl_status_t flush_status = descriptorProvider_->flushRdmaWrites(dev_id);
+        if (flush_status != NIXL_SUCCESS) {
+            return flush_status;
+        }
+    }
+    req_h->flushed_ = true;
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t

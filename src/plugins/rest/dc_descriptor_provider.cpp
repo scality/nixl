@@ -107,19 +107,37 @@ struct cudaDriverApi {
     using cu_device_get_attribute_fn_t = int (*)(int *, int, int);
     using cu_mem_get_handle_for_address_range_fn_t =
         int (*)(void *, unsigned long long, size_t, int, unsigned long long);
+    using cu_primary_ctx_retain_fn_t = int (*)(void **, int);
+    using cu_primary_ctx_release_fn_t = int (*)(int);
+    using cu_ctx_push_fn_t = int (*)(void *);
+    using cu_ctx_pop_fn_t = int (*)(void **);
+    using cu_flush_rdma_writes_fn_t = int (*)(int, int);
 
     cu_init_fn_t init = nullptr;
     cu_device_get_fn_t deviceGet = nullptr;
     cu_device_get_pci_bus_id_fn_t deviceGetPciBusId = nullptr;
-    // Optional, for DMA-BUF export; null on drivers that predate it.
+    // Optional, for DMA-BUF export and RDMA write flushes; null on drivers that
+    // predate them.
     cu_device_get_attribute_fn_t deviceGetAttribute = nullptr;
     cu_mem_get_handle_for_address_range_fn_t memGetHandleForAddressRange = nullptr;
+    cu_primary_ctx_retain_fn_t primaryCtxRetain = nullptr;
+    cu_primary_ctx_release_fn_t primaryCtxRelease = nullptr;
+    cu_ctx_push_fn_t ctxPush = nullptr;
+    cu_ctx_pop_fn_t ctxPop = nullptr;
+    cu_flush_rdma_writes_fn_t flushRdmaWrites = nullptr;
     bool ok = false;
 };
 
-// Values from cuda.h (CUdevice_attribute, CUmemRangeHandleType).
+// Values from cuda.h (CUdevice_attribute, CUmemRangeHandleType,
+// CUflushGPUDirectRDMAWrites*, CUGPUDirectRDMAWritesOrdering).
 [[maybe_unused]] constexpr int cu_device_attribute_dma_buf_supported = 124;
 constexpr int cu_mem_range_handle_type_dma_buf_fd = 1;
+constexpr int cu_device_attribute_rdma_flush_writes_options = 117;
+constexpr int cu_device_attribute_rdma_writes_ordering = 118;
+constexpr int cu_flush_rdma_writes_option_host = 1;
+constexpr int cu_rdma_writes_ordering_owner = 100;
+constexpr int cu_flush_rdma_writes_target_current_ctx = 0;
+constexpr int cu_flush_rdma_writes_to_owner = 100;
 
 const cudaDriverApi &
 cudaDriver() {
@@ -142,6 +160,16 @@ cudaDriver() {
         a.memGetHandleForAddressRange =
             reinterpret_cast<cudaDriverApi::cu_mem_get_handle_for_address_range_fn_t>(
                 dlsym(lib, "cuMemGetHandleForAddressRange"));
+        a.primaryCtxRetain = reinterpret_cast<cudaDriverApi::cu_primary_ctx_retain_fn_t>(
+            dlsym(lib, "cuDevicePrimaryCtxRetain"));
+        a.primaryCtxRelease = reinterpret_cast<cudaDriverApi::cu_primary_ctx_release_fn_t>(
+            dlsym(lib, "cuDevicePrimaryCtxRelease_v2"));
+        a.ctxPush =
+            reinterpret_cast<cudaDriverApi::cu_ctx_push_fn_t>(dlsym(lib, "cuCtxPushCurrent_v2"));
+        a.ctxPop =
+            reinterpret_cast<cudaDriverApi::cu_ctx_pop_fn_t>(dlsym(lib, "cuCtxPopCurrent_v2"));
+        a.flushRdmaWrites = reinterpret_cast<cudaDriverApi::cu_flush_rdma_writes_fn_t>(
+            dlsym(lib, "cuFlushGPUDirectRDMAWrites"));
         a.ok = a.init && a.deviceGet && a.deviceGetPciBusId && a.init(0) == 0;
         if (!a.ok) {
             NIXL_WARN << "ibverbs_dc: CUDA driver API unavailable; no GPU/NIC affinity";
@@ -602,6 +630,14 @@ dcDescriptorProvider::~dcDescriptorProvider() {
             }
         }
         buffers_.clear();
+        const cudaDriverApi &cu = cudaDriver();
+        for (auto &kv : gpuFlush_) {
+            int dev = 0;
+            if (kv.second.ctx && cu.deviceGet(&dev, kv.first) == 0) {
+                cu.primaryCtxRelease(dev);
+            }
+        }
+        gpuFlush_.clear();
     }
     for (auto &nic : nics_) {
         releaseNic(nic);
@@ -771,6 +807,78 @@ dcDescriptorProvider::dmabufSupported(int dev_id) {
                               "(nvidia_peermem)");
     gpuDmabuf_[dev_id] = supported;
     return supported;
+}
+
+const dcDescriptorProvider::gpuFlush &
+dcDescriptorProvider::flushStateFor(int dev_id) {
+    auto it = gpuFlush_.find(dev_id);
+    if (it != gpuFlush_.end()) {
+        return it->second;
+    }
+    gpuFlush &state = gpuFlush_[dev_id];
+    const cudaDriverApi &cu = cudaDriver();
+    int dev = 0;
+    int ordering = 0;
+    int options = 0;
+    if (!cu.ok || !cu.deviceGetAttribute || cu.deviceGet(&dev, dev_id) != 0 ||
+        cu.deviceGetAttribute(&ordering, cu_device_attribute_rdma_writes_ordering, dev) != 0) {
+        NIXL_WARN << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+                  << ": cannot query GPUDirect RDMA write ordering; reads are not flushed";
+        return state;
+    }
+    // A flush to the owner is a no-op when the platform already orders the writes
+    // for it.
+    if (ordering >= cu_rdma_writes_ordering_owner) {
+        NIXL_INFO << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+                  << ": GPUDirect RDMA writes are ordered natively; reads need no flush";
+        return state;
+    }
+    void *ctx = nullptr;
+    if (!cu.flushRdmaWrites || !cu.primaryCtxRetain || !cu.primaryCtxRelease || !cu.ctxPush ||
+        !cu.ctxPop ||
+        cu.deviceGetAttribute(&options, cu_device_attribute_rdma_flush_writes_options, dev) != 0 ||
+        !(options & cu_flush_rdma_writes_option_host) || cu.primaryCtxRetain(&ctx, dev) != 0) {
+        NIXL_WARN << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+                  << ": GPUDirect RDMA writes are not ordered and cannot be flushed; a kernel "
+                     "launched right after a read may see stale data";
+        return state;
+    }
+    state.needed = true;
+    state.ctx = ctx;
+    NIXL_INFO << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+              << ": flushing GPUDirect RDMA writes when a read completes";
+    return state;
+}
+
+nixl_status_t
+dcDescriptorProvider::flushRdmaWrites(int dev_id) {
+    void *ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const gpuFlush &state = flushStateFor(dev_id);
+        if (!state.needed) {
+            return NIXL_SUCCESS;
+        }
+        ctx = state.ctx;
+    }
+    // The flush targets the current context: make the GPU's primary context
+    // current on this thread, flush, then restore whatever the caller had.
+    const cudaDriverApi &cu = cudaDriver();
+    int rc = cu.ctxPush(ctx);
+    if (rc != 0) {
+        NIXL_ERROR << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+                   << ": cuCtxPushCurrent failed with CUresult " << rc;
+        return NIXL_ERR_BACKEND;
+    }
+    rc = cu.flushRdmaWrites(cu_flush_rdma_writes_target_current_ctx, cu_flush_rdma_writes_to_owner);
+    void *popped = nullptr;
+    cu.ctxPop(&popped);
+    if (rc != 0) {
+        NIXL_ERROR << "ibverbs_dc: GPU " << visibleToUserGpu(dev_id)
+                   << ": cuFlushGPUDirectRDMAWrites failed with CUresult " << rc;
+        return NIXL_ERR_BACKEND;
+    }
+    return NIXL_SUCCESS;
 }
 
 ibv_mr *

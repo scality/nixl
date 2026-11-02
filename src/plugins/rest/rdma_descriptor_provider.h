@@ -57,6 +57,17 @@ public:
      */
     virtual std::string
     makeDescriptor(void *ptr, size_t size) = 0;
+
+    /**
+     * Make the RDMA writes the server performed into the memory of GPU dev_id
+     * visible to that GPU. Called once a READ into its VRAM has completed and
+     * before the transfer reports success, so the caller's next kernel never
+     * reads stale data. A provider whose writes need no flush keeps the default.
+     */
+    virtual nixl_status_t
+    flushRdmaWrites(int dev_id) {
+        return NIXL_SUCCESS;
+    }
 };
 
 #endif // NIXL_SRC_PLUGINS_REST_RDMA_DESCRIPTOR_PROVIDER_H
