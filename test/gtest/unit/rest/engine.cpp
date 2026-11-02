@@ -140,10 +140,12 @@ namespace {
 
         std::vector<registration> registered;
         std::vector<uintptr_t> deregistered;
+        std::vector<int> flushed; ///< GPUs flushRdmaWrites was called for, in order
         uintptr_t unregisteredAddr = 0; ///< isRegistered is false for a range starting here
         uintptr_t failAddr = 0; ///< openAccess fails for a range starting here
         std::vector<uint64_t> opened; ///< ids openAccess gave, in order
         std::vector<uint64_t> closed; ///< ids closeAccess was called for, in order
+        nixl_status_t flushStatus = NIXL_SUCCESS; ///< what flushRdmaWrites returns
 
         static std::string
         descriptorFor(uintptr_t ptr, size_t size) {
@@ -188,6 +190,12 @@ namespace {
         closeAccess(uint64_t id) override {
             closed.push_back(id);
             return NIXL_SUCCESS;
+        }
+
+        nixl_status_t
+        flushRdmaWrites(int dev_id) override {
+            flushed.push_back(dev_id);
+            return flushStatus;
         }
     };
 
@@ -552,6 +560,115 @@ TEST_F(restEngineTest, ReleaseWaitsForOutstandingRequests) {
     rest_->complete(0, true);
     releaser.join();
     EXPECT_TRUE(released.load());
+}
+
+// ---------------------------------------------------------------------------
+// Flushing the RDMA writes of a READ into GPU memory
+// ---------------------------------------------------------------------------
+
+// Each GPU the READ wrote into is flushed once, only after every request has
+// completed, and a later check does not flush again.
+TEST_F(restEngineTest, VramReadFlushesEachGpuOnceBeforeSuccess) {
+    makeEngine();
+    ASSERT_EQ(registerMem(OBJ_SEG, 0, 0, obj_dev, "obj"), NIXL_SUCCESS);
+    ASSERT_EQ(registerMem(VRAM_SEG, local_addr, 4096, 1), NIXL_SUCCESS);
+    ASSERT_EQ(registerMem(VRAM_SEG, local_addr + 0x10000, 4096, 2), NIXL_SUCCESS);
+
+    const auto local =
+        dlist(VRAM_SEG,
+              {{local_addr, 100, 1}, {local_addr + 0x10000, 100, 2}, {local_addr + 100, 100, 1}});
+    const auto remote =
+        dlist(OBJ_SEG, {{0, 100, obj_dev}, {100, 100, obj_dev}, {200, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+
+    rest_->complete(0, true);
+    rest_->complete(1, true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_IN_PROG);
+    EXPECT_TRUE(provider_->flushed.empty()) << "flushed while a request was still running";
+
+    rest_->complete(2, true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+    EXPECT_EQ(provider_->flushed, (std::vector<int>{1, 2}));
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+    EXPECT_EQ(provider_->flushed.size(), 2u) << "a second check flushed again";
+    releaseHandle();
+}
+
+// The server reads GPU memory on a WRITE and writes host memory on a DRAM READ:
+// neither leaves RDMA writes in a GPU to flush.
+TEST_F(restEngineTest, WriteAndDramReadAreNotFlushed) {
+    makeEngine();
+    registerDefaults();
+    ASSERT_EQ(registerMem(VRAM_SEG, local_addr + 0x200000, 4096, 1), NIXL_SUCCESS);
+
+    const auto vram = dlist(VRAM_SEG, {{local_addr + 0x200000, 100, 1}});
+    const auto remote = dlist(OBJ_SEG, {{0, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_WRITE, vram, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_WRITE, vram, remote), NIXL_IN_PROG);
+    rest_->completeAll(true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+    releaseHandle();
+
+    const auto dram = dlist(DRAM_SEG, {{local_addr, 100, 0}});
+    ASSERT_EQ(prep(NIXL_READ, dram, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, dram, remote), NIXL_IN_PROG);
+    rest_->calls.back().done(true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+    releaseHandle();
+
+    EXPECT_TRUE(provider_->flushed.empty());
+}
+
+// A failed READ reports its error and flushes nothing: the buffer holds no data
+// to make visible.
+TEST_F(restEngineTest, FailedVramReadIsNotFlushed) {
+    makeEngine();
+    ASSERT_EQ(registerMem(OBJ_SEG, 0, 0, obj_dev, "obj"), NIXL_SUCCESS);
+    ASSERT_EQ(registerMem(VRAM_SEG, local_addr, 4096, 1), NIXL_SUCCESS);
+
+    const auto local = dlist(VRAM_SEG, {{local_addr, 100, 1}});
+    const auto remote = dlist(OBJ_SEG, {{0, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    rest_->complete(0, false);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_ERR_BACKEND);
+    EXPECT_TRUE(provider_->flushed.empty());
+    releaseHandle();
+}
+
+// A READ whose flush fails must not report success: its data may not be visible.
+TEST_F(restEngineTest, FlushFailureFailsTheRead) {
+    makeEngine();
+    ASSERT_EQ(registerMem(OBJ_SEG, 0, 0, obj_dev, "obj"), NIXL_SUCCESS);
+    ASSERT_EQ(registerMem(VRAM_SEG, local_addr, 4096, 1), NIXL_SUCCESS);
+    provider_->flushStatus = NIXL_ERR_BACKEND;
+
+    const auto local = dlist(VRAM_SEG, {{local_addr, 100, 1}});
+    const auto remote = dlist(OBJ_SEG, {{0, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    rest_->complete(0, true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_ERR_BACKEND);
+    releaseHandle();
+}
+
+// Every post of a prepared handle writes the buffer again, so each is flushed.
+TEST_F(restEngineTest, RepostedVramReadIsFlushedAgain) {
+    makeEngine();
+    ASSERT_EQ(registerMem(OBJ_SEG, 0, 0, obj_dev, "obj"), NIXL_SUCCESS);
+    ASSERT_EQ(registerMem(VRAM_SEG, local_addr, 4096, 1), NIXL_SUCCESS);
+
+    const auto local = dlist(VRAM_SEG, {{local_addr, 100, 1}});
+    const auto remote = dlist(OBJ_SEG, {{0, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    for (size_t i = 0; i < 2; ++i) {
+        ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+        rest_->complete(i, true);
+        EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+        EXPECT_EQ(provider_->flushed.size(), i + 1) << "post " << i;
+    }
+    releaseHandle();
 }
 
 // ---------------------------------------------------------------------------
