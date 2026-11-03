@@ -145,6 +145,8 @@ namespace {
         uintptr_t failAddr = 0; ///< openAccess fails for a range starting here
         std::vector<uint64_t> opened; ///< ids openAccess gave, in order
         std::vector<uint64_t> closed; ///< ids closeAccess was called for, in order
+        nixl_status_t closeStatus = NIXL_SUCCESS; ///< what closeAccess returns
+        std::function<void(uint64_t)> onClose; ///< runs inside closeAccess
         nixl_status_t flushStatus = NIXL_SUCCESS; ///< what flushRdmaWrites returns
 
         static std::string
@@ -189,7 +191,10 @@ namespace {
         nixl_status_t
         closeAccess(uint64_t id) override {
             closed.push_back(id);
-            return NIXL_SUCCESS;
+            if (onClose) {
+                onClose(id);
+            }
+            return closeStatus;
         }
 
         nixl_status_t
@@ -486,6 +491,86 @@ TEST_F(restEngineTest, UnregisteredRangeFailsPreparation) {
     EXPECT_TRUE(provider_->opened.empty()) << "preparing must not open any access";
 }
 
+// An access that cannot be opened fails the post before any request is sent,
+// and the accesses already opened are closed: nothing is left reaching the
+// buffer.
+TEST_F(restEngineTest, AccessThatCannotOpenFailsThePostBeforeSending) {
+    makeEngine();
+    registerDefaults();
+    provider_->failAddr = local_addr + 4096;
+
+    const auto local = dlist(DRAM_SEG, {{local_addr, 3 * 4096, 0}});
+    const auto remote = dlist(OBJ_SEG, {{0, 3 * 4096, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    EXPECT_EQ(post(NIXL_READ, local, remote), NIXL_ERR_BACKEND);
+    EXPECT_TRUE(rest_->calls.empty());
+    EXPECT_EQ(provider_->opened, (std::vector<uint64_t>{1}));
+    EXPECT_EQ(provider_->closed, provider_->opened);
+    releaseHandle();
+}
+
+// Each post opens an access per request: the NIC is chosen per request, and an
+// access is closed once its request has finished.
+TEST_F(restEngineTest, EveryPostOpensItsOwnAccesses) {
+    makeEngine();
+    registerDefaults();
+
+    const auto local = dlist(DRAM_SEG, {{local_addr, 2 * 4096, 0}});
+    const auto remote = dlist(OBJ_SEG, {{0, 2 * 4096, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    EXPECT_TRUE(provider_->opened.empty());
+    for (size_t post_nr = 1; post_nr <= 2; ++post_nr) {
+        ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+        EXPECT_EQ(provider_->opened.size(), 2 * post_nr) << "post " << post_nr;
+        rest_->completeAll(true);
+        EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+        rest_->calls.clear();
+    }
+    EXPECT_EQ(provider_->closed, provider_->opened);
+    releaseHandle();
+}
+
+// A request's access closes when it finishes, whatever its outcome, and before
+// that outcome is reported: the caller who sees it may reuse the buffer.
+TEST_F(restEngineTest, AccessClosesBeforeTheOutcomeIsReported) {
+    makeEngine();
+    registerDefaults();
+
+    const auto local = dlist(DRAM_SEG, {{local_addr, 2 * 4096, 0}});
+    const auto remote = dlist(OBJ_SEG, {{0, 2 * 4096, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    ASSERT_EQ(rest_->calls.size(), 2u);
+
+    std::vector<nixl_status_t> status_at_close;
+    provider_->onClose = [&](uint64_t) { status_at_close.push_back(engine_->checkXfer(handle_)); };
+    rest_->complete(1, false);
+    EXPECT_EQ(provider_->closed, (std::vector<uint64_t>{2})) << "a failed request closes too";
+    rest_->complete(0, true);
+    EXPECT_EQ(provider_->closed, (std::vector<uint64_t>{2, 1}));
+    EXPECT_EQ(status_at_close, (std::vector<nixl_status_t>{NIXL_IN_PROG, NIXL_IN_PROG}))
+        << "the transfer finished before its last access closed";
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_ERR_BACKEND);
+    provider_->onClose = nullptr;
+    releaseHandle();
+}
+
+// An access that cannot be closed fails its request, even one the server
+// completed: the buffer must not be reused.
+TEST_F(restEngineTest, AccessThatCannotCloseFailsTheRequest) {
+    makeEngine();
+    registerDefaults();
+    provider_->closeStatus = NIXL_ERR_BACKEND;
+
+    const auto local = dlist(DRAM_SEG, {{local_addr, 100, 0}});
+    const auto remote = dlist(OBJ_SEG, {{0, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    rest_->complete(0, true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_ERR_BACKEND);
+    releaseHandle();
+}
+
 // ---------------------------------------------------------------------------
 // Transfer status
 // ---------------------------------------------------------------------------
@@ -688,6 +773,7 @@ TEST_F(restEngineTest, DramWithoutRdmaPinsNothingAndReadsOverHttp) {
 
     ASSERT_EQ(rest_->calls.size(), 1u);
     EXPECT_EQ(rest_->calls[0].method, restCall::kind::BODY);
+    EXPECT_TRUE(provider_->opened.empty()) << "a body read opens no RDMA access";
     EXPECT_EQ(rest_->calls[0].addr, local_addr);
     EXPECT_EQ(rest_->calls[0].len, 10000u);
     EXPECT_EQ(rest_->calls[0].offset, 1000u);
