@@ -664,46 +664,61 @@ nixlRestEngine::queryMem(const nixl_reg_dlist_t &descs,
     state->resp.assign(descs.descCount(), std::nullopt);
     state->settled.assign(descs.descCount(), false);
 
+    const size_t count = descs.descCount();
     std::vector<std::future<void>> futures;
-    futures.reserve(descs.descCount());
+    futures.reserve((count + max_keys_per_exists_batch - 1) / max_keys_per_exists_batch);
 
-    // One aggregate deadline for all checks: concurrent HEADs share a single
-    // bound, so a hung endpoint can't make this block for 30s * descCount().
+    // One aggregate deadline for all batches, so a hung endpoint can't make this
+    // block for 30s per batch.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
-    for (int i = 0; i < descs.descCount(); ++i) {
-        const auto &desc = descs[i];
-        // Mirror the key convention used by registerMem: metaInfo, or the
-        // device id when no key was supplied.
-        std::string key = objKeyFor(desc.metaInfo, desc.devId);
+    for (size_t first = 0; first < count; first += max_keys_per_exists_batch) {
+        const size_t end = std::min(count, first + max_keys_per_exists_batch);
+        std::vector<std::string> keys;
+        keys.reserve(end - first);
+        for (size_t i = first; i < end; ++i) {
+            const auto &desc = descs[static_cast<int>(i)];
+            // Mirror the key convention used by registerMem: metaInfo, or the
+            // device id when no key was supplied.
+            keys.push_back(objKeyFor(desc.metaInfo, desc.devId));
+        }
 
         auto promise = std::make_shared<std::promise<void>>();
         futures.push_back(promise->get_future());
 
-        connectorClient_->checkObjectExistsAsync(
-            key, [state, i, promise](std::optional<bool> exists) {
+        connectorClient_->checkObjectsExistAsync(
+            std::move(keys),
+            [state, first, end, promise](std::vector<std::optional<bool>> exists) {
                 {
                     std::lock_guard<std::mutex> lk(state->mu);
-                    if (state->settled[i]) {
-                        return;
-                    }
-                    state->settled[i] = true;
-                    if (!exists.has_value()) {
-                        state->hasError = true;
-                    } else if (*exists) {
-                        state->resp[i] = nixl_query_resp_t{nixl_b_params_t{}};
+                    for (size_t i = first; i < end; ++i) {
+                        if (state->settled[i]) {
+                            continue;
+                        }
+                        state->settled[i] = true;
+                        const std::optional<bool> e =
+                            i - first < exists.size() ? exists[i - first] : std::nullopt;
+                        if (!e.has_value()) {
+                            state->hasError = true;
+                        } else if (*e) {
+                            state->resp[i] = nixl_query_resp_t{nixl_b_params_t{}};
+                        }
                     }
                 }
                 promise->set_value();
             });
     }
 
-    for (size_t i = 0; i < futures.size(); ++i) {
-        if (futures[i].wait_until(deadline) == std::future_status::timeout) {
+    for (size_t b = 0; b < futures.size(); ++b) {
+        if (futures[b].wait_until(deadline) == std::future_status::timeout) {
+            const size_t first = b * max_keys_per_exists_batch;
+            const size_t end = std::min(count, first + max_keys_per_exists_batch);
             std::lock_guard<std::mutex> lk(state->mu);
-            if (!state->settled[i]) {
-                state->settled[i] = true;
-                state->hasError = true;
+            for (size_t i = first; i < end; ++i) {
+                if (!state->settled[i]) {
+                    state->settled[i] = true;
+                    state->hasError = true;
+                }
             }
         }
     }

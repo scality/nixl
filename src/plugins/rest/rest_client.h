@@ -40,6 +40,10 @@ using put_object_callback_t = std::function<void(bool success)>;
 using get_object_callback_t = std::function<void(bool success)>;
 // true = exists, false = not found, std::nullopt = request error
 using check_object_callback_t = std::function<void(std::optional<bool> exists)>;
+// One answer per key, in the order of the keys, each as check_object_callback_t's.
+using check_objects_callback_t = std::function<void(std::vector<std::optional<bool>> exists)>;
+// Keys checkObjectsExistAsync sends in one request: the server's limit.
+constexpr std::size_t max_keys_per_exists_batch = 1000;
 // Builds a request's RDMA descriptor when the request starts; an empty one fails
 // the request without sending it.
 using rdma_descriptor_fn_t = std::function<std::string()>;
@@ -123,6 +127,15 @@ public:
      */
     virtual void
     checkObjectExistsAsync(std::string_view key, check_object_callback_t callback) = 0;
+
+    /**
+     * Asynchronously check whether several objects exist. This default sends one
+     * checkObjectExistsAsync per key.
+     * @param keys The object keys
+     * @param callback Called once, with one answer per key in the order of keys
+     */
+    virtual void
+    checkObjectsExistAsync(std::vector<std::string> keys, check_objects_callback_t callback);
 };
 
 /// Default limit on a whole request, connection included.
@@ -182,6 +195,16 @@ public:
     void
     checkObjectExistsAsync(std::string_view key, check_object_callback_t callback) override;
 
+    /**
+     * One POST {endpoint}/.batch_exists for up to max_keys_per_exists_batch keys.
+     * Falls back to one HEAD per key for keys the text body can't carry, for more
+     * keys than one request takes, for a batch the server refuses, and for good
+     * once the server says it doesn't know the operation.
+     */
+    void
+    checkObjectsExistAsync(std::vector<std::string> keys,
+                           check_objects_callback_t callback) override;
+
 private:
     /// Per-request state for an in-flight curl_multi transfer. Defined in client.cpp.
     struct requestCtx;
@@ -240,6 +263,8 @@ private:
     /// Requests failed by the backlog drain, reported once at teardown rather
     /// than one log line each. Poller-thread only.
     std::size_t fdAbandoned_ = 0;
+    /// The server answered that it doesn't know .batch_exists: check with HEADs.
+    std::atomic<bool> batchExistsUnsupported_{false};
 
     std::string
     buildUrl(std::string_view key) const;
@@ -297,6 +322,12 @@ private:
     /// and free the context. Poller-thread only.
     void
     finishRequest(requestCtx *ctx, CURLcode res, long http_code);
+
+    /// finishRequest for a .batch_exists POST: dispatch one answer per key, or
+    /// check the keys again with HEADs if the server refused the batch.
+    /// Poller-thread only.
+    void
+    finishExistsBatch(requestCtx *ctx, CURLcode res, long http_code);
 };
 
 #endif // NIXL_SRC_PLUGINS_REST_REST_CLIENT_H

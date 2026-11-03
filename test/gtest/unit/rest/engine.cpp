@@ -149,6 +149,15 @@ namespace {
             callback(it == exists.end() ? std::nullopt : it->second);
         }
 
+        std::vector<size_t> batchSizes; ///< keys per checkObjectsExistAsync, in order
+
+        void
+        checkObjectsExistAsync(std::vector<std::string> keys,
+                               check_objects_callback_t callback) override {
+            batchSizes.push_back(keys.size());
+            iRestClient::checkObjectsExistAsync(std::move(keys), std::move(callback));
+        }
+
         // Requests that failed to start have already completed.
         void
         complete(size_t i, bool ok) {
@@ -883,7 +892,7 @@ TEST_F(restEngineTest, DramWithoutRdmaLeavesVramOnRdma) {
 }
 
 // ---------------------------------------------------------------------------
-// queryMem: object existence through HEAD
+// queryMem: object existence, in batches of keys
 // ---------------------------------------------------------------------------
 
 TEST_F(restEngineTest, QueryMemReportsWhichObjectsExist) {
@@ -918,6 +927,29 @@ TEST_F(restEngineTest, QueryMemFailsWhenACheckFails) {
     ASSERT_EQ(resp.size(), 2u);
     EXPECT_TRUE(resp[0].has_value());
     EXPECT_FALSE(resp[1].has_value());
+}
+
+TEST_F(restEngineTest, QueryMemChecksAtMostOneBatchOfKeysPerRequest) {
+    makeEngine();
+    const size_t count = 2 * max_keys_per_exists_batch + 5;
+    nixl_reg_dlist_t descs(OBJ_SEG);
+    for (size_t i = 0; i < count; ++i) {
+        const std::string key = "key" + std::to_string(i);
+        rest_->exists[key] = i % 2 == 0;
+        nixlBlobDesc desc = {};
+        desc.metaInfo = key;
+        descs.addDesc(desc);
+    }
+
+    std::vector<nixl_query_resp_t> resp;
+    EXPECT_EQ(engine_->queryMem(descs, resp), NIXL_SUCCESS);
+
+    const std::vector<size_t> expected = {max_keys_per_exists_batch, max_keys_per_exists_batch, 5};
+    EXPECT_EQ(rest_->batchSizes, expected);
+    ASSERT_EQ(resp.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        EXPECT_EQ(resp[i].has_value(), i % 2 == 0) << "descriptor " << i;
+    }
 }
 
 } // namespace gtest::rest

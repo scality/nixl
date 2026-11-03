@@ -47,6 +47,59 @@ captureBody(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return n;
 }
 
+/// A .batch_exists answer holds a "NNN\n" line per key. One byte more is kept so
+/// that a longer body fails to parse instead of being read as a complete answer.
+constexpr size_t max_captured_exists_answer = max_keys_per_exists_batch * 4 + 1;
+
+size_t
+captureExistsAnswer(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    auto *body = static_cast<std::string *>(userdata);
+    const size_t n = size * nmemb;
+    if (body->size() < max_captured_exists_answer) {
+        body->append(static_cast<char *>(ptr),
+                     std::min(n, max_captured_exists_answer - body->size()));
+    }
+    return n;
+}
+
+/// True if a key can go in a .batch_exists text body: one key per line, and
+/// sproxyd refuses the whole batch for a key starting with '.'.
+bool
+fitsExistsBatch(std::string_view key) {
+    constexpr std::string_view line_breaks("\r\n\0", 3);
+    return !key.empty() && key.front() != '.' && key.find_first_of(line_breaks) == key.npos;
+}
+
+/// The answer per key of a .batch_exists text answer: 200 exists, 404 does not,
+/// any other status is an error. nullopt if it doesn't hold one line per key.
+std::optional<std::vector<std::optional<bool>>>
+parseExistsAnswer(std::string_view body, size_t count) {
+    std::vector<std::optional<bool>> exists;
+    exists.reserve(count);
+    while (!body.empty()) {
+        const size_t eol = body.find('\n');
+        if (eol == body.npos) {
+            return std::nullopt;
+        }
+        const std::string_view line = body.substr(0, eol);
+        body.remove_prefix(eol + 1);
+        if (line == "200") {
+            exists.emplace_back(true);
+        } else if (line == "404") {
+            exists.emplace_back(false);
+        } else if (line.size() == 3 &&
+                   std::all_of(line.begin(), line.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+            exists.emplace_back(std::nullopt);
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (exists.size() != count) {
+        return std::nullopt;
+    }
+    return exists;
+}
+
 /// Destination of a plain-HTTP body read: the caller's buffer and its capacity.
 struct httpBodySink {
     char *dst = nullptr;
@@ -269,7 +322,7 @@ descriptorsExhausted() {
 
 } // namespace
 
-enum class rest_method { PUT, GET, HEAD };
+enum class rest_method { PUT, GET, HEAD, POST };
 
 // Per-request state for an in-flight curl_multi transfer. Owns its easy handle,
 // header list, and response buffer for the full transfer lifetime; the user
@@ -284,6 +337,10 @@ struct restClient::requestCtx {
     rest_method method = rest_method::GET;
     std::function<void(bool)> boolCb; // Put/Get
     std::function<void(std::optional<bool>)> checkCb; // Head
+    check_objects_callback_t batchCb; // Post .batch_exists
+    /// The keys of a .batch_exists, kept to check them one by one if it is refused.
+    std::vector<std::string> batchKeys;
+    std::string requestBody;
     /// Set only for a plain-HTTP body read. dst == nullptr means the body is error
     /// text bound for responseBody, as it is for every RDMA and HEAD request.
     httpBodySink sink;
@@ -329,11 +386,19 @@ restClient::buildEasy(requestCtx *ctx) const {
     case rest_method::HEAD:
         curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
         break;
+    case rest_method::POST:
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, ctx->requestBody.data());
+        curl_easy_setopt(
+            curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(ctx->requestBody.size()));
+        break;
     }
     if (ctx->headers) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, ctx->headers);
     }
-    if (ctx->sink.dst != nullptr) {
+    if (ctx->method == rest_method::POST) {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, captureExistsAnswer);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx->responseBody);
+    } else if (ctx->sink.dst != nullptr) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeToSink);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx->sink);
     } else {
@@ -389,7 +454,9 @@ restClient::finishRequest(requestCtx *ctx, CURLcode res, long http_code) {
         ++totalRequests_;
     }
 
-    if (ctx->method == rest_method::HEAD) {
+    if (ctx->method == rest_method::POST) {
+        finishExistsBatch(ctx, res, http_code);
+    } else if (ctx->method == rest_method::HEAD) {
         std::optional<bool> result;
         if (res != CURLE_OK) {
             NIXL_ERROR << absl::StrFormat(
@@ -484,6 +551,68 @@ restClient::finishRequest(requestCtx *ctx, CURLcode res, long http_code) {
         });
     }
     delete ctx;
+}
+
+void
+restClient::finishExistsBatch(requestCtx *ctx, CURLcode res, long http_code) {
+    const bool answered = res == CURLE_OK;
+    // A refused batch is checked again with one HEAD per key. Not while stopping:
+    // the poller would exit before it starts them.
+    if (answered && http_code == 400 && !stop_.load()) {
+        if (ctx->responseBody.find("unsupported operation") != std::string::npos) {
+            NIXL_INFO << absl::StrFormat(
+                "checkObjectsExistAsync: %s doesn't support .batch_exists; checking each key "
+                "with HEAD from now on",
+                endpoint_);
+            batchExistsUnsupported_.store(true);
+        } else {
+            NIXL_ERROR << absl::StrFormat(
+                "checkObjectsExistAsync: %s refused a batch of %zu keys, checking them with "
+                "HEAD: %s",
+                ctx->url,
+                ctx->batchKeys.size(),
+                ctx->responseBody);
+        }
+        iRestClient::checkObjectsExistAsync(std::move(ctx->batchKeys), std::move(ctx->batchCb));
+        return;
+    }
+
+    std::optional<std::vector<std::optional<bool>>> exists;
+    if (!answered) {
+        NIXL_ERROR << absl::StrFormat(
+            "checkObjectsExistAsync: curl_code=%d (%s) os_errno=%s for POST %s",
+            static_cast<int>(res),
+            curlErrorText(res, ctx->errorBuf),
+            osErrnoText(ctx->easy),
+            ctx->url);
+    } else if (http_code != 200) {
+        NIXL_ERROR << absl::StrFormat("checkObjectsExistAsync: HTTP %ld for POST %s: %s",
+                                      http_code,
+                                      ctx->url,
+                                      ctx->responseBody);
+    } else {
+        exists = parseExistsAnswer(ctx->responseBody, ctx->batchKeys.size());
+        if (!exists) {
+            NIXL_ERROR << absl::StrFormat(
+                "checkObjectsExistAsync: POST %s did not answer one status per key for %zu "
+                "keys: %s",
+                ctx->url,
+                ctx->batchKeys.size(),
+                ctx->responseBody);
+        }
+    }
+    if (!exists) {
+        exists.emplace(ctx->batchKeys.size(), std::nullopt);
+    }
+    asio::post(pool_, [cb = std::move(ctx->batchCb), exists = std::move(*exists)]() mutable {
+        try {
+            if (cb) {
+                cb(std::move(exists));
+            }
+        }
+        catch (...) {
+        }
+    });
 }
 
 restClient::restClient(nixl_b_params_t *custom_params)
@@ -971,6 +1100,84 @@ restClient::checkObjectExistsAsync(std::string_view key, check_object_callback_t
         }
         return;
     }
+
+    buildEasy(ctx.get());
+    enqueue(std::move(ctx));
+}
+
+void
+iRestClient::checkObjectsExistAsync(std::vector<std::string> keys,
+                                    check_objects_callback_t callback) {
+    if (keys.empty()) {
+        if (callback) {
+            callback({});
+        }
+        return;
+    }
+
+    struct checks {
+        std::mutex mu;
+        std::vector<std::optional<bool>> exists;
+        size_t left;
+        check_objects_callback_t callback;
+    };
+
+    auto state = std::make_shared<checks>();
+    state->exists.assign(keys.size(), std::nullopt);
+    state->left = keys.size();
+    state->callback = std::move(callback);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        checkObjectExistsAsync(keys[i], [state, i](std::optional<bool> exists) {
+            {
+                const std::lock_guard<std::mutex> lk(state->mu);
+                state->exists[i] = exists;
+                if (--state->left > 0) {
+                    return;
+                }
+            }
+            if (state->callback) {
+                state->callback(std::move(state->exists));
+            }
+        });
+    }
+}
+
+void
+restClient::checkObjectsExistAsync(std::vector<std::string> keys,
+                                   check_objects_callback_t callback) {
+    const bool fits = !keys.empty() && keys.size() <= max_keys_per_exists_batch &&
+        std::all_of(keys.begin(), keys.end(), fitsExistsBatch);
+    if (!fits || batchExistsUnsupported_.load()) {
+        iRestClient::checkObjectsExistAsync(std::move(keys), std::move(callback));
+        return;
+    }
+
+    auto ctx = std::make_unique<requestCtx>();
+    ctx->client = this;
+    ctx->opName = "checkObjectsExistAsync";
+    ctx->method = rest_method::POST;
+    ctx->url = absl::StrFormat("%s/.batch_exists", endpoint_);
+    for (const std::string &key : keys) {
+        ctx->requestBody += key;
+        ctx->requestBody += '\n';
+    }
+    ctx->batchKeys = std::move(keys);
+    ctx->batchCb = std::move(callback);
+
+    ctx->easy = acquireEasy();
+    if (!ctx->easy) {
+        NIXL_ERROR << "checkObjectsExistAsync: curl_easy_init failed";
+        if (ctx->batchCb) {
+            ctx->batchCb(std::vector<std::optional<bool>>(ctx->batchKeys.size()));
+        }
+        return;
+    }
+
+    ctx->headers = curl_slist_append(ctx->headers, "Content-Type: text/plain");
+    ctx->headers = curl_slist_append(ctx->headers, "Accept: text/plain");
+    // Send the body at once: waiting for a 100 Continue costs a round trip.
+    ctx->headers = curl_slist_append(ctx->headers, "Expect:");
 
     buildEasy(ctx.get());
     enqueue(std::move(ctx));

@@ -25,7 +25,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <future>
+#include <mutex>
 #include <netinet/in.h>
 #include <optional>
 #include <string>
@@ -189,6 +191,117 @@ public:
 private:
     int fd_ = -1;
     int port_ = 0;
+};
+
+// A loopback HTTP server for any number of requests, one per connection. It
+// reads each request with its body, records it, and answers what answer_fn
+// returns for it.
+class scriptedServer {
+public:
+    struct answer {
+        int status;
+        std::string body;
+    };
+
+    using answer_fn_t = std::function<answer(const std::string &request)>;
+
+    explicit scriptedServer(answer_fn_t answer_fn) : answerFn_(std::move(answer_fn)) {
+        listenFd_ = socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT_GE(listenFd_, 0) << "socket() failed: " << strerror(errno);
+
+        int opt = 1;
+        setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in addr{};
+
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        EXPECT_EQ(bind(listenFd_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)), 0)
+            << "bind() failed: " << strerror(errno);
+        EXPECT_EQ(listen(listenFd_, 64), 0) << "listen() failed: " << strerror(errno);
+
+        socklen_t len = sizeof(addr);
+        getsockname(listenFd_, reinterpret_cast<struct sockaddr *>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+
+        thread_ = std::thread(&scriptedServer::serve, this);
+    }
+
+    ~scriptedServer() {
+        ::shutdown(listenFd_, SHUT_RDWR);
+        close(listenFd_);
+        thread_.join();
+    }
+
+    int
+    port() const {
+        return port_;
+    }
+
+    /// The requests answered so far, in the order they arrived.
+    std::vector<std::string>
+    requests() {
+        const std::lock_guard<std::mutex> lk(mu_);
+        return requests_;
+    }
+
+private:
+    void
+    serve() {
+        for (;;) {
+            const int client_fd = accept(listenFd_, nullptr, nullptr);
+            if (client_fd < 0) {
+                return;
+            }
+            const std::string request = readRequest(client_fd);
+            const answer a = answerFn_(request);
+            {
+                const std::lock_guard<std::mutex> lk(mu_);
+                requests_.push_back(request);
+            }
+            const std::string response = "HTTP/1.1 " + std::to_string(a.status) +
+                " X\r\nConnection: close\r\nContent-Length: " + std::to_string(a.body.size()) +
+                "\r\n\r\n" + a.body;
+            send(client_fd, response.data(), response.size(), 0);
+            close(client_fd);
+        }
+    }
+
+    static std::string
+    readRequest(int fd) {
+        std::string request;
+        char buf[4096];
+        size_t end = std::string::npos;
+        size_t content_length = 0;
+        for (;;) {
+            if (end == std::string::npos) {
+                end = request.find("\r\n\r\n");
+                if (end != std::string::npos) {
+                    end += 4;
+                    const size_t at = request.find("Content-Length: ");
+                    if (at != std::string::npos && at < end) {
+                        content_length = std::stoul(request.substr(at + 16));
+                    }
+                }
+            }
+            if (end != std::string::npos && request.size() >= end + content_length) {
+                return request;
+            }
+            const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                return request;
+            }
+            request.append(buf, static_cast<std::string::size_type>(n));
+        }
+    }
+
+    answer_fn_t answerFn_;
+    int listenFd_ = -1;
+    int port_ = 0;
+    std::thread thread_;
+    std::mutex mu_;
+    std::vector<std::string> requests_;
 };
 
 static nixl_b_params_t
@@ -593,6 +706,177 @@ TEST_F(restClientTest, CheckExistsReturnsErrorOn500) {
 
     EXPECT_TRUE(done.load()) << "Callback was never invoked";
     EXPECT_FALSE(result.has_value()) << "Expected error (nullopt) for HTTP 500";
+}
+
+// ---------------------------------------------------------------------------
+// Existence check of many keys (POST .batch_exists)
+// ---------------------------------------------------------------------------
+
+using exists_t = std::vector<std::optional<bool>>;
+
+// Runs one checkObjectsExistAsync and returns its answer.
+static exists_t
+checkAll(restClient &client, std::vector<std::string> keys) {
+    std::atomic<bool> done{false};
+    exists_t result;
+    client.checkObjectsExistAsync(std::move(keys), [&](exists_t exists) {
+        result = std::move(exists);
+        done = true;
+    });
+    waitForCallback(done);
+    EXPECT_TRUE(done.load()) << "callback never invoked";
+    return result;
+}
+
+static bool
+isBatchPost(const std::string &request) {
+    return request.rfind("POST /.batch_exists ", 0) == 0;
+}
+
+// A HEAD answer: 404 for a key containing "absent", 200 otherwise.
+static scriptedServer::answer
+headAnswer(const std::string &request) {
+    EXPECT_EQ(request.rfind("HEAD /", 0), 0u) << request;
+    const std::string line = request.substr(0, request.find("\r\n"));
+    return {line.find("absent") == std::string::npos ? 200 : 404, ""};
+}
+
+TEST_F(restClientTest, BatchExistsPostsTheKeysAsText) {
+    scriptedServer server([](const std::string &) -> scriptedServer::answer {
+        return {200, "200\n404\n500\n"};
+    });
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    const exists_t result = checkAll(client, {"a", "dir/b", "c"});
+
+    const exists_t expected = {true, false, std::nullopt};
+    EXPECT_EQ(result, expected);
+    const std::vector<std::string> requests = server.requests();
+    ASSERT_EQ(requests.size(), 1u);
+    const std::string &req = requests[0];
+    EXPECT_TRUE(isBatchPost(req)) << req;
+    EXPECT_NE(req.find("Content-Type: text/plain\r\n"), std::string::npos) << req;
+    EXPECT_NE(req.find("Accept: text/plain\r\n"), std::string::npos) << req;
+    EXPECT_EQ(req.find("Expect:"), std::string::npos) << "waits for a 100 Continue:\n" << req;
+    EXPECT_EQ(req.substr(req.find("\r\n\r\n") + 4), "a\ndir/b\nc\n");
+}
+
+TEST_F(restClientTest, BatchExistsFailsEveryKeyOnALineCountMismatch) {
+    scriptedServer server([](const std::string &) -> scriptedServer::answer {
+        return {200, "200\n"};
+    });
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    const exists_t expected = {std::nullopt, std::nullopt};
+    EXPECT_EQ(checkAll(client, {"a", "b"}), expected);
+}
+
+TEST_F(restClientTest, BatchExistsFailsEveryKeyOnAMalformedAnswer) {
+    scriptedServer server([](const std::string &) -> scriptedServer::answer {
+        return {200, "200\nyes\n"};
+    });
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    const exists_t expected = {std::nullopt, std::nullopt};
+    EXPECT_EQ(checkAll(client, {"a", "b"}), expected);
+}
+
+TEST_F(restClientTest, BatchExistsFailsEveryKeyOnAServerError) {
+    scriptedServer server([](const std::string &) -> scriptedServer::answer {
+        return {500, "boom"};
+    });
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    const exists_t expected = {std::nullopt, std::nullopt};
+    EXPECT_EQ(checkAll(client, {"a", "b"}), expected);
+    EXPECT_EQ(server.requests().size(), 1u) << "a server error must not fall back to HEAD";
+}
+
+TEST_F(restClientTest, BatchExistsUsesHeadForGoodOnAnUnsupportedOperation) {
+    scriptedServer server([](const std::string &request) -> scriptedServer::answer {
+        if (isBatchPost(request)) {
+            return {400, "<html>unsupported operation: .batch_exists</html>"};
+        }
+        return headAnswer(request);
+    });
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    const exists_t expected = {true, false};
+    EXPECT_EQ(checkAll(client, {"present", "absent"}), expected);
+    EXPECT_EQ(checkAll(client, {"present", "absent"}), expected);
+
+    const std::vector<std::string> requests = server.requests();
+    ASSERT_EQ(requests.size(), 5u);
+    EXPECT_TRUE(isBatchPost(requests[0])) << requests[0];
+    for (size_t i = 1; i < requests.size(); ++i) {
+        EXPECT_EQ(requests[i].rfind("HEAD /", 0), 0u) << requests[i];
+    }
+}
+
+TEST_F(restClientTest, BatchExistsChecksARefusedBatchWithHead) {
+    scriptedServer server([](const std::string &request) -> scriptedServer::answer {
+        if (isBatchPost(request)) {
+            return {400, "<html>invalid key</html>"};
+        }
+        return headAnswer(request);
+    });
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    const exists_t expected = {true, false};
+    EXPECT_EQ(checkAll(client, {"present", "absent"}), expected);
+    EXPECT_EQ(checkAll(client, {"present", "absent"}), expected);
+
+    size_t posts = 0;
+    for (const std::string &req : server.requests()) {
+        posts += isBatchPost(req) ? 1 : 0;
+    }
+    EXPECT_EQ(posts, 2u) << "a refused batch must not stop the next one from being posted";
+}
+
+TEST_F(restClientTest, BatchExistsUsesHeadForKeysTheBodyCannotCarry) {
+    for (const std::string &odd : {std::string("present\n"), std::string(".present")}) {
+        scriptedServer server(headAnswer);
+        nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+        restClient client(&params);
+
+        const exists_t expected = {true, false};
+        EXPECT_EQ(checkAll(client, {odd, "absent"}), expected);
+        for (const std::string &req : server.requests()) {
+            EXPECT_FALSE(isBatchPost(req)) << req;
+        }
+    }
+}
+
+TEST_F(restClientTest, BatchExistsUsesHeadBeyondOneBatch) {
+    scriptedServer server(headAnswer);
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    // Fewer connections at once than the server's listen backlog.
+    params["max_inflight"] = "16";
+    restClient client(&params);
+
+    std::vector<std::string> keys(max_keys_per_exists_batch + 1, "absent");
+    keys[0] = "present";
+    const exists_t result = checkAll(client, keys);
+
+    exists_t expected(keys.size(), false);
+    expected[0] = true;
+    EXPECT_EQ(result, expected);
+    EXPECT_EQ(server.requests().size(), keys.size());
+}
+
+TEST_F(restClientTest, BatchExistsOfNoKeyAnswersAtOnce) {
+    scriptedServer server(headAnswer);
+    nixl_b_params_t params = makeRestParams(localEndpoint(server.port()));
+    restClient client(&params);
+
+    EXPECT_TRUE(checkAll(client, {}).empty());
+    EXPECT_TRUE(server.requests().empty());
 }
 
 // ---------------------------------------------------------------------------
