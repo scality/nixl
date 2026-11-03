@@ -1058,6 +1058,10 @@ objects rather than overwrites, and removes those objects at the end with the
 endpoint's batch delete. Changing keys takes a new transfer request per WRITE,
 as `--recreate_xfer` does.
 
+A REST WRITE runs with a batch size of 1: every block of a batch targets the
+same object, which concurrent PUTs cannot all write. For concurrent WRITEs, use
+`--num_threads` or `--pipeline_depth`.
+
 ### Azure Blob Storage Backend
 For AZURE_BLOB plugin benchmarking, ETCD is optional for single instances.
 ```bash

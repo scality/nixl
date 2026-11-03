@@ -906,6 +906,15 @@ xferBenchConfig::loadParams(void) {
                   << std::endl;
         return -1;
     }
+    // A REST WRITE is a PUT of a whole object, but every block of a batch targets
+    // the same object: concurrent PUTs of one key.
+    if (backend == XFERBENCH_BACKEND_REST && op_type == XFERBENCH_OP_WRITE && max_batch_size > 1) {
+        std::cerr << "REST WRITE supports a batch size of 1 only: every block of a batch "
+                     "targets the same object, which concurrent PUTs cannot all write. "
+                     "Use --num_threads or --pipeline_depth for concurrent WRITEs."
+                  << std::endl;
+        return -1;
+    }
 
     // Validate randomization mode
     if (isStorageBackend()) {
