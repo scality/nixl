@@ -83,9 +83,17 @@ public:
      * @param port      port the self-connected queue pair uses.
      * @param gid_index its GID; the queue pair connects to itself through it.
      * @param mtu       its path MTU.
+     * @param initial_keys keys created now, at least 1: creating one takes a
+     *                  firmware command of about 350 us, which a request that
+     *                  finds a key ready does not wait for.
      * Check ok() before use.
      */
-    dcRequestKeys(ibv_context *ctx, ibv_pd *pd, uint8_t port, int gid_index, ibv_mtu mtu);
+    dcRequestKeys(ibv_context *ctx,
+                  ibv_pd *pd,
+                  uint8_t port,
+                  int gid_index,
+                  ibv_mtu mtu,
+                  size_t initial_keys);
     ~dcRequestKeys();
 
     dcRequestKeys(const dcRequestKeys &) = delete;

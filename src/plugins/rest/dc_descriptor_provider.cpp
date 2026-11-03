@@ -56,6 +56,10 @@ countBondSlaves(const char *slaves_line) {
 /// Requests between one-line spread summaries.
 constexpr uint64_t spread_log_interval = 1u << 20;
 
+/// Request keys created per NIC at setup, about 22 ms of firmware commands per
+/// NIC. A NIC holds one per request in flight on it; more are created on demand.
+constexpr size_t request_keys_per_nic = 64;
+
 /// Canonicalize a sysfs symlink to its /sys/devices/... target. Empty on failure.
 std::string
 canonicalPath(const std::string &path) {
@@ -578,7 +582,8 @@ dcDescriptorProvider::setupNic(const std::string &nic_spec, uint64_t dc_key, nic
     }
     memcpy(nic.gid, gid.raw, 16);
 
-    nic.keys = std::make_unique<dcRequestKeys>(nic.ctx, nic.pd, dc_port, nic.gidIndex, path_mtu);
+    nic.keys = std::make_unique<dcRequestKeys>(
+        nic.ctx, nic.pd, dc_port, nic.gidIndex, path_mtu, request_keys_per_nic);
     if (!nic.keys->ok()) {
         NIXL_ERROR << "ibverbs_dc: no request keys on " << nic.devName << ": " << nic.keys->error();
         return false;

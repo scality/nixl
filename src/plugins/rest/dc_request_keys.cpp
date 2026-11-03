@@ -40,7 +40,12 @@ constexpr std::chrono::seconds completion_timeout{1};
 
 } // namespace
 
-dcRequestKeys::dcRequestKeys(ibv_context *ctx, ibv_pd *pd, uint8_t port, int gid_index, ibv_mtu mtu)
+dcRequestKeys::dcRequestKeys(ibv_context *ctx,
+                             ibv_pd *pd,
+                             uint8_t port,
+                             int gid_index,
+                             ibv_mtu mtu,
+                             size_t initial_keys)
     : ctx_(ctx),
       pd_(pd),
       port_(port),
@@ -54,9 +59,18 @@ dcRequestKeys::dcRequestKeys(ibv_context *ctx, ibv_pd *pd, uint8_t port, int gid
     if (!createQp()) {
         return;
     }
-    // Checks that the driver can change a key's tag, which every open relies on.
+    // The first one also checks that the driver can change a key's tag, which
+    // every open relies on.
     std::lock_guard<std::mutex> lk(mu_);
     ok_ = createKey();
+    for (size_t i = 1; ok_ && i < initial_keys; ++i) {
+        if (!createKey()) {
+            // Requests create what is missing.
+            NIXL_WARN << "ibverbs_dc: created " << keys_.size() << " of " << initial_keys
+                      << " request keys at setup";
+            break;
+        }
+    }
 }
 
 dcRequestKeys::~dcRequestKeys() {

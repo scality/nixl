@@ -251,7 +251,9 @@ reused at once.
 A key is an `mlx5` indirect memory key that points at the request's range.
 Opening and closing it are local NIC operations of about a microsecond each.
 A key opens only when its request starts, so a NIC holds at most about
-`max_inflight` open keys, however many requests are queued.
+`max_inflight` open keys, however many requests are queued. Creating a key
+takes about 350 µs, so each NIC creates 64 when the backend starts, and more
+only when more requests run on it at once.
 The key's address space starts at 0, so the descriptor carries address 0. A
 key's remote key changes each time it opens, and a value comes back only after
 at least 60 seconds.
