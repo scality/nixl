@@ -577,6 +577,12 @@ dcDescriptorProvider::setupNic(const std::string &nic_spec, uint64_t dc_key, nic
         return false;
     }
     memcpy(nic.gid, gid.raw, 16);
+
+    nic.keys = std::make_unique<dcRequestKeys>(nic.ctx, nic.pd, dc_port, nic.gidIndex, path_mtu);
+    if (!nic.keys->ok()) {
+        NIXL_ERROR << "ibverbs_dc: no request keys on " << nic.devName << ": " << nic.keys->error();
+        return false;
+    }
     return true;
 }
 
@@ -622,6 +628,14 @@ dcDescriptorProvider::~dcDescriptorProvider() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         logRequestSpread(true);
+        if (!openKeys_.empty()) {
+            NIXL_WARN << "ibverbs_dc: " << openKeys_.size()
+                      << " request key(s) still open at teardown; destroying them";
+        }
+        // The keys point into the MRs, unknown to the kernel: destroyed first.
+        for (auto &nic : nics_) {
+            nic.keys.reset();
+        }
         for (auto &kv : buffers_) {
             for (auto &rail : kv.second.rails) {
                 if (rail.mr) {
@@ -647,6 +661,7 @@ dcDescriptorProvider::~dcDescriptorProvider() {
 
 void
 dcDescriptorProvider::releaseNic(nicCtx &nic) {
+    nic.keys.reset();
     for (int p = 0; p < dc_max_lag_ports; p++) {
         if (nic.dctQps[p]) {
             ibv_destroy_qp(nic.dctQps[p]);
@@ -951,8 +966,8 @@ dcDescriptorProvider::registerMemory(void *ptr, size_t size, int dev_id) {
         return NIXL_SUCCESS;
     }
 
-    // One MR per rail covering the whole buffer: an rkey covers any sub-range, so
-    // the rail is chosen per request in makeDescriptor, not here.
+    // One MR per rail covering the whole buffer: a request key can point at any
+    // sub-range, so the rail is chosen per request in openAccess, not here.
     buffer buf;
     buf.len = size;
     buf.devId = dev_id;
@@ -1002,6 +1017,12 @@ dcDescriptorProvider::deregisterMemory(void *ptr) {
     if (it == buffers_.end()) {
         NIXL_ERROR << "ibverbs_dc: deregisterMemory: ptr " << ptr << " not registered";
         return NIXL_ERR_NOT_FOUND;
+    }
+    if (it->second.refs == 1 && it->second.openKeys > 0) {
+        // A key the kernel does not know about still points into the MRs.
+        NIXL_ERROR << "ibverbs_dc: " << ptr << " still has " << it->second.openKeys
+                   << " request key(s) open; not deregistering it";
+        return NIXL_ERR_BACKEND;
     }
     if (--it->second.refs > 0) {
         return NIXL_SUCCESS;
@@ -1098,7 +1119,7 @@ dcDescriptorProvider::logRequestSpread(bool detailed) {
     }
 }
 
-const dcDescriptorProvider::buffer *
+std::map<uintptr_t, dcDescriptorProvider::buffer>::const_iterator
 dcDescriptorProvider::findBuffer(uintptr_t addr, size_t size) const {
     // The nearest base at or below addr normally covers the range; when
     // registrations are nested (a pool and a sub-range of it), the enclosing one
@@ -1106,65 +1127,119 @@ dcDescriptorProvider::findBuffer(uintptr_t addr, size_t size) const {
     for (auto it = buffers_.upper_bound(addr); it != buffers_.begin();) {
         --it;
         if (addr + size <= it->first + it->second.len) {
-            return &it->second;
+            return it;
         }
     }
-    return nullptr;
+    return buffers_.end();
 }
 
 bool
 dcDescriptorProvider::isRegistered(void *ptr, size_t size) const {
     std::lock_guard<std::mutex> lk(mu_);
-    return findBuffer(reinterpret_cast<uintptr_t>(ptr), size) != nullptr;
+    return findBuffer(reinterpret_cast<uintptr_t>(ptr), size) != buffers_.end();
 }
 
-std::string
-dcDescriptorProvider::makeDescriptor(void *ptr, size_t size) {
+rdmaAccess
+dcDescriptorProvider::openAccess(void *ptr, size_t size) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!layoutLogged_) {
-        logLayout();
-        layoutLogged_ = true;
-    }
-
-    if (size > UINT32_MAX) {
-        NIXL_ERROR << "ibverbs_dc: request size " << size
-                   << " exceeds the 32-bit SIZE field of a DC RDMA descriptor";
-        return std::string();
-    }
-
-    const buffer *found = findBuffer(addr, size);
-    if (!found) {
-        NIXL_ERROR << "ibverbs_dc: no registration covers ptr " << ptr << " size " << size;
-        return std::string();
-    }
-    const buffer &buf = *found;
-
-    const railMr &rail = buf.rails[pickRail(buf)];
-    nicCtx &nic = nics_[rail.nicIdx];
-    nicIssued_[rail.nicIdx]++;
-    auto &counts = gpuNicRequests_[buf.devId];
-    if (counts.empty()) {
-        counts.assign(nics_.size(), 0);
-    }
-    counts[rail.nicIdx]++;
-    if (buf.devId >= 0) {
-        const std::vector<int> &affine = affineNicsFor(buf.devId);
-        if (std::find(affine.begin(), affine.end(), rail.nicIdx) == affine.end()) {
-            crossNuma_++;
+    const ibv_mr *mr = nullptr;
+    int nic_idx = 0;
+    uintptr_t base = 0;
+    uint32_t dctn = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!layoutLogged_) {
+            logLayout();
+            layoutLogged_ = true;
         }
-    }
-    // Periodic, because a run that is killed rather than finished never reaches
-    // the teardown dump, and that is exactly when the spread is worth seeing.
-    if (++sinceSpreadLog_ >= spread_log_interval) {
-        sinceSpreadLog_ = 0;
-        logRequestSpread(false);
+
+        if (size > UINT32_MAX) {
+            NIXL_ERROR << "ibverbs_dc: request size " << size
+                       << " exceeds the 32-bit SIZE field of a DC RDMA descriptor";
+            return {};
+        }
+
+        const auto found = findBuffer(addr, size);
+        if (found == buffers_.end()) {
+            NIXL_ERROR << "ibverbs_dc: no registration covers ptr " << ptr << " size " << size;
+            return {};
+        }
+        base = found->first;
+        buffer &buf = buffers_.at(base);
+
+        const railMr &rail = buf.rails[pickRail(buf)];
+        mr = rail.mr;
+        nic_idx = rail.nicIdx;
+        nicCtx &nic = nics_[nic_idx];
+        dctn = nic.dctns[nic.lagSeq++ % nic.numLagPorts];
+        nicIssued_[nic_idx]++;
+        auto &counts = gpuNicRequests_[buf.devId];
+        if (counts.empty()) {
+            counts.assign(nics_.size(), 0);
+        }
+        counts[nic_idx]++;
+        if (buf.devId >= 0) {
+            const std::vector<int> &affine = affineNicsFor(buf.devId);
+            if (std::find(affine.begin(), affine.end(), nic_idx) == affine.end()) {
+                crossNuma_++;
+            }
+        }
+        // Periodic, because a run that is killed rather than finished never
+        // reaches the teardown dump, and that is exactly when the spread is worth
+        // seeing.
+        if (++sinceSpreadLog_ >= spread_log_interval) {
+            sinceSpreadLog_ = 0;
+            logRequestSpread(false);
+        }
+        // Counted before the key opens, so the buffer cannot be deregistered
+        // under it.
+        buf.openKeys++;
     }
 
-    return formatDcDescriptor(static_cast<uint64_t>(addr),
-                              static_cast<uint32_t>(size),
-                              rail.mr->rkey,
-                              nic.lid,
-                              nic.dctns[nic.lagSeq++ % nic.numLagPorts],
-                              nic.gid);
+    // Outside mu_: a NIC's keys have their own lock, and opening one waits for
+    // the NIC.
+    const nicCtx &nic = nics_[nic_idx];
+    uint32_t slot = 0;
+    uint32_t rkey = 0;
+    const bool opened = nic.keys->open(mr, addr, size, slot, rkey);
+
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!opened) {
+        buffers_.at(base).openKeys--;
+        NIXL_ERROR << "ibverbs_dc: no request key for ptr " << ptr << " size " << size << " on "
+                   << nic.devName;
+        return {};
+    }
+    const uint64_t id = nextAccessId_++;
+    openKeys_[id] = {nic_idx, slot, base};
+    // The key's address space starts at 0: see dcRequestKeys.
+    return {
+        formatDcDescriptor(0 /* addr */, static_cast<uint32_t>(size), rkey, nic.lid, dctn, nic.gid),
+        id};
+}
+
+nixl_status_t
+dcDescriptorProvider::closeAccess(uint64_t id) {
+    openKey key;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = openKeys_.find(id);
+        if (it == openKeys_.end()) {
+            NIXL_ERROR << "ibverbs_dc: closeAccess: no open access " << id;
+            return NIXL_ERR_NOT_FOUND;
+        }
+        key = it->second;
+        openKeys_.erase(it);
+    }
+
+    if (!nics_[key.nicIdx].keys->close(key.slot)) {
+        // The key may still be usable: its buffer stays counted, so it is never
+        // deregistered while a server could reach it.
+        NIXL_ERROR << "ibverbs_dc: a request key on " << nics_[key.nicIdx].devName
+                   << " could not be closed; its buffer cannot be deregistered";
+        return NIXL_ERR_BACKEND;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    buffers_.at(key.buffer).openKeys--;
+    return NIXL_SUCCESS;
 }

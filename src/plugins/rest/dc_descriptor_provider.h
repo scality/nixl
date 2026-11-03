@@ -20,14 +20,17 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
 #include "dc_descriptor.h"
+#include "dc_request_keys.h"
 #include "rdma_descriptor_provider.h"
 
 /// Maximum DCT QPs per NIC (one per physical LAG/bond port).
@@ -37,10 +40,13 @@ static constexpr int dc_max_lag_ports = 4;
  * In-process libibverbs DC (Dynamically Connected) RDMA descriptor provider.
  *
  * Opens one DC target per NIC and registers every buffer on all of them, so a
- * request against any buffer can travel on any rail. An rkey covers any
- * sub-range of its MR, so the NIC a request uses is picked when its RDMA
- * descriptor is built: see pickRail. VRAM requests use only the NICs affine to
- * their GPU.
+ * request against any buffer can travel on any rail. The NIC a request uses is
+ * picked when its access is opened: see pickRail. VRAM requests use only the
+ * NICs affine to their GPU.
+ *
+ * The server never gets the rkey of a buffer's MR, which stays valid as long as
+ * the buffer is registered. Each request gets a key of its own on the NIC it
+ * uses, closed when the request has finished: see dcRequestKeys.
  *
  * The DC target is passive: the server (DCI side) initiates and performs all
  * one-sided RDMA, so this client runs no background threads, CM listener, or CQ
@@ -76,8 +82,10 @@ public:
     deregisterMemory(void *ptr) override;
     bool
     isRegistered(void *ptr, size_t size) const override;
-    std::string
-    makeDescriptor(void *ptr, size_t size) override;
+    rdmaAccess
+    openAccess(void *ptr, size_t size) override;
+    nixl_status_t
+    closeAccess(uint64_t id) override;
     /// cuFlushGPUDirectRDMAWrites on the GPU's primary context, skipped on a GPU
     /// whose platform already orders RDMA writes for their owner.
     nixl_status_t
@@ -102,11 +110,12 @@ private:
         std::string pciPath; ///< canonical /sys/devices/... PCIe path of the NIC
         int numaNode = -1; ///< NUMA node of the NIC, or -1 if unknown
         bool dmabufUnsupported = false; ///< ibv_reg_dmabuf_mr refused as unsupported
+        std::unique_ptr<dcRequestKeys> keys;
     };
 
     /// One rail of a registered buffer: an MR covering the WHOLE buffer on that
-    /// NIC. An rkey is valid for any sub-range of its MR, so a request at any
-    /// offset can be described from any rail the buffer is registered on.
+    /// NIC. A request key can point at any sub-range of it, so a request at any
+    /// offset can travel on any rail the buffer is registered on.
     struct railMr {
         ibv_mr *mr = nullptr;
         int nicIdx = 0;
@@ -117,7 +126,15 @@ private:
         size_t len = 0;
         int devId = -1; ///< GPU ordinal (VRAM) or -1 (host memory)
         int refs = 1; ///< identical registrations sharing these MRs
+        size_t openKeys = 0; ///< request keys pointing into its MRs
         std::vector<railMr> rails;
+    };
+
+    /// An access given by openAccess() and not yet closed.
+    struct openKey {
+        int nicIdx = 0;
+        uint32_t slot = 0; ///< what dcRequestKeys::close() takes
+        uintptr_t buffer = 0; ///< base of the registration it points into
     };
 
     /// Build (and INIT->RTR) a NIC's DC context. Returns false on error.
@@ -129,8 +146,9 @@ private:
     /// Detect bond width for an IB device via sysfs; clamps to [1, dc_max_lag_ports].
     static int
     numLagPorts(const char *dev_name);
-    /// The registration holding [addr, addr + size), or null. Caller must hold mu_.
-    const buffer *
+    /// The registration holding [addr, addr + size), or buffers_.end(). Caller
+    /// must hold mu_.
+    std::map<uintptr_t, buffer>::const_iterator
     findBuffer(uintptr_t addr, size_t size) const;
     /// Index into buf.rails for the next request against buf: the rail whose NIC
     /// has taken the fewest requests, among the NICs affine to the buffer's GPU for
@@ -217,6 +235,9 @@ private:
     mutable std::mutex mu_;
     /// base address -> buffer, ordered so a sub-address can be found by range.
     std::map<uintptr_t, buffer> buffers_;
+    /// rdmaAccess::id -> the key it holds open.
+    std::unordered_map<uint64_t, openKey> openKeys_;
+    uint64_t nextAccessId_ = 1;
 };
 
 #endif // NIXL_SRC_PLUGINS_REST_DC_DESCRIPTOR_PROVIDER_H

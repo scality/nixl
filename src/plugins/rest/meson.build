@@ -20,6 +20,8 @@ rest_sources = [
     'dc_descriptor.h',
     'dc_descriptor_provider.cpp',
     'dc_descriptor_provider.h',
+    'dc_request_keys.cpp',
+    'dc_request_keys.h',
     'rdma_descriptor_provider.h',
     'rest_backend.cpp',
     'rest_backend.h',
@@ -36,8 +38,12 @@ rest_mlx5_dep = dependency('libmlx5', required: false)
 # libibverbs.pc does not give the rdma-core release, so check the flag itself.
 rest_ibverbs_relaxed_ordering = rest_ibverbs_dep.found() and cpp.has_header_symbol(
     'infiniband/verbs.h', 'IBV_ACCESS_RELAXED_ORDERING', dependencies: rest_ibverbs_dep)
-if not (rest_curl_dep.found() and rest_ibverbs_relaxed_ordering and rest_mlx5_dep.found())
-    warning('libcurl >= 7.68, libibverbs with IBV_ACCESS_RELAXED_ORDERING or libmlx5 not found, skipping REST plugin build')
+# Each request gets its own key, which must change its rkey on every open.
+rest_mlx5_mkey_update_tag = rest_mlx5_dep.found() and cpp.has_header_symbol(
+    'infiniband/mlx5dv.h', 'MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG',
+    dependencies: [rest_ibverbs_dep, rest_mlx5_dep])
+if not (rest_curl_dep.found() and rest_ibverbs_relaxed_ordering and rest_mlx5_mkey_update_tag)
+    warning('libcurl >= 7.68, libibverbs with IBV_ACCESS_RELAXED_ORDERING or libmlx5 with MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG not found, skipping REST plugin build')
     subdir_done()
 endif
 

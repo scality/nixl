@@ -36,7 +36,8 @@ uses neither the AWS SDK nor AWS authentication.
 ## Prerequisites
 
 - An RDMA NIC with DC support (NVIDIA ConnectX, `mlx5`), reachable by the
-  Scality endpoint.
+  Scality endpoint, whose kernel driver lets a process change the tag of the
+  memory keys it creates (see [Request keys](#request-keys)).
 - For GPU memory, one of:
   - DMA-BUF, used first: Linux 5.12 or later and an NVIDIA driver that exports
     DMA-BUF (typically the open kernel modules);
@@ -45,7 +46,8 @@ uses neither the AWS SDK nor AWS authentication.
 
 - A reachable Scality AI Connector endpoint.
 - Build dependencies: `libcurl` 7.68 or later, `libibverbs` from an rdma-core that
-  defines `IBV_ACCESS_RELAXED_ORDERING`, and `libmlx5`.
+  defines `IBV_ACCESS_RELAXED_ORDERING`, and `libmlx5` with
+  `MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG`.
 
 ## Building
 
@@ -221,16 +223,46 @@ the server's own RoCE settings.
    are mapped to their object ids.
 2. **Prepare.** The connector cuts the transfer into requests and checks that
    each buffer range is registered (no data moves yet).
-3. **Post.** For each request it builds an RDMA descriptor for the buffer range,
-   then issues the HTTP `PUT`/`GET` for the object id, carrying the descriptor in
-   the `x-scal-rdma` header, and returns immediately. The server performs the
-   RDMA read or write on the buffer. A prepared transfer posted again gets new
-   descriptors, so its requests may use other NICs.
-4. **Poll.** The transfer stays in progress until every part has finished. It
-   then reports success, or the first error if a part failed. Before a READ into
-   VRAM reports success, the connector makes the server's RDMA writes visible
-   to the GPU with `cuFlushGPUDirectRDMAWrites`, so a kernel launched next sees
-   the data. The flush is skipped on platforms that already order those writes.
+3. **Post.** For each request it opens a key for the buffer range (see
+   [Request keys](#request-keys)) and builds the RDMA descriptor with it, then
+   issues the HTTP `PUT`/`GET` for the object id, carrying the descriptor in the
+   `x-scal-rdma` header, and returns immediately. The server performs the RDMA
+   read or write on the buffer. A prepared transfer posted again gets new keys,
+   so its requests may use other NICs.
+4. **Poll.** When a request finishes, its key is closed. The transfer stays in
+   progress until every part has finished. It then reports success, or the
+   first error if a part failed. Before a READ into VRAM reports success, the
+   connector makes the server's RDMA writes visible to the GPU with
+   `cuFlushGPUDirectRDMAWrites`, so a kernel launched next sees the data. The
+   flush is skipped on platforms that already order those writes.
+
+## Request keys
+
+The server reads or writes the buffer through the key carried by the RDMA
+descriptor. The key of the buffer's registration would stay valid as long as
+the buffer is registered: a server that performs its RDMA late, after the
+request failed or timed out, would still reach the buffer. So each request
+gets a key of its own, and the key is closed before the request reports its
+outcome. Once a transfer reports, success or failure, no RDMA of its requests
+can reach the buffer any more: the server fails them instead. The buffer can be
+reused at once.
+
+A key is an `mlx5` indirect memory key that points at the request's range.
+Opening and closing it are local NIC operations of about a microsecond each.
+The key's address space starts at 0, so the descriptor carries address 0. A
+key's remote key changes each time it opens, and a value comes back only after
+at least 60 seconds.
+
+This works around limits of the RDMA stack, explained in `dc_request_keys.h`:
+
+- A memory window, the standard way to give a key per request, cannot be used.
+  The kind that can be revoked quickly only accepts access through the queue
+  pair that created it, and the server's RDMA arrives through the DC target.
+  The other kind cannot be created from a DC queue pair by rdma-core, and Linux
+  refuses it on DMA-BUF registrations, which GPU memory uses.
+- rdma-core configures `mlx5` keys only from an RC queue pair. Each NIC has
+  one, connected to itself and used only for that; it sends nothing on the
+  network.
 
 ## Limitations
 
@@ -246,8 +278,8 @@ the server's own RoCE settings.
   length. A registration that starts at the same address as an existing one but
   has a different length is refused. Register the buffer once, or register
   sub-ranges that start at different addresses.
-- After a failed or timed-out request the server may still complete its RDMA on
-  the buffer, so do not reuse the buffer for other data.
+- A buffer cannot be deregistered while a transfer on it is running: its
+  requests' keys point into its registration.
 
 ## Troubleshooting
 
@@ -257,6 +289,9 @@ the server's own RoCE settings.
 | `RDMA requires a NIC list` | Set `rdma_nics`, or `rdma_dev_addr_list` in `cufile.json`. |
 | `ibverbs_dc: no RDMA device found for NIC` | The IPv4 address or device name matches no local RDMA device. |
 | `ibverbs_dc: ibv_reg_mr failed on <nic>` for VRAM | Neither registration path works for GPU memory: load `nvidia_peermem`, or use a kernel and NVIDIA driver with DMA-BUF support. |
+| `ibverbs_dc: no request keys on <nic>: mlx5dv_create_mkey: ...` | The NIC is left out. With `the mlx5 driver cannot change a key's tag`, the kernel's `mlx5` driver is too old for [request keys](#request-keys): update it. |
+| `ibverbs_dc: a request key on <nic> could not be closed` | The request fails, and its buffer can no longer be deregistered: the server might still reach it. Do not reuse that buffer. |
+| `ibverbs_dc: <ptr> still has <n> request key(s) open; not deregistering it` | The buffer was deregistered while one of its transfers was still running, or after a key could not be closed. |
 | `GPUDirect RDMA writes are not ordered and cannot be flushed` | The GPU or driver offers no host-side flush, and the platform does not order RDMA writes for the GPU: a kernel launched right after a read may see stale data. Use a driver with `cuFlushGPUDirectRDMAWrites` (CUDA 11.3 or later). |
 | `restClient: first connect failure. fds open=...` | Open descriptors close to the soft limit: lower `max_inflight` or raise `ulimit -n`. Far below it: the endpoint could not be reached; see the `curl says` text in the log. |
 | `<op>: failed url=<url> curl_code=<n> http_code=<n>` | The HTTP call failed. A non-2xx `http_code` comes from the server; check the object id and endpoint URL. |
@@ -270,5 +305,6 @@ the server's own RoCE settings.
 | `rest_client.{h,cpp}` | `restClient`: the libcurl control-plane client, behind the `iRestClient` interface (also the test-injection seam). |
 | `rdma_descriptor_provider.h` | `iRdmaDescriptorProvider`: the data-plane interface. |
 | `dc_descriptor_provider.{h,cpp}` | `dcDescriptorProvider`: in-process libibverbs DC implementation. |
+| `dc_request_keys.{h,cpp}` | `dcRequestKeys`: the per-request keys of one NIC, and why they are built this way. |
 | `dc_descriptor.h` | DC RDMA descriptor wire format, as generated by cuObject, free of libibverbs. |
 | `cufile_nics.h` | `cufile.json` readers for `rdma_dev_addr_list` and `rdma_dc_key`. |

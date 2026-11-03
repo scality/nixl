@@ -19,15 +19,24 @@
 #define NIXL_SRC_PLUGINS_REST_RDMA_DESCRIPTOR_PROVIDER_H
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "nixl_types.h"
 
+/** The server's access to a registered range, for one request. */
+struct rdmaAccess {
+    /// Sent to the server; empty when the access could not be opened.
+    std::string descriptor;
+    /// Identifies the access to closeAccess().
+    uint64_t id = 0;
+};
+
 /**
  * Data-plane side of the Scality AI Connector: registers local buffers for RDMA
- * and describes a registered byte range as an RDMA descriptor. The RDMA
- * descriptor travels to the server in an HTTP header; the server then performs
- * the one-sided RDMA read or write on that range itself.
+ * and gives the server access to a registered byte range, described by an RDMA
+ * descriptor. The RDMA descriptor travels to the server in an HTTP header; the
+ * server then performs the one-sided RDMA read or write on that range itself.
  */
 class iRdmaDescriptorProvider {
 public:
@@ -54,13 +63,21 @@ public:
     isRegistered(void *ptr, size_t size) const = 0;
 
     /**
-     * RDMA descriptor for [ptr, ptr + size), which must lie within a single
-     * registration.
-     * @return the RDMA descriptor, or an empty string if no registration covers
-     *         the range.
+     * Give the server access to [ptr, ptr + size), which must lie within a single
+     * registration, for one request. Every access opened must be closed with
+     * closeAccess() once its request has finished.
+     * @return the access; its descriptor is empty when it could not be opened.
      */
-    virtual std::string
-    makeDescriptor(void *ptr, size_t size) = 0;
+    virtual rdmaAccess
+    openAccess(void *ptr, size_t size) = 0;
+
+    /**
+     * Take back an access given by openAccess(). On success the server can no
+     * longer read or write the range through it, even an RDMA it performs late.
+     * On failure it may still be able to: the range must not be reused.
+     */
+    virtual nixl_status_t
+    closeAccess(uint64_t id) = 0;
 
     /**
      * Make the RDMA writes the server performed into the memory of GPU dev_id
