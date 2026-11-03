@@ -40,6 +40,9 @@ using put_object_callback_t = std::function<void(bool success)>;
 using get_object_callback_t = std::function<void(bool success)>;
 // true = exists, false = not found, std::nullopt = request error
 using check_object_callback_t = std::function<void(std::optional<bool> exists)>;
+// Builds a request's RDMA descriptor when the request starts; an empty one fails
+// the request without sending it.
+using rdma_descriptor_fn_t = std::function<std::string()>;
 
 /**
  * Control-plane client of the Scality AI Connector: header-only HTTP requests
@@ -56,7 +59,8 @@ public:
      * @param data_ptr Pointer to the data to upload
      * @param data_len Length of the data in bytes
      * @param offset Offset within the object
-     * @param rdma_desc RDMA descriptor for the transfer
+     * @param rdma_desc Builds the RDMA descriptor, called once when the request
+     *                  starts: requests waiting for an in-flight slot hold none
      * @param callback Callback function to handle the result
      */
     virtual void
@@ -64,7 +68,7 @@ public:
                        uintptr_t data_ptr,
                        size_t data_len,
                        size_t offset,
-                       std::string_view rdma_desc,
+                       rdma_descriptor_fn_t rdma_desc,
                        put_object_callback_t callback) = 0;
 
     /**
@@ -73,7 +77,8 @@ public:
      * @param data_ptr Pointer to the buffer to store the downloaded data
      * @param data_len Maximum length of data to read
      * @param offset Offset within the object to start reading from
-     * @param rdma_desc RDMA descriptor for the transfer
+     * @param rdma_desc Builds the RDMA descriptor, called once when the request
+     *                  starts: requests waiting for an in-flight slot hold none
      * @param past_end_ok A 416 (range past the end of the object) counts as
      *                    success: nothing was there to read
      * @param callback Callback function to handle the result
@@ -83,7 +88,7 @@ public:
                        uintptr_t data_ptr,
                        size_t data_len,
                        size_t offset,
-                       std::string_view rdma_desc,
+                       rdma_descriptor_fn_t rdma_desc,
                        bool past_end_ok,
                        get_object_callback_t callback) = 0;
 
@@ -155,7 +160,7 @@ public:
                        uintptr_t data_ptr,
                        size_t data_len,
                        size_t offset,
-                       std::string_view rdma_desc,
+                       rdma_descriptor_fn_t rdma_desc,
                        put_object_callback_t callback) override;
 
     void
@@ -163,7 +168,7 @@ public:
                        uintptr_t data_ptr,
                        size_t data_len,
                        size_t offset,
-                       std::string_view rdma_desc,
+                       rdma_descriptor_fn_t rdma_desc,
                        bool past_end_ok,
                        get_object_callback_t callback) override;
 
@@ -244,14 +249,14 @@ private:
      * differ only in the curl method options, so they share this path.
      * @param op_name Operation label for logging (string literal)
      * @param key Object key
-     * @param rdma_desc RDMA descriptor for the x-scal-rdma header
+     * @param rdma_desc Builds the x-scal-rdma header's descriptor at start
      * @param is_upload true for PUT (upload), false for GET
      * @param callback Result callback (invoked on the worker pool)
      */
     void
     submitRdmaRequest(const char *op_name,
                       std::string_view key,
-                      std::string_view rdma_desc,
+                      rdma_descriptor_fn_t rdma_desc,
                       bool is_upload,
                       std::function<void(bool)> callback,
                       size_t data_len = 0,

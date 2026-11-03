@@ -223,26 +223,34 @@ makeRestParams(int port, const std::string &num_threads, const std::string &max_
     return params;
 }
 
-// Submit n RDMA GETs against the client, counting completions and successes.
+// Submit n RDMA GETs against the client, counting completions and successes,
+// and in built the RDMA descriptors built.
 static void
 submitGets(restClient &client,
            int n,
            std::vector<char> &buf,
            std::atomic<int> &done,
-           std::atomic<int> &ok) {
+           std::atomic<int> &ok,
+           std::atomic<int> *built = nullptr) {
     for (int i = 0; i < n; i++) {
-        client.getObjectRdmaAsync("key" + std::to_string(i),
-                                  reinterpret_cast<uintptr_t>(buf.data()),
-                                  buf.size(),
-                                  0,
-                                  "rdma-descriptor",
-                                  /*past_end_ok=*/false,
-                                  [&](bool success) {
-                                      if (success) {
-                                          ok.fetch_add(1);
-                                      }
-                                      done.fetch_add(1);
-                                  });
+        client.getObjectRdmaAsync(
+            "key" + std::to_string(i),
+            reinterpret_cast<uintptr_t>(buf.data()),
+            buf.size(),
+            0,
+            [built] {
+                if (built) {
+                    built->fetch_add(1);
+                }
+                return std::string("rdma-descriptor");
+            },
+            /*past_end_ok=*/false,
+            [&](bool success) {
+                if (success) {
+                    ok.fetch_add(1);
+                }
+                done.fetch_add(1);
+            });
     }
 }
 
@@ -316,6 +324,33 @@ TEST_F(restClientConcurrencyTest, MaxInflightCapsConcurrentConnections) {
     EXPECT_LE(server.maxConcurrent(), cap) << "cap was exceeded while draining";
 }
 
+// A request's RDMA descriptor is built when the request starts, not when it is
+// submitted: the requests waiting for an in-flight slot hold no access to the
+// buffer.
+TEST_F(restClientConcurrencyTest, DescriptorIsBuiltWhenTheRequestStarts) {
+    constexpr int num_requests = 6;
+    constexpr int cap = 2;
+
+    holdingTcpServer server;
+    nixl_b_params_t params = makeRestParams(server.port(), "2", std::to_string(cap));
+    restClient client(&params);
+
+    std::vector<char> buf(1024);
+    std::atomic<int> done{0};
+    std::atomic<int> ok{0};
+    std::atomic<int> built{0};
+    submitGets(client, num_requests, buf, done, ok, &built);
+
+    ASSERT_TRUE(server.waitUntilHeld(cap)) << "no request reached the server";
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(built.load(), cap) << "descriptors were built for requests still waiting";
+
+    server.release();
+    EXPECT_TRUE(waitForCount(done, num_requests, 20)) << "queued requests never ran";
+    EXPECT_EQ(built.load(), num_requests);
+    EXPECT_EQ(ok.load(), num_requests) << "some requests did not succeed";
+}
+
 // Teardown must also fail requests that are still waiting for an in-flight slot,
 // not just the ones already running.
 TEST_F(restClientConcurrencyTest, TeardownWithPendingRequestsFiresAllCallbacks) {
@@ -328,16 +363,18 @@ TEST_F(restClientConcurrencyTest, TeardownWithPendingRequestsFiresAllCallbacks) 
     std::vector<char> buf(1024);
     std::atomic<int> done{0};
     std::atomic<int> ok{0};
+    std::atomic<int> built{0};
 
     {
         restClient client(&params);
-        submitGets(client, num_requests, buf, done, ok);
+        submitGets(client, num_requests, buf, done, ok, &built);
         // cap requests are running; the other num_requests - cap are queued.
         ASSERT_TRUE(server.waitUntilHeld(cap)) << "no request reached the server";
     }
 
     EXPECT_EQ(done.load(), num_requests) << "pending requests were dropped without a callback";
     EXPECT_EQ(ok.load(), 0) << "aborted requests should report failure";
+    EXPECT_EQ(built.load(), cap) << "a request that never started built a descriptor";
 }
 
 // Destroying the client while requests are stuck in flight must return promptly

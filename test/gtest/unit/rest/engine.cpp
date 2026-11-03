@@ -46,33 +46,60 @@ namespace {
         uintptr_t addr = 0;
         size_t len = 0;
         size_t offset = 0;
-        std::string rdmaDesc;
+        rdma_descriptor_fn_t makeDesc; ///< null for a body read
+        std::string rdmaDesc; ///< built when the request starts
+        bool started = false;
         bool pastEndOk = false;
         std::function<void(bool)> done;
     };
 
     // Records every request; the test completes them when and how it wants.
+    // A request starts at once, building its RDMA descriptor as restClient does
+    // when it starts one, unless deferStart is set: then start() starts it. A
+    // request whose descriptor is empty fails at start, as in restClient.
     // HEAD answers come from `exists`; a key missing from it is an error.
     class mockRestClient : public iRestClient {
     public:
         std::vector<restCall> calls;
         std::map<std::string, std::optional<bool>> exists;
+        bool deferStart = false;
+
+        void
+        start(size_t i) {
+            restCall &call = calls.at(i);
+            ASSERT_FALSE(call.started) << "request " << i << " started twice";
+            call.started = true;
+            if (!call.makeDesc) {
+                return;
+            }
+            call.rdmaDesc = call.makeDesc();
+            if (call.rdmaDesc.empty()) {
+                auto done = std::move(call.done);
+                call.done = nullptr;
+                done(false);
+            }
+        }
 
         void
         putObjectRdmaAsync(std::string_view key,
                            uintptr_t data_ptr,
                            size_t data_len,
                            size_t offset,
-                           std::string_view rdma_desc,
+                           rdma_descriptor_fn_t rdma_desc,
                            put_object_callback_t callback) override {
             calls.push_back({restCall::kind::PUT,
                              std::string(key),
                              data_ptr,
                              data_len,
                              offset,
-                             std::string(rdma_desc),
+                             std::move(rdma_desc),
+                             "",
+                             false,
                              false,
                              std::move(callback)});
+            if (!deferStart) {
+                start(calls.size() - 1);
+            }
         }
 
         void
@@ -80,7 +107,7 @@ namespace {
                            uintptr_t data_ptr,
                            size_t data_len,
                            size_t offset,
-                           std::string_view rdma_desc,
+                           rdma_descriptor_fn_t rdma_desc,
                            bool past_end_ok,
                            get_object_callback_t callback) override {
             calls.push_back({restCall::kind::GET,
@@ -88,9 +115,14 @@ namespace {
                              data_ptr,
                              data_len,
                              offset,
-                             std::string(rdma_desc),
+                             std::move(rdma_desc),
+                             "",
+                             false,
                              past_end_ok,
                              std::move(callback)});
+            if (!deferStart) {
+                start(calls.size() - 1);
+            }
         }
 
         void
@@ -104,7 +136,9 @@ namespace {
                              reinterpret_cast<uintptr_t>(dst),
                              data_len,
                              offset,
+                             nullptr,
                              "",
+                             true,
                              false,
                              std::move(callback)});
         }
@@ -115,15 +149,21 @@ namespace {
             callback(it == exists.end() ? std::nullopt : it->second);
         }
 
+        // Requests that failed to start have already completed.
         void
         complete(size_t i, bool ok) {
-            calls.at(i).done(ok);
+            ASSERT_TRUE(calls.at(i).done) << "request " << i << " already completed";
+            auto done = std::move(calls.at(i).done);
+            calls.at(i).done = nullptr;
+            done(ok);
         }
 
         void
         completeAll(bool ok) {
-            for (auto &call : calls) {
-                call.done(ok);
+            for (size_t i = 0; i < calls.size(); ++i) {
+                if (calls[i].done) {
+                    complete(i, ok);
+                }
             }
         }
     };
@@ -491,10 +531,54 @@ TEST_F(restEngineTest, UnregisteredRangeFailsPreparation) {
     EXPECT_TRUE(provider_->opened.empty()) << "preparing must not open any access";
 }
 
-// An access that cannot be opened fails the post before any request is sent,
-// and the accesses already opened are closed: nothing is left reaching the
-// buffer.
-TEST_F(restEngineTest, AccessThatCannotOpenFailsThePostBeforeSending) {
+// An access opens when its request starts, not when the transfer is posted:
+// only the requests in flight hold one.
+TEST_F(restEngineTest, AccessOpensWhenTheRequestStarts) {
+    makeEngine();
+    registerDefaults();
+    rest_->deferStart = true;
+
+    const auto local = dlist(DRAM_SEG, {{local_addr, 2 * 4096, 0}});
+    const auto remote = dlist(OBJ_SEG, {{0, 2 * 4096, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    ASSERT_EQ(rest_->calls.size(), 2u);
+    EXPECT_TRUE(provider_->opened.empty()) << "posting must not open any access";
+
+    rest_->start(0);
+    EXPECT_EQ(provider_->opened, (std::vector<uint64_t>{1}));
+    EXPECT_EQ(rest_->calls[0].rdmaDesc, fakeDescriptorProvider::descriptorFor(local_addr, 4096));
+    rest_->complete(0, true);
+    EXPECT_EQ(provider_->closed, (std::vector<uint64_t>{1}));
+
+    rest_->start(1);
+    rest_->complete(1, true);
+    EXPECT_EQ(provider_->closed, (std::vector<uint64_t>{1, 2}));
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
+    releaseHandle();
+}
+
+// A request that never starts (the client shut down first) opens no access and
+// so closes none.
+TEST_F(restEngineTest, RequestThatNeverStartsOpensNoAccess) {
+    makeEngine();
+    registerDefaults();
+    rest_->deferStart = true;
+
+    const auto local = dlist(DRAM_SEG, {{local_addr, 100, 0}});
+    const auto remote = dlist(OBJ_SEG, {{0, 100, obj_dev}});
+    ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    rest_->complete(0, false);
+    EXPECT_TRUE(provider_->opened.empty());
+    EXPECT_TRUE(provider_->closed.empty());
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_ERR_BACKEND);
+    releaseHandle();
+}
+
+// An access that cannot be opened fails only its own request, which is not sent;
+// the others run, and the transfer reports the failure once they finish.
+TEST_F(restEngineTest, AccessThatCannotOpenFailsItsRequest) {
     makeEngine();
     registerDefaults();
     provider_->failAddr = local_addr + 4096;
@@ -502,10 +586,15 @@ TEST_F(restEngineTest, AccessThatCannotOpenFailsThePostBeforeSending) {
     const auto local = dlist(DRAM_SEG, {{local_addr, 3 * 4096, 0}});
     const auto remote = dlist(OBJ_SEG, {{0, 3 * 4096, obj_dev}});
     ASSERT_EQ(prep(NIXL_READ, local, remote), NIXL_SUCCESS);
-    EXPECT_EQ(post(NIXL_READ, local, remote), NIXL_ERR_BACKEND);
-    EXPECT_TRUE(rest_->calls.empty());
-    EXPECT_EQ(provider_->opened, (std::vector<uint64_t>{1}));
-    EXPECT_EQ(provider_->closed, provider_->opened);
+    ASSERT_EQ(post(NIXL_READ, local, remote), NIXL_IN_PROG);
+    ASSERT_EQ(rest_->calls.size(), 3u);
+    EXPECT_TRUE(rest_->calls[1].rdmaDesc.empty());
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_IN_PROG);
+
+    rest_->completeAll(true);
+    EXPECT_EQ(engine_->checkXfer(handle_), NIXL_ERR_BACKEND);
+    EXPECT_EQ(provider_->opened, (std::vector<uint64_t>{1, 2}));
+    EXPECT_EQ(provider_->closed, provider_->opened) << "the failed open must not be closed";
     releaseHandle();
 }
 
@@ -698,7 +787,7 @@ TEST_F(restEngineTest, WriteAndDramReadAreNotFlushed) {
     const auto dram = dlist(DRAM_SEG, {{local_addr, 100, 0}});
     ASSERT_EQ(prep(NIXL_READ, dram, remote), NIXL_SUCCESS);
     ASSERT_EQ(post(NIXL_READ, dram, remote), NIXL_IN_PROG);
-    rest_->calls.back().done(true);
+    rest_->complete(rest_->calls.size() - 1, true);
     EXPECT_EQ(engine_->checkXfer(handle_), NIXL_SUCCESS);
     releaseHandle();
 

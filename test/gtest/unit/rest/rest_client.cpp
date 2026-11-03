@@ -196,6 +196,12 @@ makeRestParams(const std::string &endpoint) {
     return {{"endpoint_override", endpoint}};
 }
 
+// An RDMA descriptor builder that always returns desc.
+static rdma_descriptor_fn_t
+fixedDesc(const std::string &desc) {
+    return [desc] { return desc; };
+}
+
 static std::string
 localEndpoint(int port) {
     return "http://127.0.0.1:" + std::to_string(port);
@@ -232,7 +238,7 @@ TEST_F(restClientTest, PutSendsCorrectUrlAndHeaders) {
                               reinterpret_cast<uintptr_t>(buf.data()),
                               data_len,
                               offset,
-                              rdma_desc,
+                              fixedDesc(rdma_desc),
                               [&](bool ok) {
                                   success = ok;
                                   done = true;
@@ -265,7 +271,7 @@ TEST_F(restClientTest, GetSendsCorrectUrlAndHeaders) {
                               reinterpret_cast<uintptr_t>(buf.data()),
                               buf.size(),
                               offset,
-                              "rdma-get-descriptor",
+                              fixedDesc("rdma-get-descriptor"),
                               /*past_end_ok=*/false,
                               [&](bool ok) {
                                   success = ok;
@@ -300,7 +306,7 @@ TEST_F(restClientTest, GetAtOffsetZeroSendsRangeHeader) {
                               reinterpret_cast<uintptr_t>(buf.data()),
                               buf.size(),
                               /*offset=*/0,
-                              "rdma-get-descriptor",
+                              fixedDesc("rdma-get-descriptor"),
                               /*past_end_ok=*/false,
                               [&](bool ok) {
                                   success = ok;
@@ -333,7 +339,7 @@ TEST_F(restClientTest, GetTreats416AsSuccessOnlyWhenPastEndIsOk) {
                                   reinterpret_cast<uintptr_t>(buf.data()),
                                   buf.size(),
                                   /*offset=*/8u << 20,
-                                  "rdma-get-descriptor",
+                                  fixedDesc("rdma-get-descriptor"),
                                   past_end_ok,
                                   [&](bool ok) {
                                       success = ok;
@@ -349,7 +355,7 @@ TEST_F(restClientTest, GetTreats416AsSuccessOnlyWhenPastEndIsOk) {
     }
 }
 
-TEST_F(restClientTest, PutRejectsEmptyRdmaDesc) {
+TEST_F(restClientTest, PutRejectsMissingRdmaDesc) {
     // Port 1 won't accept connections, so a stray connection attempt fails loudly.
     nixl_b_params_t params = makeRestParams("http://127.0.0.1:1");
     restClient client(&params);
@@ -361,7 +367,7 @@ TEST_F(restClientTest, PutRejectsEmptyRdmaDesc) {
                               reinterpret_cast<uintptr_t>(buf.data()),
                               buf.size(),
                               0,
-                              /*rdma_desc=*/"",
+                              /*rdma_desc=*/nullptr,
                               [&](bool ok) {
                                   success = ok;
                                   done = true;
@@ -369,7 +375,7 @@ TEST_F(restClientTest, PutRejectsEmptyRdmaDesc) {
 
     waitForCallback(done);
     EXPECT_TRUE(done.load()) << "Callback was never invoked";
-    EXPECT_FALSE(success.load()) << "Expected failure with empty rdma_desc";
+    EXPECT_FALSE(success.load()) << "Expected failure without rdma_desc";
 }
 
 TEST_F(restClientTest, PutRejectsZeroDataLen) {
@@ -381,7 +387,7 @@ TEST_F(restClientTest, PutRejectsZeroDataLen) {
                               /*data_ptr=*/0,
                               /*data_len=*/0,
                               0,
-                              "some-descriptor",
+                              fixedDesc("some-descriptor"),
                               [&](bool ok) {
                                   success = ok;
                                   done = true;
@@ -392,7 +398,7 @@ TEST_F(restClientTest, PutRejectsZeroDataLen) {
     EXPECT_FALSE(success.load()) << "Expected failure with data_len=0";
 }
 
-TEST_F(restClientTest, GetRejectsEmptyRdmaDesc) {
+TEST_F(restClientTest, GetRejectsMissingRdmaDesc) {
     nixl_b_params_t params = makeRestParams("http://127.0.0.1:1");
     restClient client(&params);
 
@@ -402,7 +408,7 @@ TEST_F(restClientTest, GetRejectsEmptyRdmaDesc) {
                               reinterpret_cast<uintptr_t>(buf.data()),
                               buf.size(),
                               0,
-                              /*rdma_desc=*/"",
+                              /*rdma_desc=*/nullptr,
                               /*past_end_ok=*/false,
                               [&](bool ok) {
                                   success = ok;
@@ -411,7 +417,38 @@ TEST_F(restClientTest, GetRejectsEmptyRdmaDesc) {
 
     waitForCallback(done);
     EXPECT_TRUE(done.load()) << "Callback was never invoked";
-    EXPECT_FALSE(success.load()) << "Expected failure with empty rdma_desc";
+    EXPECT_FALSE(success.load()) << "Expected failure without rdma_desc";
+}
+
+// A descriptor that cannot be built when the request starts fails the request
+// without sending it: sent, it would wait for request_timeout_ms on an endpoint
+// that never answers.
+TEST_F(restClientTest, EmptyDescriptorFailsTheRequestWithoutSendingIt) {
+    silentListener listener;
+    nixl_b_params_t params = makeRestParams(localEndpoint(listener.port()));
+    params["request_timeout_ms"] = "5000";
+    restClient client(&params);
+
+    std::vector<char> buf(64);
+    std::atomic<bool> done{false}, success{true};
+    const auto start = std::chrono::steady_clock::now();
+    client.getObjectRdmaAsync("k",
+                              reinterpret_cast<uintptr_t>(buf.data()),
+                              buf.size(),
+                              0,
+                              fixedDesc(""),
+                              /*past_end_ok=*/false,
+                              [&](bool ok) {
+                                  success = ok;
+                                  done = true;
+                              });
+
+    waitForCallback(done, 5000);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    ASSERT_TRUE(done.load()) << "Callback was never invoked";
+    EXPECT_FALSE(success.load()) << "a request without a descriptor must fail";
+    EXPECT_LT(elapsed.count(), 1000) << "the request was sent and waited for an answer";
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +502,7 @@ TEST_F(restClientTest, StalledRequestFailsAfterRequestTimeout) {
                               reinterpret_cast<uintptr_t>(buf.data()),
                               buf.size(),
                               0,
-                              "rdma-get-descriptor",
+                              fixedDesc("rdma-get-descriptor"),
                               /*past_end_ok=*/false,
                               [&](bool ok) {
                                   success = ok;

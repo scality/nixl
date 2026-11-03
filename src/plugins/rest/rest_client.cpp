@@ -292,6 +292,9 @@ struct restClient::requestCtx {
     char errorBuf[CURL_ERROR_SIZE] = {};
     /// A 416 (range past the end of the object) means nothing to read: success.
     bool pastEndOk = false;
+    /// Builds the x-scal-rdma descriptor when the request starts; unset for HEAD
+    /// and body reads.
+    rdma_descriptor_fn_t rdmaDesc;
 
     ~requestCtx() {
         if (headers) {
@@ -666,6 +669,20 @@ restClient::startPending() {
         std::unique_ptr<requestCtx> ctx = std::move(pending_.front());
         pending_.pop_front();
         requestCtx *raw = ctx.get();
+        // Built only now: a request waiting for a slot holds no access to the
+        // buffer, and at most maxInflight_ accesses are open at once.
+        if (raw->rdmaDesc) {
+            const std::string desc = raw->rdmaDesc();
+            if (desc.empty()) {
+                NIXL_ERROR << absl::StrFormat(
+                    "%s: no RDMA descriptor for url=%s; not sent", raw->opName, raw->url);
+                finishRequest(ctx.release(), CURLE_FAILED_INIT, 0);
+                continue;
+            }
+            raw->headers =
+                curl_slist_append(raw->headers, absl::StrFormat("x-scal-rdma: %s", desc).c_str());
+            curl_easy_setopt(raw->easy, CURLOPT_HTTPHEADER, raw->headers);
+        }
         CURLMcode mc = curl_multi_add_handle(multi_, raw->easy);
         if (mc != CURLM_OK) {
             NIXL_ERROR << absl::StrFormat(
@@ -759,7 +776,7 @@ restClient::pollerLoop() {
 void
 restClient::submitRdmaRequest(const char *op_name,
                               std::string_view key,
-                              std::string_view rdma_desc,
+                              rdma_descriptor_fn_t rdma_desc,
                               bool is_upload,
                               std::function<void(bool)> callback,
                               size_t data_len,
@@ -772,6 +789,7 @@ restClient::submitRdmaRequest(const char *op_name,
     ctx->method = is_upload ? rest_method::PUT : rest_method::GET;
     ctx->url = buildUrl(key);
     ctx->boolCb = std::move(callback);
+    ctx->rdmaDesc = std::move(rdma_desc);
 
     ctx->easy = acquireEasy();
     if (!ctx->easy) {
@@ -782,8 +800,6 @@ restClient::submitRdmaRequest(const char *op_name,
         return;
     }
 
-    std::string rdma_header = absl::StrFormat("x-scal-rdma: %s", rdma_desc);
-    ctx->headers = curl_slist_append(ctx->headers, rdma_header.c_str());
     if (is_upload) {
         // Content-Length: 0; data is transferred via RDMA, not the HTTP body.
         ctx->headers = curl_slist_append(ctx->headers, "Content-Length: 0");
@@ -804,16 +820,14 @@ restClient::putObjectRdmaAsync(std::string_view key,
                                uintptr_t data_ptr,
                                size_t data_len,
                                size_t offset,
-                               std::string_view rdma_desc,
+                               rdma_descriptor_fn_t rdma_desc,
                                put_object_callback_t callback) {
-    // The RDMA descriptor grants access to the buffer; log only its length.
     NIXL_TRACE << absl::StrFormat(
-        "putObjectRdmaAsync: key=%s, data_ptr=%p, data_len=%zu, offset=%zu, rdma_desc_len=%zu",
+        "putObjectRdmaAsync: key=%s, data_ptr=%p, data_len=%zu, offset=%zu",
         key,
         reinterpret_cast<void *>(data_ptr),
         data_len,
-        offset,
-        rdma_desc.size());
+        offset);
 
     if (data_len == 0) {
         NIXL_ERROR << "putObjectRdmaAsync: data_len is 0, returning failure";
@@ -823,8 +837,8 @@ restClient::putObjectRdmaAsync(std::string_view key,
         return;
     }
 
-    if (rdma_desc.empty()) {
-        NIXL_ERROR << "putObjectRdmaAsync: rdma_desc is empty, returning failure";
+    if (!rdma_desc) {
+        NIXL_ERROR << "putObjectRdmaAsync: no rdma_desc, returning failure";
         if (callback) {
             callback(false);
         }
@@ -832,7 +846,7 @@ restClient::putObjectRdmaAsync(std::string_view key,
     }
 
     submitRdmaRequest(
-        "putObjectRdmaAsync", key, rdma_desc, /*is_upload=*/true, std::move(callback));
+        "putObjectRdmaAsync", key, std::move(rdma_desc), /*is_upload=*/true, std::move(callback));
 }
 
 void
@@ -840,16 +854,15 @@ restClient::getObjectRdmaAsync(std::string_view key,
                                uintptr_t data_ptr,
                                size_t data_len,
                                size_t offset,
-                               std::string_view rdma_desc,
+                               rdma_descriptor_fn_t rdma_desc,
                                bool past_end_ok,
                                get_object_callback_t callback) {
     NIXL_TRACE << absl::StrFormat(
-        "getObjectRdmaAsync: key=%s, data_ptr=%p, data_len=%zu, offset=%zu, rdma_desc_len=%zu",
+        "getObjectRdmaAsync: key=%s, data_ptr=%p, data_len=%zu, offset=%zu",
         key,
         reinterpret_cast<void *>(data_ptr),
         data_len,
-        offset,
-        rdma_desc.size());
+        offset);
 
     if (data_len == 0) {
         NIXL_ERROR << "getObjectRdmaAsync: data_len is 0, returning failure";
@@ -867,8 +880,8 @@ restClient::getObjectRdmaAsync(std::string_view key,
         return;
     }
 
-    if (rdma_desc.empty()) {
-        NIXL_ERROR << "getObjectRdmaAsync: rdma_desc is empty, returning failure";
+    if (!rdma_desc) {
+        NIXL_ERROR << "getObjectRdmaAsync: no rdma_desc, returning failure";
         if (callback) {
             callback(false);
         }
@@ -877,7 +890,7 @@ restClient::getObjectRdmaAsync(std::string_view key,
 
     submitRdmaRequest("getObjectRdmaAsync",
                       key,
-                      rdma_desc,
+                      std::move(rdma_desc),
                       /*is_upload=*/false,
                       std::move(callback),
                       data_len,

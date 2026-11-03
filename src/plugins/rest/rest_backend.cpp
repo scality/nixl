@@ -568,37 +568,23 @@ nixlRestEngine::postXfer(const nixl_xfer_op_t &operation,
     nixlRestBackendReqH *req_h = static_cast<nixlRestBackendReqH *>(handle);
     req_h->resetStatus();
 
-    // Every access is opened before any request is sent, so a failure leaves
-    // nothing running.
-    std::vector<rdmaAccess> access(req_h->reqs_.size());
-    for (size_t i = 0; i < req_h->reqs_.size(); ++i) {
-        const restTransferRequestH &req = req_h->reqs_[i];
-        if (req.hostBody) {
-            continue;
-        }
-        access[i] = descriptorProvider_->openAccess((void *)req.addr, req.size);
-        if (access[i].descriptor.empty()) {
-            for (size_t j = 0; j < i; ++j) {
-                if (!req_h->reqs_[j].hostBody) {
-                    descriptorProvider_->closeAccess(access[j].id);
-                }
-            }
-            return NIXL_ERR_BACKEND;
-        }
-    }
-
     for (size_t i = 0; i < req_h->reqs_.size(); ++i) {
         const restTransferRequestH &req = req_h->reqs_[i];
         auto status_promise = std::make_shared<std::promise<nixl_status_t>>();
         req_h->statusFutures_.push_back(status_promise->get_future());
+        // The access opens when the client starts the request, so only the
+        // requests in flight hold one; a request that never starts opens none.
+        auto access = std::make_shared<rdmaAccess>();
+        auto open_access =
+            [provider = descriptorProvider_, access, addr = req.addr, size = req.size]() {
+                *access = provider->openAccess((void *)addr, size);
+                return access->descriptor;
+            };
         // The access closes before the outcome is reported: once the caller sees
         // it, the server can no longer reach the buffer through this request, even
         // with an RDMA it performs late, and the buffer can be reused.
-        auto on_done = [status_promise,
-                        provider = descriptorProvider_,
-                        rdma = !req.hostBody,
-                        access_id = access[i].id](bool success) {
-            if (rdma && provider->closeAccess(access_id) != NIXL_SUCCESS) {
+        auto on_done = [status_promise, provider = descriptorProvider_, access](bool success) {
+            if (!access->descriptor.empty() && provider->closeAccess(access->id) != NIXL_SUCCESS) {
                 success = false;
             }
             status_promise->set_value(success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
@@ -609,15 +595,10 @@ nixlRestEngine::postXfer(const nixl_xfer_op_t &operation,
                 req.objKey, (void *)req.addr, req.size, req.offset, on_done);
         } else if (operation == NIXL_WRITE) {
             connectorClient_->putObjectRdmaAsync(
-                req.objKey, req.addr, req.size, req.offset, access[i].descriptor, on_done);
+                req.objKey, req.addr, req.size, req.offset, open_access, on_done);
         } else {
-            connectorClient_->getObjectRdmaAsync(req.objKey,
-                                                 req.addr,
-                                                 req.size,
-                                                 req.offset,
-                                                 access[i].descriptor,
-                                                 req.pastEndOk,
-                                                 on_done);
+            connectorClient_->getObjectRdmaAsync(
+                req.objKey, req.addr, req.size, req.offset, open_access, req.pastEndOk, on_done);
         }
     }
 

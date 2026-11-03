@@ -223,12 +223,13 @@ the server's own RoCE settings.
    are mapped to their object ids.
 2. **Prepare.** The connector cuts the transfer into requests and checks that
    each buffer range is registered (no data moves yet).
-3. **Post.** For each request it opens a key for the buffer range (see
-   [Request keys](#request-keys)) and builds the RDMA descriptor with it, then
-   issues the HTTP `PUT`/`GET` for the object id, carrying the descriptor in the
-   `x-scal-rdma` header, and returns immediately. The server performs the RDMA
-   read or write on the buffer. A prepared transfer posted again gets new keys,
-   so its requests may use other NICs.
+3. **Post.** The connector queues an HTTP `PUT`/`GET` per request and returns
+   immediately. When a request starts, at most `max_inflight` at a time, it opens
+   a key for the buffer range (see [Request keys](#request-keys)), builds the
+   RDMA descriptor with it, and sends the request with the descriptor in the
+   `x-scal-rdma` header. The server performs the RDMA read or write on the
+   buffer. A prepared transfer posted again gets new keys, so its requests may
+   use other NICs.
 4. **Poll.** When a request finishes, its key is closed. The transfer stays in
    progress until every part has finished. It then reports success, or the
    first error if a part failed. Before a READ into VRAM reports success, the
@@ -249,6 +250,8 @@ reused at once.
 
 A key is an `mlx5` indirect memory key that points at the request's range.
 Opening and closing it are local NIC operations of about a microsecond each.
+A key opens only when its request starts, so a NIC holds at most about
+`max_inflight` open keys, however many requests are queued.
 The key's address space starts at 0, so the descriptor carries address 0. A
 key's remote key changes each time it opens, and a value comes back only after
 at least 60 seconds.
