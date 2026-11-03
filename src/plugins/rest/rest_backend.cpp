@@ -152,20 +152,19 @@ isValidPrepXferParams(const nixl_xfer_op_t &operation,
 }
 
 /**
- * One HTTP request of a transfer: a local byte range, the object range it maps
- * to, and the RDMA descriptor describing the local range.
+ * One HTTP request of a transfer: a local byte range and the object range it
+ * maps to. Its RDMA descriptor is built each time the transfer is posted.
  */
 class restTransferRequestH {
 public:
     uintptr_t addr = 0;
     size_t size = 0;
     size_t offset = 0;
-    std::string rdmaDesc;
     std::string objKey;
     /// A 416 (range past the end of the object) is a success, not a failure.
     bool pastEndOk = false;
-    /// Read the object into addr over plain HTTP rather than RDMA; rdmaDesc is
-    /// empty. Set by prepXfer, honoured by postXfer.
+    /// Read the object into addr over plain HTTP rather than RDMA, with no RDMA
+    /// descriptor. Set by prepXfer, honoured by postXfer.
     bool hostBody = false;
 
     restTransferRequestH(uintptr_t a, size_t s, size_t off) : addr(a), size(s), offset(off) {}
@@ -529,19 +528,13 @@ nixlRestEngine::prepXfer(const nixl_xfer_op_t &operation,
             if (host_body) {
                 // No RDMA descriptor: postXfer reads the body straight into req.addr.
                 req.hostBody = true;
-            } else {
-                req.rdmaDesc = descriptorProvider_->makeDescriptor((void *)req.addr, req.size);
-                if (req.rdmaDesc.empty()) {
-                    return NIXL_ERR_BACKEND;
-                }
+            } else if (!descriptorProvider_->isRegistered((void *)req.addr, req.size)) {
+                NIXL_ERROR << absl::StrFormat(
+                    "no RDMA registration covers 0x%016x (%zu bytes)", req.addr, req.size);
+                return NIXL_ERR_BACKEND;
             }
-            // Log only the length: the RDMA descriptor grants access to the buffer.
             NIXL_TRACE << absl::StrFormat(
-                "prepXfer: addr=0x%016x, size=%zu, offset=%zu, rdma_desc_len=%zu",
-                req.addr,
-                req.size,
-                req.offset,
-                req.rdmaDesc.size());
+                "prepXfer: addr=0x%016x, size=%zu, offset=%zu", req.addr, req.size, req.offset);
 
             req_h->reqs_.push_back(std::move(req));
             off += len;
@@ -573,7 +566,22 @@ nixlRestEngine::postXfer(const nixl_xfer_op_t &operation,
     nixlRestBackendReqH *req_h = static_cast<nixlRestBackendReqH *>(handle);
     req_h->resetStatus();
 
-    for (const auto &req : req_h->reqs_) {
+    // Every descriptor is built before any request is sent, so a failure leaves
+    // nothing running.
+    std::vector<std::string> rdma_descs(req_h->reqs_.size());
+    for (size_t i = 0; i < req_h->reqs_.size(); ++i) {
+        const restTransferRequestH &req = req_h->reqs_[i];
+        if (req.hostBody) {
+            continue;
+        }
+        rdma_descs[i] = descriptorProvider_->makeDescriptor((void *)req.addr, req.size);
+        if (rdma_descs[i].empty()) {
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
+    for (size_t i = 0; i < req_h->reqs_.size(); ++i) {
+        const restTransferRequestH &req = req_h->reqs_[i];
         auto status_promise = std::make_shared<std::promise<nixl_status_t>>();
         req_h->statusFutures_.push_back(status_promise->get_future());
         auto on_done = [status_promise](bool success) {
@@ -585,10 +593,10 @@ nixlRestEngine::postXfer(const nixl_xfer_op_t &operation,
                 req.objKey, (void *)req.addr, req.size, req.offset, on_done);
         } else if (operation == NIXL_WRITE) {
             connectorClient_->putObjectRdmaAsync(
-                req.objKey, req.addr, req.size, req.offset, req.rdmaDesc, on_done);
+                req.objKey, req.addr, req.size, req.offset, rdma_descs[i], on_done);
         } else {
             connectorClient_->getObjectRdmaAsync(
-                req.objKey, req.addr, req.size, req.offset, req.rdmaDesc, req.pastEndOk, on_done);
+                req.objKey, req.addr, req.size, req.offset, rdma_descs[i], req.pastEndOk, on_done);
         }
     }
 

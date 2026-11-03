@@ -219,11 +219,13 @@ the server's own RoCE settings.
 1. **Register memory.** Local DRAM or VRAM buffers are registered for RDMA on
    the NICs they can use (see [Multi-NIC](#multi-nic)); remote object segments
    are mapped to their object ids.
-2. **Prepare.** For each piece of the transfer the connector builds an RDMA
-   descriptor for the buffer range (no data moves yet).
-3. **Post.** It issues the HTTP `PUT`/`GET` for the object id, carrying the
-   RDMA descriptor in the `x-scal-rdma` header, and returns immediately. The server
-   performs the RDMA read or write on the buffer.
+2. **Prepare.** The connector cuts the transfer into requests and checks that
+   each buffer range is registered (no data moves yet).
+3. **Post.** For each request it builds an RDMA descriptor for the buffer range,
+   then issues the HTTP `PUT`/`GET` for the object id, carrying the descriptor in
+   the `x-scal-rdma` header, and returns immediately. The server performs the
+   RDMA read or write on the buffer. A prepared transfer posted again gets new
+   descriptors, so its requests may use other NICs.
 4. **Poll.** The transfer stays in progress until every part has finished. It
    then reports success, or the first error if a part failed. Before a READ into
    VRAM reports success, the connector makes the server's RDMA writes visible

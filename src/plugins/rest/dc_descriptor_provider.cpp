@@ -1098,6 +1098,26 @@ dcDescriptorProvider::logRequestSpread(bool detailed) {
     }
 }
 
+const dcDescriptorProvider::buffer *
+dcDescriptorProvider::findBuffer(uintptr_t addr, size_t size) const {
+    // The nearest base at or below addr normally covers the range; when
+    // registrations are nested (a pool and a sub-range of it), the enclosing one
+    // lies further back.
+    for (auto it = buffers_.upper_bound(addr); it != buffers_.begin();) {
+        --it;
+        if (addr + size <= it->first + it->second.len) {
+            return &it->second;
+        }
+    }
+    return nullptr;
+}
+
+bool
+dcDescriptorProvider::isRegistered(void *ptr, size_t size) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return findBuffer(reinterpret_cast<uintptr_t>(ptr), size) != nullptr;
+}
+
 std::string
 dcDescriptorProvider::makeDescriptor(void *ptr, size_t size) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
@@ -1113,17 +1133,7 @@ dcDescriptorProvider::makeDescriptor(void *ptr, size_t size) {
         return std::string();
     }
 
-    // Find a buffer [base, base+len) containing [addr, addr+size). The nearest
-    // base at or below addr normally covers it; when registrations are nested
-    // (a pool and a sub-range of it), the enclosing one lies further back.
-    const buffer *found = nullptr;
-    for (auto it = buffers_.upper_bound(addr); it != buffers_.begin();) {
-        --it;
-        if (addr + size <= it->first + it->second.len) {
-            found = &it->second;
-            break;
-        }
-    }
+    const buffer *found = findBuffer(addr, size);
     if (!found) {
         NIXL_ERROR << "ibverbs_dc: no registration covers ptr " << ptr << " size " << size;
         return std::string();

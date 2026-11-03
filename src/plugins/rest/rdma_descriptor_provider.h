@@ -49,6 +49,10 @@ public:
     virtual nixl_status_t
     deregisterMemory(void *ptr) = 0;
 
+    /** True when [ptr, ptr + size) lies within a single registration. */
+    virtual bool
+    isRegistered(void *ptr, size_t size) const = 0;
+
     /**
      * RDMA descriptor for [ptr, ptr + size), which must lie within a single
      * registration.

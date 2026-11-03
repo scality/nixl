@@ -74,6 +74,8 @@ public:
     registerMemory(void *ptr, size_t size, int dev_id) override;
     nixl_status_t
     deregisterMemory(void *ptr) override;
+    bool
+    isRegistered(void *ptr, size_t size) const override;
     std::string
     makeDescriptor(void *ptr, size_t size) override;
     /// cuFlushGPUDirectRDMAWrites on the GPU's primary context, skipped on a GPU
@@ -127,6 +129,9 @@ private:
     /// Detect bond width for an IB device via sysfs; clamps to [1, dc_max_lag_ports].
     static int
     numLagPorts(const char *dev_name);
+    /// The registration holding [addr, addr + size), or null. Caller must hold mu_.
+    const buffer *
+    findBuffer(uintptr_t addr, size_t size) const;
     /// Index into buf.rails for the next request against buf: the rail whose NIC
     /// has taken the fewest requests, among the NICs affine to the buffer's GPU for
     /// VRAM (all rails if none of them holds the buffer, or if GPU affinity is
