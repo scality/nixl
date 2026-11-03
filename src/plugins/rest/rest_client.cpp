@@ -32,6 +32,8 @@
 #include <thread>
 #include <utility>
 
+enum class rest_method { PUT, GET, HEAD, POST };
+
 namespace {
 
 /// A response body is only error text for the failure log, so only its start is kept.
@@ -219,16 +221,43 @@ hasMaxInflight(nixl_b_params_t *params) {
 /// client is built and cannot be counted here.
 constexpr std::size_t fd_share_divisor = 4;
 
-/// The cap to use when the caller did not choose one: default_max_inflight,
-/// scaled down to the descriptor limit actually in force.
+/// The cap of each class when the caller did not choose one: default_max_inflight,
+/// scaled down to the descriptor limit actually in force, shared by the classes.
 std::size_t
 defaultMaxInflight() {
     rlimit lim{};
-    if (getrlimit(RLIMIT_NOFILE, &lim) != 0 || lim.rlim_cur == RLIM_INFINITY) {
-        return default_max_inflight;
+    std::size_t total = default_max_inflight;
+    if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY) {
+        total = std::min(total, static_cast<std::size_t>(lim.rlim_cur) / fd_share_divisor);
     }
-    const std::size_t share = static_cast<std::size_t>(lim.rlim_cur) / fd_share_divisor;
-    return std::max<std::size_t>(1, std::min(default_max_inflight, share));
+    return std::max<std::size_t>(1, total / n_request_classes);
+}
+
+request_class
+requestClassOf(rest_method method) {
+    switch (method) {
+    case rest_method::PUT:
+        return request_class::WRITE;
+    case rest_method::GET:
+        return request_class::READ;
+    case rest_method::HEAD:
+    case rest_method::POST:
+        break;
+    }
+    return request_class::CONTROL;
+}
+
+const char *
+requestClassName(std::size_t cls) {
+    switch (static_cast<request_class>(cls)) {
+    case request_class::CONTROL:
+        return "control";
+    case request_class::READ:
+        return "read";
+    case request_class::WRITE:
+        return "write";
+    }
+    return "?";
 }
 
 std::size_t
@@ -321,8 +350,6 @@ descriptorsExhausted() {
 }
 
 } // namespace
-
-enum class rest_method { PUT, GET, HEAD, POST };
 
 // Per-request state for an in-flight curl_multi transfer. Owns its easy handle,
 // header list, and response buffer for the full transfer lifetime; the user
@@ -620,9 +647,10 @@ restClient::restClient(nixl_b_params_t *custom_params)
       pool_(numThreads_),
       requestTimeoutMs_(parseRequestTimeoutMs(custom_params)),
       maxInflight_(parseMaxInflight(custom_params)),
-      // At most maxInflight_ handles can be transferring at once, so a larger
-      // cache would only hold connections nothing is waiting to use.
-      easyCacheCap_(maxInflight_ == 0 ? default_max_inflight : maxInflight_) {
+      // At most maxInflight_ handles per class can be transferring at once, so a
+      // larger cache would only hold connections nothing is waiting to use.
+      easyCacheCap_(maxInflight_ == 0 ? default_max_inflight :
+                                        n_request_classes * maxInflight_) {
     std::call_once(curl_init_flag, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
     if (!custom_params) {
         throw std::invalid_argument("restClient: custom_params is null");
@@ -648,13 +676,13 @@ restClient::restClient(nixl_b_params_t *custom_params)
 
     std::string cap_source = "configured";
     if (!hasMaxInflight(custom_params)) {
-        cap_source = maxInflight_ < default_max_inflight ?
+        cap_source = n_request_classes * maxInflight_ < default_max_inflight ?
             absl::StrFormat("default: 1/%zu of RLIMIT_NOFILE", fd_share_divisor) :
             "default";
     }
     NIXL_INFO << absl::StrFormat(
         "restClient initialized: endpoint=%s, callback_threads=%zu, request_timeout_ms=%zu, "
-        "max_inflight=%s (%s, curl_multi poller)",
+        "max_inflight=%s per class (%s, curl_multi poller)",
         endpoint_,
         numThreads_,
         requestTimeoutMs_,
@@ -663,34 +691,38 @@ restClient::restClient(nixl_b_params_t *custom_params)
 
     // Descriptors open so far are only a floor: the caller registers memory and
     // opens its fabric contexts after this.
+    const std::size_t max_connections = n_request_classes * maxInflight_;
     rlimit lim{};
     const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
     const std::size_t open_now = openFdCount().value_or(0);
     if (have_limit && lim.rlim_cur != RLIM_INFINITY) {
         NIXL_INFO << absl::StrFormat("restClient fd budget: open=%zu (so far), soft_limit=%llu, "
-                                     "max_inflight=%zu, headroom=%lld",
+                                     "max_connections=%zu, headroom=%lld",
                                      open_now,
                                      static_cast<unsigned long long>(lim.rlim_cur),
-                                     maxInflight_,
+                                     max_connections,
                                      static_cast<long long>(lim.rlim_cur) -
                                          static_cast<long long>(open_now) -
-                                         static_cast<long long>(maxInflight_));
-        if (maxInflight_ != 0 && open_now + maxInflight_ > lim.rlim_cur) {
+                                         static_cast<long long>(max_connections));
+        if (maxInflight_ != 0 && open_now + max_connections > lim.rlim_cur) {
             NIXL_WARN << absl::StrFormat(
-                "restClient: max_inflight=%zu plus %zu descriptors already open "
-                "exceeds RLIMIT_NOFILE=%llu. Requests will fail at connect with "
-                "EMFILE and be reported as curl_code=7, indistinguishable from a "
-                "refused connection. Lower max_inflight or raise 'ulimit -n'.",
+                "restClient: %zu connections (max_inflight=%zu for each of %zu "
+                "request classes) plus %zu descriptors already open exceeds "
+                "RLIMIT_NOFILE=%llu. Requests will fail at connect with EMFILE and "
+                "be reported as curl_code=7, indistinguishable from a refused "
+                "connection. Lower max_inflight or raise 'ulimit -n'.",
+                max_connections,
                 maxInflight_,
+                n_request_classes,
                 open_now,
                 static_cast<unsigned long long>(lim.rlim_cur));
         }
     } else {
         NIXL_INFO << absl::StrFormat(
             "restClient fd budget: open=%zu (so far), soft_limit=unlimited, "
-            "max_inflight=%zu",
+            "max_connections=%zu",
             open_now,
-            maxInflight_);
+            max_connections);
     }
 }
 
@@ -712,9 +744,13 @@ restClient::~restClient() {
     if (multi_) {
         curl_multi_cleanup(multi_);
     }
-    NIXL_INFO << "restClient concurrency: peak_inflight=" << peakInflight_
-              << ", peak_pending=" << peakPending_ << ", max_inflight="
-              << (maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_));
+    for (std::size_t cls = 0; cls < n_request_classes; ++cls) {
+        NIXL_INFO << "restClient concurrency (" << requestClassName(cls)
+                  << "): peak_inflight=" << queues_[cls].peakInflight
+                  << ", peak_pending=" << queues_[cls].peakPending << ", max_inflight="
+                  << (maxInflight_ == 0 ? std::string("unlimited") :
+                                          std::to_string(maxInflight_));
+    }
     NIXL_INFO << "restClient connections: requests=" << totalRequests_
               << ", new_connections=" << newConnects_
               << " (new_connections close to requests means keepalive is not working and "
@@ -758,6 +794,7 @@ restClient::reapCompletions() {
 
         curl_multi_remove_handle(multi_, easy);
         inflight_.erase(ctx);
+        queueOf(ctx).inflight--;
 
         // Every connect failure re-checks whether the process is out of
         // descriptors: libcurl often leaves the errno unset, so the count is what
@@ -776,7 +813,7 @@ restClient::reapCompletions() {
             const bool have_limit = getrlimit(RLIMIT_NOFILE, &lim) == 0;
             NIXL_ERROR << absl::StrFormat(
                 "restClient: first connect failure. fds open=%s, soft_limit=%s, "
-                "max_inflight=%zu, curl says '%s'. Every running request holds a "
+                "max_inflight=%zu per class, curl says '%s'. Every running request holds a "
                 "connection, so open close to the limit means the cap does not fit "
                 "in the descriptors left after the caller's own use: lower "
                 "max_inflight or raise 'ulimit -n'. Open well below the limit points "
@@ -792,39 +829,61 @@ restClient::reapCompletions() {
     }
 }
 
+restClient::classQueue &
+restClient::queueOf(const requestCtx *ctx) {
+    return queues_[static_cast<std::size_t>(requestClassOf(ctx->method))];
+}
+
+std::size_t
+restClient::failPending(CURLcode res) {
+    std::size_t n = 0;
+    for (classQueue &q : queues_) {
+        while (!q.pending.empty()) {
+            std::unique_ptr<requestCtx> ctx = std::move(q.pending.front());
+            q.pending.pop_front();
+            finishRequest(ctx.release(), res, 0);
+            n++;
+        }
+    }
+    return n;
+}
+
 void
 restClient::startPending() {
-    while (!pending_.empty() && (maxInflight_ == 0 || inflight_.size() < maxInflight_)) {
-        std::unique_ptr<requestCtx> ctx = std::move(pending_.front());
-        pending_.pop_front();
-        requestCtx *raw = ctx.get();
-        // Built only now: a request waiting for a slot holds no access to the
-        // buffer, and at most maxInflight_ accesses are open at once.
-        if (raw->rdmaDesc) {
-            const std::string desc = raw->rdmaDesc();
-            if (desc.empty()) {
+    for (classQueue &q : queues_) {
+        while (!q.pending.empty() && (maxInflight_ == 0 || q.inflight < maxInflight_)) {
+            std::unique_ptr<requestCtx> ctx = std::move(q.pending.front());
+            q.pending.pop_front();
+            requestCtx *raw = ctx.get();
+            // Built only now: a request waiting for a slot holds no access to the
+            // buffer, and at most maxInflight_ accesses per class are open at once.
+            if (raw->rdmaDesc) {
+                const std::string desc = raw->rdmaDesc();
+                if (desc.empty()) {
+                    NIXL_ERROR << absl::StrFormat(
+                        "%s: no RDMA descriptor for url=%s; not sent", raw->opName, raw->url);
+                    finishRequest(ctx.release(), CURLE_FAILED_INIT, 0);
+                    continue;
+                }
+                raw->headers = curl_slist_append(
+                    raw->headers, absl::StrFormat("x-scal-rdma: %s", desc).c_str());
+                curl_easy_setopt(raw->easy, CURLOPT_HTTPHEADER, raw->headers);
+            }
+            CURLMcode mc = curl_multi_add_handle(multi_, raw->easy);
+            if (mc != CURLM_OK) {
                 NIXL_ERROR << absl::StrFormat(
-                    "%s: no RDMA descriptor for url=%s; not sent", raw->opName, raw->url);
+                    "%s: curl_multi_add_handle failed: %s", raw->opName, curl_multi_strerror(mc));
                 finishRequest(ctx.release(), CURLE_FAILED_INIT, 0);
                 continue;
             }
-            raw->headers =
-                curl_slist_append(raw->headers, absl::StrFormat("x-scal-rdma: %s", desc).c_str());
-            curl_easy_setopt(raw->easy, CURLOPT_HTTPHEADER, raw->headers);
+            ctx.release(); // ownership tracked via CURLOPT_PRIVATE until completion
+            inflight_.insert(raw);
+            q.inflight++;
+            q.peakInflight = std::max(q.peakInflight, q.inflight);
         }
-        CURLMcode mc = curl_multi_add_handle(multi_, raw->easy);
-        if (mc != CURLM_OK) {
-            NIXL_ERROR << absl::StrFormat(
-                "%s: curl_multi_add_handle failed: %s", raw->opName, curl_multi_strerror(mc));
-            finishRequest(ctx.release(), CURLE_FAILED_INIT, 0);
-            continue;
-        }
-        ctx.release(); // ownership tracked via CURLOPT_PRIVATE until completion
-        inflight_.insert(raw);
-        peakInflight_ = std::max(peakInflight_, inflight_.size());
+        // Sampled after starting, so it counts only what the cap held back.
+        q.peakPending = std::max(q.peakPending, q.pending.size());
     }
-    // Sampled after starting, so it counts only what the cap held back.
-    peakPending_ = std::max(peakPending_, pending_.size());
 }
 
 void
@@ -832,8 +891,8 @@ restClient::pollerLoop() {
     for (;;) {
         const bool stopping = stop_.load();
 
-        // 1. Drain the producer queue into pending_. On shutdown, fail queued
-        //    requests instead of starting them.
+        // 1. Drain the producer queue into the class queues. On shutdown, fail
+        //    queued requests instead of starting them.
         std::queue<std::unique_ptr<requestCtx>> batch;
         {
             const std::lock_guard<std::mutex> lk(queueMtx_);
@@ -846,10 +905,11 @@ restClient::pollerLoop() {
                 finishRequest(ctx.release(), CURLE_ABORTED_BY_CALLBACK, 0);
                 continue;
             }
-            pending_.push_back(std::move(ctx));
+            classQueue &q = queueOf(ctx.get());
+            q.pending.push_back(std::move(ctx));
         }
 
-        // 2. Fill the in-flight slots from pending_.
+        // 2. Fill the in-flight slots from the class queues.
         startPending();
 
         // 3. Advance all in-flight transfers (non-blocking).
@@ -862,16 +922,15 @@ restClient::pollerLoop() {
         // 5. Out of descriptors: nothing queued can connect, so fail the backlog
         //    now, unless descriptors were freed since the last check. Counted and
         //    reported at teardown.
-        if (fdExhausted_ && !pending_.empty()) {
+        const bool any_pending =
+            std::any_of(queues_.begin(), queues_.end(), [](const classQueue &q) {
+                return !q.pending.empty();
+            });
+        if (fdExhausted_ && any_pending) {
             fdExhausted_ = descriptorsExhausted();
         }
-        if (fdExhausted_ && !pending_.empty()) {
-            while (!pending_.empty()) {
-                std::unique_ptr<requestCtx> ctx = std::move(pending_.front());
-                pending_.pop_front();
-                fdAbandoned_++;
-                finishRequest(ctx.release(), CURLE_COULDNT_CONNECT, 0);
-            }
+        if (fdExhausted_ && any_pending) {
+            fdAbandoned_ += failPending(CURLE_COULDNT_CONNECT);
         }
 
         // 6. Completions above freed slots; refill before sleeping so a capped
@@ -888,11 +947,10 @@ restClient::pollerLoop() {
                 finishRequest(ctx, CURLE_ABORTED_BY_CALLBACK, 0);
             }
             inflight_.clear();
-            while (!pending_.empty()) {
-                std::unique_ptr<requestCtx> ctx = std::move(pending_.front());
-                pending_.pop_front();
-                finishRequest(ctx.release(), CURLE_ABORTED_BY_CALLBACK, 0);
+            for (classQueue &q : queues_) {
+                q.inflight = 0;
             }
+            failPending(CURLE_ABORTED_BY_CALLBACK);
             break;
         }
 

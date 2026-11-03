@@ -21,6 +21,7 @@
 #include <asio/thread_pool.hpp>
 #include <asio/post.hpp>
 #include <curl/curl.h>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -141,9 +142,15 @@ public:
 /// Default limit on a whole request, connection included.
 constexpr std::size_t default_request_timeout_ms = 2000;
 
-/// Upper bound on the default cap for concurrently-running requests; the default
-/// is also clamped to a share of RLIMIT_NOFILE (see defaultMaxInflight).
+/// Upper bound on the default caps for concurrently-running requests, all classes
+/// together; the default is also clamped to a share of RLIMIT_NOFILE (see
+/// defaultMaxInflight).
 constexpr std::size_t default_max_inflight = 512;
+
+/// Requests that wait for and count against max_inflight separately, so that a
+/// large store never delays a lookup or a read.
+enum class request_class : std::size_t { CONTROL, READ, WRITE };
+constexpr std::size_t n_request_classes = 3;
 
 /**
  * libcurl implementation of iRestClient. PUT and GET carry the RDMA descriptor
@@ -161,8 +168,9 @@ public:
      *                      Optional "request_timeout_ms" bounds each request
      *                      (default default_request_timeout_ms).
      *                      Optional "max_inflight" caps concurrently-running
-     *                      requests ("0" = unlimited, default
-     *                      min(default_max_inflight, RLIMIT_NOFILE / 4)).
+     *                      requests of each request_class ("0" = unlimited,
+     *                      default min(default_max_inflight, RLIMIT_NOFILE / 4)
+     *                      shared by the classes).
      */
     explicit restClient(nixl_b_params_t *custom_params);
 
@@ -224,8 +232,9 @@ private:
     /// holding its transfer: for a cache, the caller's fallback is faster.
     std::size_t requestTimeoutMs_;
 
-    // Cap on requests running at once, since each holds a connection and a file
-    // descriptor. Excess requests wait in pending_. 0 disables the cap.
+    // Cap on requests of one class running at once, since each holds a
+    // connection and a file descriptor. Excess requests wait in their class's
+    // queue. 0 disables the cap.
     std::size_t maxInflight_;
 
     // Idle easy handles kept for reuse: curl_easy_reset() keeps the connection
@@ -241,11 +250,16 @@ private:
     std::atomic<bool> stop_{false};
     /// Handles currently added to multi_. Poller-thread access only (no lock).
     std::unordered_set<requestCtx *> inflight_;
-    /// Built requests waiting for a free in-flight slot. Poller-thread only.
-    std::deque<std::unique_ptr<requestCtx>> pending_;
-    // High-water marks, logged at teardown. Poller-thread only.
-    std::size_t peakInflight_ = 0;
-    std::size_t peakPending_ = 0;
+    /// The requests of one request_class. Poller-thread only.
+    struct classQueue {
+        /// Built requests waiting for a free in-flight slot of the class.
+        std::deque<std::unique_ptr<requestCtx>> pending;
+        std::size_t inflight = 0;
+        // High-water marks, logged at teardown.
+        std::size_t peakInflight = 0;
+        std::size_t peakPending = 0;
+    };
+    std::array<classQueue, n_request_classes> queues_;
     // Connection-reuse accounting, logged at teardown: new_connections well
     // below requests means the handle cache is doing its job. Poller-thread only.
     std::size_t totalRequests_ = 0;
@@ -305,10 +319,19 @@ private:
     void
     enqueue(std::unique_ptr<requestCtx> ctx);
 
-    /// Move pending requests into multi_ while in-flight slots are available.
-    /// Poller-thread only.
+    /// Move pending requests into multi_ while their class has in-flight slots
+    /// available. Poller-thread only.
     void
     startPending();
+
+    /// The queue of a request's class. Poller-thread only.
+    classQueue &
+    queueOf(const requestCtx *ctx);
+
+    /// Fail every request waiting for a slot, in all classes, with res; returns
+    /// how many. Poller-thread only.
+    std::size_t
+    failPending(CURLcode res);
 
     /// Body of the poller thread: drain queue, perform, reap, poll.
     void

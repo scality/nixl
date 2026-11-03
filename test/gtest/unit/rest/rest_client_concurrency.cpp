@@ -29,10 +29,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <optional>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -49,9 +51,16 @@ namespace gtest::rest {
 // Tracks the peak number of simultaneously-held connections.
 class holdingTcpServer {
 public:
+    /// Whether a request, given as its raw text, is held; the others are
+    /// answered at once.
+    using hold_fn_t = std::function<bool(const std::string &request)>;
+
     /// @param close_connection answer with "Connection: close", so the client
     ///        keeps no idle connection to this server.
-    explicit holdingTcpServer(bool close_connection = false) : closeConnection_(close_connection) {
+    /// @param hold which requests to hold; all of them if unset.
+    explicit holdingTcpServer(bool close_connection = false, hold_fn_t hold = nullptr)
+        : closeConnection_(close_connection),
+          hold_(std::move(hold)) {
         listenFd_ = socket(AF_INET, SOCK_STREAM, 0);
         EXPECT_GE(listenFd_, 0) << "socket() failed: " << strerror(errno);
 
@@ -176,11 +185,12 @@ private:
             request.append(buf, static_cast<std::string::size_type>(n));
         }
 
-        int now = concurrent_.fetch_add(1) + 1;
-        int prev_max = maxConcurrent_.load();
-        while (now > prev_max && !maxConcurrent_.compare_exchange_weak(prev_max, now)) {}
+        const bool held = !hold_ || hold_(request);
+        if (held) {
+            int now = concurrent_.fetch_add(1) + 1;
+            int prev_max = maxConcurrent_.load();
+            while (now > prev_max && !maxConcurrent_.compare_exchange_weak(prev_max, now)) {}
 
-        {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_.wait(lk, [this] { return released_; });
         }
@@ -192,11 +202,14 @@ private:
         // SIGPIPE killing the test process.
         (void)send(fd, resp, strlen(resp), MSG_NOSIGNAL);
         close(fd);
-        concurrent_.fetch_sub(1);
+        if (held) {
+            concurrent_.fetch_sub(1);
+        }
         closed_.fetch_add(1);
     }
 
     const bool closeConnection_;
+    const hold_fn_t hold_;
     int listenFd_ = -1;
     int port_ = 0;
     std::thread acceptThread_;
@@ -252,6 +265,24 @@ submitGets(restClient &client,
                 done.fetch_add(1);
             });
     }
+}
+
+// Submit n RDMA PUTs, counting completions.
+static void
+submitPuts(restClient &client, int n, std::vector<char> &buf, std::atomic<int> &done) {
+    for (int i = 0; i < n; i++) {
+        client.putObjectRdmaAsync("put" + std::to_string(i),
+                                  reinterpret_cast<uintptr_t>(buf.data()),
+                                  buf.size(),
+                                  0,
+                                  [] { return std::string("rdma-descriptor"); },
+                                  [&](bool) { done.fetch_add(1); });
+    }
+}
+
+static bool
+isPut(const std::string &request) {
+    return request.rfind("PUT ", 0) == 0;
 }
 
 static bool
@@ -322,6 +353,65 @@ TEST_F(restClientConcurrencyTest, MaxInflightCapsConcurrentConnections) {
     EXPECT_TRUE(waitForCount(done, num_requests, 20)) << "queued requests never ran";
     EXPECT_EQ(ok.load(), num_requests) << "some requests did not succeed";
     EXPECT_LE(server.maxConcurrent(), cap) << "cap was exceeded while draining";
+}
+
+// A lookup runs while writes fill their in-flight slots and more wait behind
+// them: an existence check never queues behind a store.
+TEST_F(restClientConcurrencyTest, LookupDoesNotWaitBehindWrites) {
+    constexpr int cap = 2;
+    holdingTcpServer server(false, isPut);
+    nixl_b_params_t params = makeRestParams(server.port(), "2", std::to_string(cap));
+    restClient client(&params);
+
+    std::vector<char> buf(1024);
+    std::atomic<int> puts_done{0};
+    submitPuts(client, 3 * cap, buf, puts_done);
+    ASSERT_TRUE(server.waitUntilHeld(cap)) << "the writes never filled their slots";
+
+    std::atomic<bool> checked{false};
+    std::optional<bool> exists;
+    client.checkObjectExistsAsync("present", [&](std::optional<bool> result) {
+        exists = result;
+        checked = true;
+    });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!checked.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(checked.load()) << "the lookup waited behind the writes";
+    EXPECT_EQ(exists, std::optional<bool>(true));
+    EXPECT_EQ(puts_done.load(), 0) << "a held write completed";
+
+    server.release();
+    EXPECT_TRUE(waitForCount(puts_done, 3 * cap, 20)) << "queued writes never ran";
+}
+
+// Reads start while writes fill their in-flight slots and more wait: each class
+// has its own cap.
+TEST_F(restClientConcurrencyTest, ReadsDoNotWaitBehindWrites) {
+    constexpr int cap = 2;
+    holdingTcpServer server;
+    nixl_b_params_t params = makeRestParams(server.port(), "2", std::to_string(cap));
+    restClient client(&params);
+
+    std::vector<char> buf(1024);
+    std::atomic<int> puts_done{0};
+    submitPuts(client, 3 * cap, buf, puts_done);
+    ASSERT_TRUE(server.waitUntilHeld(cap)) << "the writes never filled their slots";
+
+    std::atomic<int> gets_done{0};
+    std::atomic<int> gets_ok{0};
+    submitGets(client, 3 * cap, buf, gets_done, gets_ok);
+    EXPECT_TRUE(server.waitUntilHeld(2 * cap))
+        << "the reads waited behind the writes; only " << server.maxConcurrent()
+        << " requests reached the server";
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_LE(server.maxConcurrent(), 2 * cap) << "a class exceeded max_inflight=" << cap;
+
+    server.release();
+    EXPECT_TRUE(waitForCount(puts_done, 3 * cap, 20)) << "queued writes never ran";
+    EXPECT_TRUE(waitForCount(gets_done, 3 * cap, 20)) << "queued reads never ran";
+    EXPECT_EQ(gets_ok.load(), 3 * cap);
 }
 
 // A request's RDMA descriptor is built when the request starts, not when it is
