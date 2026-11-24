@@ -36,6 +36,12 @@
 /// Maximum DCT QPs per NIC (one per physical LAG/bond port).
 static constexpr int dc_max_lag_ports = 4;
 
+/// RoCE service level and traffic class (ToS byte, DSCP = value >> 2).
+struct dcRoceQos {
+    uint8_t sl = 0;
+    uint8_t trafficClass = 0;
+};
+
 /**
  * In-process libibverbs DC (Dynamically Connected) RDMA descriptor provider.
  *
@@ -58,15 +64,11 @@ public:
      * @param nics   NIC specifiers, IPv4 addresses or RDMA device names (e.g.
      *               mlx5_1); one DC target is opened per entry.
      * @param dc_key DC access key the server's DCI side must present.
-     * @param sl     RoCE service level (0-15) of what the DC target sends.
-     * @param traffic_class RoCE traffic class (ToS byte, DSCP = value >> 2).
      * @param gpu_nic_affinity Whether VRAM requests stay on the NICs affine to
      *               their GPU; false spreads them over every NIC, like host memory.
      */
     dcDescriptorProvider(const std::vector<std::string> &nics,
                          uint64_t dc_key,
-                         uint8_t sl,
-                         uint8_t traffic_class,
                          bool gpu_nic_affinity = true);
     ~dcDescriptorProvider() override;
 
@@ -104,6 +106,8 @@ private:
         uint16_t lid = 0;
         uint8_t gid[16] = {};
         int gidIndex = 0;
+        /// Marks what the DCT sends: the data of a WRITE and RDMA ACKs.
+        dcRoceQos qos;
         uint64_t lagSeq = 0; ///< round-robin cursor over this NIC's LAG ports
         uint64_t maxMrSize = 0; ///< largest MR the device accepts, 0 if unknown
         std::string devName; ///< ib device name (e.g. mlx5_1), for logging
@@ -226,11 +230,6 @@ private:
     std::size_t regBytes_ = 0;
     std::size_t regUs_ = 0;
     std::size_t deregUs_ = 0;
-    /// RoCE service level and traffic class for the DCT address vector. They mark
-    /// what this side sends (RDMA read responses and ACKs); the server marks what
-    /// it sends itself.
-    uint8_t sl_;
-    uint8_t trafficClass_;
     bool gpuNicAffinity_;
     mutable std::mutex mu_;
     /// base address -> buffer, ordered so a sub-address can be found by range.

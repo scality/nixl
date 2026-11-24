@@ -35,6 +35,7 @@ cpp = meson.get_compiler('cpp')
 rest_curl_dep = dependency('libcurl', version: '>=7.68.0', required: false)
 rest_ibverbs_dep = dependency('libibverbs', required: false)
 rest_mlx5_dep = dependency('libmlx5', required: false)
+rest_rdmacm_dep = dependency('librdmacm', required: false)
 # libibverbs.pc does not give the rdma-core release, so check the flag itself.
 rest_ibverbs_relaxed_ordering = rest_ibverbs_dep.found() and cpp.has_header_symbol(
     'infiniband/verbs.h', 'IBV_ACCESS_RELAXED_ORDERING', dependencies: rest_ibverbs_dep)
@@ -42,8 +43,8 @@ rest_ibverbs_relaxed_ordering = rest_ibverbs_dep.found() and cpp.has_header_symb
 rest_mlx5_mkey_update_tag = rest_mlx5_dep.found() and cpp.has_header_symbol(
     'infiniband/mlx5dv.h', 'MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG',
     dependencies: [rest_ibverbs_dep, rest_mlx5_dep])
-if not (rest_curl_dep.found() and rest_ibverbs_relaxed_ordering and rest_mlx5_mkey_update_tag)
-    warning('libcurl >= 7.68, libibverbs with IBV_ACCESS_RELAXED_ORDERING or libmlx5 with MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG not found, skipping REST plugin build')
+if not (rest_curl_dep.found() and rest_rdmacm_dep.found() and rest_ibverbs_relaxed_ordering and rest_mlx5_mkey_update_tag)
+    warning('libcurl >= 7.68, librdmacm, libibverbs with IBV_ACCESS_RELAXED_ORDERING or libmlx5 with MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG not found, skipping REST plugin build')
     subdir_done()
 endif
 
@@ -54,6 +55,7 @@ rest_deps = [
     rest_curl_dep,
     rest_ibverbs_dep,
     rest_mlx5_dep,
+    rest_rdmacm_dep,
     dl_dep,
 ]
 rest_compile_defs = []

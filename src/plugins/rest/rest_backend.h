@@ -30,13 +30,6 @@
 /// DC access key used when neither 'rdma_dc_key' nor cufile.json sets one.
 constexpr uint64_t default_dc_key = 0xffeeddccULL;
 
-/// Defaults for 'rdma_sl' and 'rdma_traffic_class': NVIDIA's standard lossless
-/// RoCE setup, with RoCE on priority 3 (PFC enabled) and marked DSCP 26. SL 3
-/// selects that priority under PCP trust; traffic class 106 is DSCP 26 (104)
-/// plus the ECN-capable bit, which selects it under DSCP trust.
-constexpr uint8_t default_rdma_sl = 3;
-constexpr uint8_t default_rdma_traffic_class = 106;
-
 /// Default bytes per object request, overridable via the 'split_size' backend
 /// parameter (0 disables splitting).
 constexpr size_t default_split_size = 8 * 1024 * 1024;
@@ -152,8 +145,6 @@ private:
     /// customParams 'rdma_nics' or cufile.json.
     std::vector<std::string> rdmaNics_;
     uint64_t dcKey_ = default_dc_key;
-    uint8_t rdmaSl_ = default_rdma_sl;
-    uint8_t rdmaTrafficClass_ = default_rdma_traffic_class;
     /// 'nic_affinity': "gpu" (default) keeps VRAM requests on the NICs affine to
     /// their GPU, "all" spreads them over every NIC.
     bool gpuNicAffinity_ = true;

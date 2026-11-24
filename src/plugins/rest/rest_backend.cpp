@@ -51,29 +51,6 @@ paramOr(const nixl_b_params_t *params, const std::string &key, const std::string
     return (it == params->end() || it->second.empty()) ? def : it->second;
 }
 
-/// Integer customParams value in [0, max], or def when absent. A malformed or
-/// out-of-range value is reported and replaced by def.
-unsigned long
-paramInRange(const nixl_b_params_t *params,
-             const std::string &key,
-             unsigned long max,
-             unsigned long def) {
-    const std::string value = paramOr(params, key, "");
-    if (value.empty()) {
-        return def;
-    }
-    try {
-        const unsigned long parsed = nixl::config::configTraits<unsigned long>::convert(value);
-        if (parsed <= max) {
-            return parsed;
-        }
-    }
-    catch (const std::runtime_error &) {
-    }
-    NIXL_WARN << "Ignoring " << key << "=" << value << " (expected 0-" << max << "), using " << def;
-    return def;
-}
-
 /// A DC access key in hex, with or without 0x ("0xffeeddcc" or "ffeeddcc").
 std::optional<uint64_t>
 parseDcKeyValue(const std::string &text) {
@@ -315,10 +292,6 @@ nixlRestEngine::nixlRestEngine(const nixlBackendInitParams *init_params,
         }
     }
 
-    rdmaSl_ = static_cast<uint8_t>(paramInRange(params, "rdma_sl", 15, default_rdma_sl));
-    rdmaTrafficClass_ = static_cast<uint8_t>(
-        paramInRange(params, "rdma_traffic_class", 255, default_rdma_traffic_class));
-
     const std::string nic_affinity = paramOr(params, "nic_affinity", "gpu");
     if (nic_affinity == "all") {
         gpuNicAffinity_ = false;
@@ -362,8 +335,7 @@ nixlRestEngine::ensureDescriptorProvider() {
                    << cufileJsonPath();
         return NIXL_ERR_BACKEND;
     }
-    auto client = std::make_shared<dcDescriptorProvider>(
-        rdmaNics_, dcKey_, rdmaSl_, rdmaTrafficClass_, gpuNicAffinity_);
+    auto client = std::make_shared<dcDescriptorProvider>(rdmaNics_, dcKey_, gpuNicAffinity_);
     if (!client->isConnected()) {
         NIXL_ERROR << "Failed to initialize the DC descriptor provider";
         return NIXL_ERR_BACKEND;

@@ -21,6 +21,8 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <netinet/in.h>
+#include <rdma/rdma_cma.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -305,6 +307,68 @@ isIpv4MappedGid(const uint8_t raw[16]) {
     return memcmp(raw, prefix, 12) == 0;
 }
 
+constexpr int route_resolve_timeout_ms = 2000;
+
+/**
+ * The SL and ToS rdma_cm gives RC traffic sent from GID gid_index of the DC
+ * port: cma_roce_tos of the port, and the VLAN egress map or DCB of the GID
+ * address's own interface. Zero on InfiniBand and when the route cannot be
+ * resolved.
+ */
+dcRoceQos
+hostQosForGid(ibv_context *ctx, uint8_t link_layer, int gid_index) {
+    dcRoceQos qos;
+    if (link_layer != IBV_LINK_LAYER_ETHERNET) {
+        return qos;
+    }
+    const char *dev_name = ibv_get_device_name(ctx->device);
+    ibv_gid gid;
+    if (ibv_query_gid(ctx, dc_port, gid_index, &gid) != 0) {
+        NIXL_WARN << "ibverbs_dc: cannot read GID " << gid_index << " of " << dev_name
+                  << ", using SL 0 and ToS 0";
+        return qos;
+    }
+
+    sockaddr_storage addr{};
+    if (isIpv4MappedGid(gid.raw)) {
+        auto *v4 = reinterpret_cast<sockaddr_in *>(&addr);
+        v4->sin_family = AF_INET;
+        memcpy(&v4->sin_addr, gid.raw + 12, 4);
+    } else {
+        auto *v6 = reinterpret_cast<sockaddr_in6 *>(&addr);
+        v6->sin6_family = AF_INET6;
+        memcpy(&v6->sin6_addr, gid.raw, 16);
+        if (IN6_IS_ADDR_LINKLOCAL(&v6->sin6_addr)) {
+            NIXL_WARN << "ibverbs_dc: GID " << gid_index << " of " << dev_name
+                      << " is link-local, using SL 0 and ToS 0";
+            return qos;
+        }
+    }
+
+    // Without an event channel, librdmacm resolves synchronously. A route to the
+    // address itself gets the same SL and ToS as one to a peer.
+    rdma_cm_id *id = nullptr;
+    if (rdma_create_id(nullptr, &id, nullptr, RDMA_PS_TCP) != 0 ||
+        rdma_resolve_addr(
+            id, nullptr, reinterpret_cast<sockaddr *>(&addr), route_resolve_timeout_ms) != 0 ||
+        rdma_resolve_route(id, route_resolve_timeout_ms) != 0) {
+        NIXL_WARN << "ibverbs_dc: cannot resolve an RDMA route from GID " << gid_index << " of "
+                  << dev_name << " (" << strerror(errno) << "), using SL 0 and ToS 0";
+    } else if (strcmp(ibv_get_device_name(id->verbs->device), dev_name) != 0 ||
+               id->port_num != dc_port || id->route.num_paths < 1) {
+        NIXL_WARN << "ibverbs_dc: RDMA route from GID " << gid_index << " of " << dev_name
+                  << " went through " << ibv_get_device_name(id->verbs->device) << " port "
+                  << (int)id->port_num << ", using SL 0 and ToS 0";
+    } else {
+        qos.sl = id->route.path_rec[0].sl;
+        qos.trafficClass = id->route.path_rec[0].traffic_class;
+    }
+    if (id) {
+        rdma_destroy_id(id);
+    }
+    return qos;
+}
+
 /**
  * Open the RDMA device for a NIC specifier, which is either an IPv4 address or an
  * RDMA device name (e.g. "mlx5_1"):
@@ -515,6 +579,10 @@ dcDescriptorProvider::setupNic(const std::string &nic_spec, uint64_t dc_key, nic
     // 4096 is the largest RDMA MTU; a 1500-byte Ethernet MTU makes the port's 1024.
     const ibv_mtu path_mtu =
         (port_attr.active_mtu < IBV_MTU_4096) ? port_attr.active_mtu : IBV_MTU_4096;
+    nic.qos = hostQosForGid(nic.ctx, port_attr.link_layer, nic.gidIndex);
+    NIXL_INFO << "ibverbs_dc: NIC " << nic_spec << " (" << nic.devName << ") sends with RoCE SL "
+              << (int)nic.qos.sl << ", traffic class " << (int)nic.qos.trafficClass << " (DSCP "
+              << (nic.qos.trafficClass >> 2) << ")";
 
     for (int p = 0; p < nic.numLagPorts; p++) {
         ibv_qp_init_attr_ex qp_attr{};
@@ -556,12 +624,12 @@ dcDescriptorProvider::setupNic(const std::string &nic_spec, uint64_t dc_key, nic
         memset(&mod, 0, sizeof(mod));
         mod.qp_state = IBV_QPS_RTR;
         mod.path_mtu = path_mtu;
-        mod.ah_attr.sl = sl_;
+        mod.ah_attr.sl = nic.qos.sl;
         mod.ah_attr.port_num = dc_port;
         mod.ah_attr.is_global = 1;
         mod.ah_attr.grh.sgid_index = nic.gidIndex;
         mod.ah_attr.grh.hop_limit = 64;
-        mod.ah_attr.grh.traffic_class = trafficClass_;
+        mod.ah_attr.grh.traffic_class = nic.qos.trafficClass;
         mod.min_rnr_timer = 12;
         if (ibv_modify_qp(nic.dctQps[p],
                           &mod,
@@ -593,12 +661,8 @@ dcDescriptorProvider::setupNic(const std::string &nic_spec, uint64_t dc_key, nic
 
 dcDescriptorProvider::dcDescriptorProvider(const std::vector<std::string> &nics,
                                            uint64_t dc_key,
-                                           uint8_t sl,
-                                           uint8_t traffic_class,
                                            bool gpu_nic_affinity)
-    : sl_(sl),
-      trafficClass_(traffic_class),
-      gpuNicAffinity_(gpu_nic_affinity) {
+    : gpuNicAffinity_(gpu_nic_affinity) {
     if (nics.empty()) {
         NIXL_ERROR << "ibverbs_dc: no NICs provided";
         return;
@@ -624,9 +688,8 @@ dcDescriptorProvider::dcDescriptorProvider(const std::vector<std::string> &nics,
     }
     connected_ = true;
     NIXL_INFO << "ibverbs_dc: DC transport ready across " << nics_.size() << " NIC(s), key=0x"
-              << std::hex << std::noshowbase << dc_key << std::dec << ", RoCE sl=" << (int)sl_
-              << " traffic_class=" << (int)trafficClass_ << " (DSCP " << (trafficClass_ >> 2)
-              << "), GPU memory uses " << (gpuNicAffinity_ ? "its affine NICs" : "every NIC");
+              << std::hex << std::noshowbase << dc_key << std::dec << ", GPU memory uses "
+              << (gpuNicAffinity_ ? "its affine NICs" : "every NIC");
 }
 
 dcDescriptorProvider::~dcDescriptorProvider() {

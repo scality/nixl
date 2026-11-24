@@ -1048,7 +1048,7 @@ built with libcurl.
 ```
 
 The plugin's other parameters, such as `max_inflight`, `request_timeout_ms` or
-`rdma_sl`, are set through `--backend_params` as well; the plugin README lists
+`nic_affinity`, are set through `--backend_params` as well; the plugin README lists
 them. Without `--mode MG`, a process uses a single GPU, and so only that GPU's
 NICs.
 

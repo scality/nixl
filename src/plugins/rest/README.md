@@ -46,8 +46,8 @@ uses neither the AWS SDK nor AWS authentication.
 
 - A reachable Scality AI Connector endpoint.
 - Build dependencies: `libcurl` 7.68 or later, `libibverbs` from an rdma-core that
-  defines `IBV_ACCESS_RELAXED_ORDERING`, and `libmlx5` with
-  `MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG`.
+  defines `IBV_ACCESS_RELAXED_ORDERING`, `libmlx5` with
+  `MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG`, and `librdmacm`.
 
 ## Building
 
@@ -93,8 +93,6 @@ The backend is created as `REST` and configured through its `customParams`.
 | `nic_affinity` | `gpu` | NICs GPU memory uses. `gpu` keeps each request on the NICs affine to its GPU (see [Multi-NIC](#multi-nic)); `all` spreads it over every NIC, like host memory, crossing NUMA nodes when it must. |
 | `rdma_dc_key` | from `cufile.json`, else `0xffeeddcc` | DC access key the server's DCI side must present, in hex (e.g. `0xffeeddcc`). |
 | `rdma_nics` | from `cufile.json` | NICs to register memory on: comma-separated IPv4 addresses or device names, e.g. `10.10.40.208,10.10.48.208` or `mlx5_1,mlx5_2`. |
-| `rdma_sl` | `3` | RoCE service level (0-15). Selects the egress priority under PCP trust. See [RoCE priority](#roce-priority). |
-| `rdma_traffic_class` | `106` | RoCE traffic class, the IP ToS byte (0-255, DSCP = value >> 2). Selects the priority under DSCP trust. See [RoCE priority](#roce-priority). |
 
 Requests are issued to `{endpoint_override}/{object_id}`.
 
@@ -205,11 +203,29 @@ hardware bond hash (DCT QPs cannot be pinned to a physical port directly).
 
 ## RoCE priority
 
-The defaults follow NVIDIA's standard lossless RoCE configuration: RoCE on
-priority 3 with PFC enabled, marked DSCP 26. `rdma_sl=3` selects priority 3
-when switches and NICs trust PCP (VLAN-tagged traffic); `rdma_traffic_class=106`
-(DSCP 26 plus the ECN-capable bit) selects it when they trust DSCP. On a fabric
-configured differently, set both to match it.
+The connector marks RoCE traffic the way the host marks rdma_cm (RC) traffic,
+as the Scality server does, so one host setting covers both and any other RDMA
+application on the host. For each NIC, it resolves an RDMA route from the
+address of the GID it uses and takes the service level and traffic class
+rdma_cm picks:
+
+- the traffic class (IP ToS byte, DSCP = value >> 2) is the port's rdma_cm
+  default, `/sys/kernel/config/rdma_cm/<device>/ports/<port>/default_roce_tos`;
+- the service level is the egress priority of the address's interface, from its
+  VLAN egress map or DCB.
+
+Both are logged per NIC at startup (`sends with RoCE SL ..., traffic class
+...`). When the route cannot be resolved, the NIC sends with SL 0 and traffic
+class 0, and a warning says why. For NVIDIA's standard lossless RoCE setup
+(priority 3 with PFC, DSCP 26), set `default_roce_tos` to `106` (DSCP 26 plus
+the ECN-capable bit) on each port:
+
+```sh
+mkdir -p /sys/kernel/config/rdma_cm/mlx5_1
+echo 106 > /sys/kernel/config/rdma_cm/mlx5_1/ports/1/default_roce_tos
+```
+
+MLNX_OFED's `cma_roce_tos -d mlx5_1 -t 106` does the same.
 
 These settings only mark what this side sends: the data of a WRITE, which the
 server reads from the local buffer, and RDMA acknowledgements. The data of a
