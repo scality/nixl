@@ -689,7 +689,7 @@ devices can differ between the initiator and target processes.
 
 **REST Backend:**
 ```
---rest_endpoint URL        # Base URL of the Scality AI Connector (required)
+--rest_endpoint URL        # Base URL of the Scality AI Connector, or a comma-separated list (required)
 --rest_unique_keys         # Write every posted WRITE to a new object key; the objects are removed at the end
 ```
 

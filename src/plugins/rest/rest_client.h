@@ -147,6 +147,10 @@ constexpr std::size_t default_request_timeout_ms = 2000;
 /// defaultMaxInflight).
 constexpr std::size_t default_max_inflight = 512;
 
+/// How long an endpoint that could not be connected to is skipped by the round
+/// robin.
+constexpr std::size_t endpoint_down_ms = 5000;
+
 /// Requests that wait for and count against max_inflight separately, so that a
 /// large store never delays a lookup or a read.
 enum class request_class : std::size_t { CONTROL, READ, WRITE };
@@ -158,11 +162,16 @@ constexpr std::size_t n_request_classes = 3;
  * RDMA.
  *
  * URL format: {endpoint}/{key}
+ *
+ * Requests go to the endpoints in turn. One that cannot connect, and so never
+ * reached the server, moves to the next endpoint within its request timeout, and
+ * the endpoint is skipped for endpoint_down_ms.
  */
 class restClient : public iRestClient {
 public:
     /**
-     * @param custom_params Backend init params; must contain "endpoint_override".
+     * @param custom_params Backend init params; must contain "endpoint_override",
+     *                      one endpoint or a comma-separated list.
      *                      Optional "num_threads" sizes the callback worker pool
      *                      (default: max(2, hardware_concurrency / 4)).
      *                      Optional "request_timeout_ms" bounds each request
@@ -217,8 +226,16 @@ private:
     /// Per-request state for an in-flight curl_multi transfer. Defined in client.cpp.
     struct requestCtx;
 
-    /// Base endpoint, e.g. "http://10.0.0.1:10000"
-    std::string endpoint_;
+    struct endpoint {
+        /// Base URL, e.g. "http://10.0.0.1:10000"
+        std::string url;
+        /// steady_clock nanoseconds until which the round robin skips it.
+        std::atomic<int64_t> downUntil{0};
+        std::atomic<std::size_t> requests{0};
+    };
+
+    std::vector<endpoint> endpoints_;
+    std::atomic<std::size_t> nextEndpoint_{0};
 
     // A single poller thread owns the curl multi handle and drives all transfers;
     // completed callbacks are offloaded to this pool (sized by numThreads_) so a
@@ -280,8 +297,22 @@ private:
     /// The server answered that it doesn't know .batch_exists: check with HEADs.
     std::atomic<bool> batchExistsUnsupported_{false};
 
-    std::string
-    buildUrl(std::string_view key) const;
+    /// Point a new request at path ("{key}" encoded, or ".batch_exists") on the
+    /// next endpoint of the round robin.
+    void
+    route(requestCtx *ctx, std::string path);
+
+    /// Move ctx to the next endpoint up in its walk of the round robin and set its
+    /// URL. The first attempt takes its round-robin endpoint even when every one
+    /// is down. False when no endpoint is left to try. Any thread.
+    bool
+    advanceEndpoint(requestCtx *ctx);
+
+    /// Retry a request that never reached its endpoint on the next one, within
+    /// its request timeout. False if it is not eligible, and must be finished.
+    /// Poller-thread only.
+    bool
+    failOver(requestCtx *ctx, CURLcode res);
 
     /**
      * Build a PUT/GET RDMA request context and hand it to the poller. PUT and GET

@@ -319,7 +319,9 @@ NB_ARG_STRING(azure_blob_connection_string,
               "local testing)");
 
 // REST options - only used when backend is REST
-NB_ARG_STRING(rest_endpoint, "", "Base URL of the Scality AI Connector for REST backend");
+NB_ARG_STRING(rest_endpoint,
+              "",
+              "Base URL of the Scality AI Connector for REST backend, or a comma-separated list");
 NB_ARG_BOOL(rest_unique_keys,
             false,
             "Write every posted WRITE to a new object key; the objects are removed at the end");
@@ -2037,6 +2039,17 @@ restHandle() {
     return handle.get();
 }
 
+// The first endpoint of --rest_endpoint, which may list several serving the same
+// objects.
+std::string
+firstRestEndpoint() {
+    const std::string &list = xferBenchConfig::rest_endpoint;
+    std::string first = list.substr(0, list.find(','));
+    first.erase(0, first.find_first_not_of(" \t"));
+    first.erase(first.find_last_not_of(" \t") + 1);
+    return first;
+}
+
 // Sends `method` to <endpoint>/<name>, the URL the plugin itself uses: a PUT
 // uploads `size` bytes, a POST sends `body` as JSON.
 bool
@@ -2044,7 +2057,7 @@ restRequest(const std::string &method,
             const std::string &name,
             size_t size = 0,
             const std::string &body = "") {
-    const std::string url = xferBenchConfig::rest_endpoint + "/" + name;
+    const std::string url = firstRestEndpoint() + "/" + name;
     CURL *curl = restHandle();
     if (curl == nullptr) {
         std::cerr << "Error: " << method << " " << url << ": no curl handle" << std::endl;

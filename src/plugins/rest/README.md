@@ -69,7 +69,7 @@ The backend is created as `REST` and configured through its `customParams`.
 
 | Parameter | Meaning |
 |---|---|
-| `endpoint_override` | Base URL of the connector, e.g. `http://10.0.0.1:10000` |
+| `endpoint_override` | Base URL of the connector, e.g. `http://10.0.0.1:10000`, or a comma-separated list of them (see [Several endpoints](#several-endpoints)). |
 
 **HTTP requests (optional)**
 
@@ -94,7 +94,22 @@ The backend is created as `REST` and configured through its `customParams`.
 | `rdma_dc_key` | from `cufile.json`, else `0xffeeddcc` | DC access key the server's DCI side must present, in hex (e.g. `0xffeeddcc`). |
 | `rdma_nics` | from `cufile.json` | NICs to register memory on: comma-separated IPv4 addresses or device names, e.g. `10.10.40.208,10.10.48.208` or `mlx5_1,mlx5_2`. |
 
-Requests are issued to `{endpoint_override}/{object_id}`.
+Requests are issued to `{endpoint}/{object_id}`.
+
+### Several endpoints
+
+With a list such as
+`endpoint_override = http://10.0.0.1:10000,http://10.0.0.2:10000`, requests go
+to the endpoints in turn. When a request cannot connect to its endpoint
+(connection refused, host unreachable, or no connection within 1 s), it is
+sent to the next endpoint, still within its `request_timeout_ms`. That endpoint
+is then skipped for 5 s, after which requests try it again. When none of them
+can be connected to, the request fails.
+
+Only a request that never reached the server moves to another endpoint. One
+that was sent and then failed or timed out fails, PUT included, as it does with
+a single endpoint: the server may have acted on it. All endpoints must serve
+the same objects.
 
 Example (parameters as passed to the REST backend):
 
@@ -314,6 +329,7 @@ This works around limits of the RDMA stack, explained in `dc_request_keys.h`:
 | `ibverbs_dc: a request key on <nic> could not be closed` | The request fails, and its buffer can no longer be deregistered: the server might still reach it. Do not reuse that buffer. |
 | `ibverbs_dc: <ptr> still has <n> request key(s) open; not deregistering it` | The buffer was deregistered while one of its transfers was still running, or after a key could not be closed. |
 | `GPUDirect RDMA writes are not ordered and cannot be flushed` | The GPU or driver offers no host-side flush, and the platform does not order RDMA writes for the GPU: a kernel launched right after a read may see stale data. Use a driver with `cuFlushGPUDirectRDMAWrites` (CUDA 11.3 or later). |
+| `restClient: cannot connect to <endpoint> (...); sending to the other endpoints` | That endpoint is down or unreachable. Requests use the other endpoints of `endpoint_override` and try it again 5 s later. |
 | `restClient: first connect failure. fds open=...` | Open descriptors close to the soft limit: lower `max_inflight` or raise `ulimit -n`. Far below it: the endpoint could not be reached; see the `curl says` text in the log. |
 | `<op>: failed url=<url> curl_code=<n> http_code=<n>` | The HTTP call failed. A non-2xx `http_code` comes from the server; check the object id and endpoint URL. |
 

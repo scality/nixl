@@ -633,6 +633,105 @@ TEST_F(restClientTest, StalledRequestFailsAfterRequestTimeout) {
 }
 
 // ---------------------------------------------------------------------------
+// Several endpoints: round robin, and fail-over of a request that cannot connect
+// ---------------------------------------------------------------------------
+
+// A loopback port nothing listens on: connecting to it is refused.
+static int
+closedPort() {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    struct sockaddr_in addr {};
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    EXPECT_EQ(bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)), 0);
+    socklen_t len = sizeof(addr);
+    getsockname(fd, reinterpret_cast<struct sockaddr *>(&addr), &len);
+    close(fd);
+    return ntohs(addr.sin_port);
+}
+
+static scriptedServer::answer
+okAnswer(const std::string &) {
+    return {200, ""};
+}
+
+// Runs one RDMA PUT and returns whether it succeeded.
+static bool
+putOne(restClient &client, const std::string &key) {
+    std::vector<char> buf(64);
+    std::atomic<bool> done{false}, success{false};
+    client.putObjectRdmaAsync(key,
+                              reinterpret_cast<uintptr_t>(buf.data()),
+                              buf.size(),
+                              0,
+                              fixedDesc("rdma-put-descriptor"),
+                              [&](bool ok) {
+                                  success = ok;
+                                  done = true;
+                              });
+    waitForCallback(done);
+    EXPECT_TRUE(done.load()) << "callback never invoked";
+    return success.load();
+}
+
+TEST_F(restClientTest, EndpointsTakeRequestsInTurn) {
+    scriptedServer first(okAnswer), second(okAnswer);
+    nixl_b_params_t params =
+        makeRestParams(localEndpoint(first.port()) + ", " + localEndpoint(second.port()));
+    restClient client(&params);
+
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(putOne(client, "key" + std::to_string(i)));
+    }
+
+    EXPECT_EQ(first.requests().size(), 2u);
+    EXPECT_EQ(second.requests().size(), 2u);
+}
+
+TEST_F(restClientTest, RequestMovesToTheNextEndpointWhenOneCannotConnect) {
+    scriptedServer server(okAnswer);
+    nixl_b_params_t params =
+        makeRestParams(localEndpoint(closedPort()) + "," + localEndpoint(server.port()));
+    restClient client(&params);
+
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(putOne(client, "key" + std::to_string(i)));
+    }
+
+    const std::vector<std::string> requests = server.requests();
+    ASSERT_EQ(requests.size(), 4u);
+    // The retry reuses the descriptor built for the first attempt.
+    const std::string &req = requests[0];
+    const size_t at = req.find("x-scal-rdma: ");
+    ASSERT_NE(at, std::string::npos) << req;
+    EXPECT_EQ(req.find("x-scal-rdma: ", at + 1), std::string::npos) << req;
+}
+
+TEST_F(restClientTest, RequestFailsWhenNoEndpointCanConnect) {
+    nixl_b_params_t params =
+        makeRestParams(localEndpoint(closedPort()) + "," + localEndpoint(closedPort()));
+    restClient client(&params);
+
+    EXPECT_FALSE(putOne(client, "key"));
+}
+
+// A request sent to an endpoint that then never answers may have been acted on:
+// it fails rather than going to another endpoint.
+TEST_F(restClientTest, RequestThatReachedAnEndpointIsNotSentToAnother) {
+    silentListener listener;
+    scriptedServer server(okAnswer);
+    nixl_b_params_t params =
+        makeRestParams(localEndpoint(listener.port()) + "," + localEndpoint(server.port()));
+    params["request_timeout_ms"] = "300";
+    restClient client(&params);
+
+    EXPECT_FALSE(putOne(client, "key"));
+    EXPECT_TRUE(server.requests().empty());
+}
+
+// ---------------------------------------------------------------------------
 // Existence check (HTTP HEAD)
 // ---------------------------------------------------------------------------
 

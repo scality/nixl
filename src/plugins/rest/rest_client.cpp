@@ -18,13 +18,16 @@
 #include "rest_client.h"
 #include "common/config_traits.h"
 #include "common/nixl_log.h"
+#include "common/str_util.h"
 #include <absl/strings/str_format.h>
+#include <absl/strings/str_join.h>
 #include <asio/post.hpp>
 #include <curl/curl.h>
 #include <dirent.h>
 #include <sys/resource.h>
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -358,7 +361,17 @@ struct restClient::requestCtx {
     restClient *client = nullptr;
     CURL *easy = nullptr;
     struct curl_slist *headers = nullptr;
+    /// What follows the endpoint in the URL: the encoded key, or ".batch_exists".
+    std::string path;
     std::string url;
+    /// endpoints_ index of the current attempt.
+    std::size_t endpoint = 0;
+    /// The round-robin endpoint the request started from, and how far from it the
+    /// walk over the endpoints has gone.
+    std::size_t firstEndpoint = 0;
+    std::size_t walked = 0;
+    /// When the first attempt started: retries share its request timeout.
+    std::optional<std::chrono::steady_clock::time_point> startedAt;
     std::string responseBody;
     const char *opName = "";
     rest_method method = rest_method::GET;
@@ -379,6 +392,8 @@ struct restClient::requestCtx {
     /// Builds the x-scal-rdma descriptor when the request starts; unset for HEAD
     /// and body reads.
     rdma_descriptor_fn_t rdmaDesc;
+    /// The descriptor is in headers: a retry on another endpoint reuses it.
+    bool descAttached = false;
 
     ~requestCtx() {
         if (headers) {
@@ -590,7 +605,7 @@ restClient::finishExistsBatch(requestCtx *ctx, CURLcode res, long http_code) {
             NIXL_INFO << absl::StrFormat(
                 "checkObjectsExistAsync: %s doesn't support .batch_exists; checking each key "
                 "with HEAD from now on",
-                endpoint_);
+                endpoints_[ctx->endpoint].url);
             batchExistsUnsupported_.store(true);
         } else {
             NIXL_ERROR << absl::StrFormat(
@@ -657,10 +672,16 @@ restClient::restClient(nixl_b_params_t *custom_params)
     }
 
     auto ep_it = custom_params->find("endpoint_override");
-    if (ep_it == custom_params->end() || ep_it->second.empty()) {
+    const std::vector<std::string> urls = ep_it == custom_params->end() ?
+        std::vector<std::string>() :
+        nixl::str::splitStripped(ep_it->second, ',');
+    if (urls.empty()) {
         throw std::invalid_argument("restClient: 'endpoint_override' parameter is required");
     }
-    endpoint_ = ep_it->second;
+    endpoints_ = std::vector<endpoint>(urls.size());
+    for (std::size_t i = 0; i < urls.size(); ++i) {
+        endpoints_[i].url = urls[i];
+    }
 
     // Create the multi handle and start the poller only after validation, so a
     // throwing constructor leaves no thread or handle behind.
@@ -681,9 +702,9 @@ restClient::restClient(nixl_b_params_t *custom_params)
             "default";
     }
     NIXL_INFO << absl::StrFormat(
-        "restClient initialized: endpoint=%s, callback_threads=%zu, request_timeout_ms=%zu, "
+        "restClient initialized: endpoints=%s, callback_threads=%zu, request_timeout_ms=%zu, "
         "max_inflight=%s per class (%s, curl_multi poller)",
-        endpoint_,
+        absl::StrJoin(urls, ","),
         numThreads_,
         requestTimeoutMs_,
         maxInflight_ == 0 ? std::string("unlimited") : std::to_string(maxInflight_),
@@ -755,6 +776,11 @@ restClient::~restClient() {
               << ", new_connections=" << newConnects_
               << " (new_connections close to requests means keepalive is not working and "
                  "the endpoint will exhaust ephemeral ports)";
+    if (endpoints_.size() > 1) {
+        for (const endpoint &ep : endpoints_) {
+            NIXL_INFO << "restClient endpoint " << ep.url << ": requests=" << ep.requests.load();
+        }
+    }
     if (fdExhaustionSeen_) {
         NIXL_ERROR << "restClient: ran out of file descriptors during the run; " << fdAbandoned_
                    << " queued request(s) were failed without being attempted, and "
@@ -763,9 +789,96 @@ restClient::~restClient() {
     }
 }
 
-std::string
-restClient::buildUrl(std::string_view key) const {
-    return absl::StrFormat("%s/%s", endpoint_, encodeKey(key));
+namespace {
+
+int64_t
+steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+void
+restClient::route(requestCtx *ctx, std::string path) {
+    ctx->path = std::move(path);
+    ctx->firstEndpoint = nextEndpoint_.fetch_add(1, std::memory_order_relaxed) % endpoints_.size();
+    advanceEndpoint(ctx);
+}
+
+bool
+restClient::advanceEndpoint(requestCtx *ctx) {
+    const std::size_t n = endpoints_.size();
+    const int64_t now = steadyNowNs();
+    std::optional<std::size_t> pick;
+    for (; ctx->walked < n; ++ctx->walked) {
+        const std::size_t idx = (ctx->firstEndpoint + ctx->walked) % n;
+        if (endpoints_[idx].downUntil.load(std::memory_order_relaxed) <= now) {
+            pick = idx;
+            ++ctx->walked;
+            break;
+        }
+    }
+    if (!pick && ctx->url.empty()) {
+        pick = ctx->firstEndpoint;
+    }
+    if (!pick) {
+        return false;
+    }
+    ctx->endpoint = *pick;
+    ctx->url = absl::StrFormat("%s/%s", endpoints_[*pick].url, ctx->path);
+    endpoints_[*pick].requests.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool
+restClient::failOver(requestCtx *ctx, CURLcode res) {
+    const bool unreachable = res == CURLE_COULDNT_CONNECT || res == CURLE_COULDNT_RESOLVE_HOST ||
+        res == CURLE_OPERATION_TIMEDOUT;
+    if (endpoints_.size() < 2 || !unreachable || fdExhausted_ || stop_.load()) {
+        return false;
+    }
+    // A request that sent no byte never reached the server: safe to send again,
+    // PUT included.
+    long sent = 0;
+    if (curl_easy_getinfo(ctx->easy, CURLINFO_REQUEST_SIZE, &sent) != CURLE_OK || sent != 0) {
+        return false;
+    }
+
+    endpoint &down = endpoints_[ctx->endpoint];
+    const int64_t now = steadyNowNs();
+    const int64_t until = now + static_cast<int64_t>(endpoint_down_ms) * 1000000;
+    if (down.downUntil.exchange(until, std::memory_order_relaxed) <= now) {
+        NIXL_WARN << absl::StrFormat(
+            "restClient: cannot connect to %s (%s); sending to the other endpoints for %zu ms",
+            down.url,
+            curlErrorText(res, ctx->errorBuf),
+            endpoint_down_ms);
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - *ctx->startedAt)
+                             .count();
+    const long remaining = static_cast<long>(requestTimeoutMs_) - static_cast<long>(elapsed);
+    const std::string failed_url = ctx->url;
+    if (remaining <= 0 || !advanceEndpoint(ctx)) {
+        return false;
+    }
+    NIXL_DEBUG << absl::StrFormat("%s: %s unreachable, retrying on %s within %ld ms",
+                                  ctx->opName,
+                                  failed_url,
+                                  ctx->url,
+                                  remaining);
+
+    ctx->errorBuf[0] = '\0';
+    ctx->responseBody.clear();
+    ctx->sink.len = 0;
+    ctx->sink.overflow = false;
+    curl_easy_setopt(ctx->easy, CURLOPT_URL, ctx->url.c_str());
+    curl_easy_setopt(ctx->easy, CURLOPT_TIMEOUT_MS, remaining);
+    queueOf(ctx).pending.emplace_front(ctx);
+    return true;
 }
 
 void
@@ -806,6 +919,9 @@ restClient::reapCompletions() {
             fdExhaustionSeen_ = fdExhaustionSeen_ || fdExhausted_;
         } else if (http_code != 0) {
             fdExhausted_ = false;
+        }
+        if (failOver(ctx, res)) {
+            continue;
         }
         if (res == CURLE_COULDNT_CONNECT && !fdExhaustionLogged_) {
             fdExhaustionLogged_ = true;
@@ -857,7 +973,7 @@ restClient::startPending() {
             requestCtx *raw = ctx.get();
             // Built only now: a request waiting for a slot holds no access to the
             // buffer, and at most maxInflight_ accesses per class are open at once.
-            if (raw->rdmaDesc) {
+            if (raw->rdmaDesc && !raw->descAttached) {
                 const std::string desc = raw->rdmaDesc();
                 if (desc.empty()) {
                     NIXL_ERROR << absl::StrFormat(
@@ -868,6 +984,10 @@ restClient::startPending() {
                 raw->headers = curl_slist_append(
                     raw->headers, absl::StrFormat("x-scal-rdma: %s", desc).c_str());
                 curl_easy_setopt(raw->easy, CURLOPT_HTTPHEADER, raw->headers);
+                raw->descAttached = true;
+            }
+            if (!raw->startedAt) {
+                raw->startedAt = std::chrono::steady_clock::now();
             }
             CURLMcode mc = curl_multi_add_handle(multi_, raw->easy);
             if (mc != CURLM_OK) {
@@ -974,7 +1094,7 @@ restClient::submitRdmaRequest(const char *op_name,
     ctx->opName = op_name;
     ctx->pastEndOk = past_end_ok;
     ctx->method = is_upload ? rest_method::PUT : rest_method::GET;
-    ctx->url = buildUrl(key);
+    route(ctx.get(), encodeKey(key));
     ctx->boolCb = std::move(callback);
     ctx->rdmaDesc = std::move(rdma_desc);
 
@@ -1115,7 +1235,7 @@ restClient::getObjectBodyAsync(std::string_view key,
     ctx->client = this;
     ctx->opName = "getObjectBodyAsync";
     ctx->method = rest_method::GET;
-    ctx->url = buildUrl(key);
+    route(ctx.get(), encodeKey(key));
     ctx->boolCb = std::move(callback);
     ctx->sink.dst = static_cast<char *>(dst);
     ctx->sink.cap = data_len;
@@ -1147,7 +1267,7 @@ restClient::checkObjectExistsAsync(std::string_view key, check_object_callback_t
     ctx->client = this;
     ctx->opName = "checkObjectExistsAsync";
     ctx->method = rest_method::HEAD;
-    ctx->url = buildUrl(key);
+    route(ctx.get(), encodeKey(key));
     ctx->checkCb = std::move(callback);
 
     ctx->easy = acquireEasy();
@@ -1215,7 +1335,7 @@ restClient::checkObjectsExistAsync(std::vector<std::string> keys,
     ctx->client = this;
     ctx->opName = "checkObjectsExistAsync";
     ctx->method = rest_method::POST;
-    ctx->url = absl::StrFormat("%s/.batch_exists", endpoint_);
+    route(ctx.get(), ".batch_exists");
     for (const std::string &key : keys) {
         ctx->requestBody += key;
         ctx->requestBody += '\n';
